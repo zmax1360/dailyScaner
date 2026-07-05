@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.zmax.scanner.weekly</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <!-- EDIT: absolute path to run_scanner.sh -->
+    <string>/Users/YOURUSER/trading/scanner/run_scanner.sh</string>
+    <string>weekly</string>
+  </array>
+
+  <!-- Sunday 18:00 ET — weekly candle closed Friday, OI settled,
+       thesis ready before Monday open. Weekday 0 = Sunday. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>18</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/com.zmax.scanner.weekly.err</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/com.zmax.scanner.weekly.out</string>
+</dict>
+</plist>
