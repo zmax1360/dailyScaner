@@ -768,6 +768,123 @@ def _render_weekly_run(payload: dict, spot: float | str, run_time: str):
             st.markdown(thesis)
 
 
+def _render_expiry_vol_table(vol_curr: dict, vol_prev: dict | None, overall_pc: float):
+    """
+    Volume-by-Expiry table aggregated from top_calls / top_puts.
+    CALL VOL and PUT VOL cells are colored green (↑) / red (↓) vs prev run.
+    """
+    # ── Aggregate current run ─────────────────────────────────────────────────
+    curr: dict[str, dict] = {}
+    for side_key, vol_key in [("call_vol", "top_calls"), ("put_vol", "top_puts")]:
+        for c in (vol_curr.get(vol_key) or []):
+            exp = c.get("expiry", "?")
+            dte = int(c.get("dte", 0))
+            v   = int(c.get("volume") or 0)
+            if exp not in curr:
+                curr[exp] = {"dte": dte, "call_vol": 0, "put_vol": 0}
+            curr[exp][side_key] += v
+
+    # ── Aggregate previous run ────────────────────────────────────────────────
+    prev: dict[str, dict] = {}
+    if vol_prev:
+        for side_key, vol_key in [("call_vol", "top_calls"), ("put_vol", "top_puts")]:
+            for c in (vol_prev.get(vol_key) or []):
+                exp = c.get("expiry", "?")
+                v   = int(c.get("volume") or 0)
+                prev.setdefault(exp, {"call_vol": 0, "put_vol": 0})[side_key] += v
+
+    if not curr:
+        st.caption("No volume data in this archive.")
+        return
+
+    # ── Build rows ────────────────────────────────────────────────────────────
+    rows = []
+    for exp in sorted(curr):
+        d   = curr[exp]
+        cv, pv = d["call_vol"], d["put_vol"]
+        dte = d["dte"]
+        pc  = pv / cv if cv > 0 else 0
+
+        if pc < 0.7:   bias = "▲ BULLISH"
+        elif pc < 0.9: bias = "▲ MILD BULLISH"
+        elif pc < 1.1: bias = "- NEUTRAL"
+        elif pc < 1.5: bias = "▼ MILD BEARISH"
+        else:          bias = "▼ BEARISH"
+
+        notable = abs(pc - overall_pc) > 0.25 if overall_pc > 0 else False
+        pd_     = prev.get(exp, {})
+        cv_d    = cv - pd_.get("call_vol", 0) if vol_prev else None
+        pv_d    = pv - pd_.get("put_vol",  0) if vol_prev else None
+
+        def _ds(v):
+            if v is None: return ""
+            if v > 0: return f"+{v:,}"
+            if v < 0: return f"{v:,}"
+            return "·0"
+
+        rows.append({
+            "EXPIRY":   exp,
+            "DTE":      f"{dte}d",
+            "CALL VOL": f"{cv:,}",
+            "PUT VOL":  f"{pv:,}",
+            "P/C":      f"{pc:.2f}",
+            "BIAS":     bias,
+            "NOTABLE":  "◄ notable" if notable else "",
+            "CALL Δ":   _ds(cv_d),
+            "PUT Δ":    _ds(pv_d),
+            # numeric shadows for styling
+            "_cv_d":    cv_d,
+            "_pv_d":    pv_d,
+        })
+
+    df = pd.DataFrame(rows)
+    display_cols = ["EXPIRY","DTE","CALL VOL","PUT VOL","P/C","BIAS","NOTABLE","CALL Δ","PUT Δ"]
+    if not vol_prev:
+        display_cols = [c for c in display_cols if c not in ("CALL Δ","PUT Δ")]
+    disp = df[display_cols].copy()
+
+    def _style_bias(val: str) -> str:
+        if "BULL" in str(val): return "color:#00c853;font-weight:bold"
+        if "BEAR" in str(val): return "color:#d50000;font-weight:bold"
+        return "color:#9e9e9e"
+
+    def _style_delta(val: str) -> str:
+        s = str(val)
+        if s.startswith("+"): return "color:#00c853;font-weight:bold"
+        if s.startswith("-"): return "color:#d50000;font-weight:bold"
+        return "color:#666"
+
+    def _style_vol_cell(col_name):
+        """Color CALL/PUT VOL cells green/red based on delta sign."""
+        delta_col = "_cv_d" if col_name == "CALL VOL" else "_pv_d"
+        def fn(val):
+            # get the delta from the full df by row position
+            return ""   # placeholder; handled by _style_cv / _style_pv below
+        return fn
+
+    styled = disp.style.map(_style_bias, subset=["BIAS"])
+    if vol_prev:
+        styled = styled.map(_style_delta, subset=["CALL Δ","PUT Δ"])
+        # Color the actual volume cells by sign of their delta
+        def _cv_style(val):
+            idx = disp["CALL VOL"].tolist().index(val) if val in disp["CALL VOL"].tolist() else -1
+            if idx >= 0:
+                d = df["_cv_d"].iloc[idx]
+                if d is not None and d > 0: return "color:#00c853;font-weight:bold"
+                if d is not None and d < 0: return "color:#d50000;font-weight:bold"
+            return ""
+        def _pv_style(val):
+            idx = disp["PUT VOL"].tolist().index(val) if val in disp["PUT VOL"].tolist() else -1
+            if idx >= 0:
+                d = df["_pv_d"].iloc[idx]
+                if d is not None and d > 0: return "color:#00c853;font-weight:bold"
+                if d is not None and d < 0: return "color:#d50000;font-weight:bold"
+            return ""
+        styled = styled.map(_cv_style, subset=["CALL VOL"]).map(_pv_style, subset=["PUT VOL"])
+
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
 @st.cache_data(ttl=120)
 def _scan_archive_metadata() -> list[dict]:
     """
@@ -861,6 +978,17 @@ def _render_tab2():
         st.error(f"Could not read {sel['fpath']}: {e}")
         return
 
+    # Load the previous run of the same type for delta computation
+    prev_payload = None
+    for i in range(sel_idx + 1, len(meta)):
+        if meta[i]["type"] == sel["type"]:
+            try:
+                with open(meta[i]["fpath"]) as f:
+                    prev_payload = json.load(f)
+            except Exception:
+                pass
+            break
+
     spot      = payload.get("spot", "—")
     is_weekly = "checklist_score" in payload
     src_tag   = "📆 Weekly" if is_weekly else "📊 Daily"
@@ -871,6 +999,23 @@ def _render_tab2():
     if is_weekly:
         _render_weekly_run(payload, spot, sel["time"])
     else:
+        # ── Volume by Expiry table ─────────────────────────────────────────
+        vol_curr = payload.get("volume") or {}
+        vol_prev = (prev_payload.get("volume") or {}) if prev_payload else None
+        pc_ratio = float(vol_curr.get("pc_ratio") or 0)
+
+        st.markdown("#### Volume by Expiry")
+        if prev_payload:
+            prev_ts = prev_payload.get("timestamp", "")
+            try:
+                prev_et = datetime.fromisoformat(prev_ts).astimezone(ET).strftime("%H:%M ET")
+            except Exception:
+                prev_et = "previous run"
+            st.caption(f"CALL Δ / PUT Δ vs {prev_et}  ·  green = higher  ·  red = lower")
+        _render_expiry_vol_table(vol_curr, vol_prev, pc_ratio)
+
+        st.divider()
+        # ── 5-point checklist ──────────────────────────────────────────────
         _render_daily_run(payload, spot, sel["time"])
 
 
