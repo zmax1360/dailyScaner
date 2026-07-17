@@ -98,15 +98,11 @@ def _sidebar() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Flow table (reads from archive — no live data fetched)
+# TAB 1 — Latest Run (full rich report from most recent archive JSON)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _load_archive_chain() -> tuple[pd.DataFrame, dict | None]:
-    """
-    Build a flat per-contract DataFrame from the most recent daily archive JSON.
-    Uses top_calls / top_puts stored by the scanner; no live data fetched.
-    Returns (df, raw_payload).
-    """
+    """Return per-contract DataFrame + raw payload for the latest daily archive."""
     files = sorted(glob.glob("archive/AAPL_*.json"), reverse=True)
     if not files:
         return pd.DataFrame(), None
@@ -126,88 +122,228 @@ def _load_archive_chain() -> tuple[pd.DataFrame, dict | None]:
             vol_int = int(vol) if not (isinstance(vol, float) and vol != vol) else 0
             oi_int  = int(oi)  if not (isinstance(oi,  float) and oi  != oi)  else 0
             rows.append({
-                "side":         side,
-                "strike":       float(c.get("strike", 0)),
-                "expiry":       c.get("expiry", ""),
-                "dte":          int(c.get("dte", 0)),
-                "last":         last,
-                "volume":       vol_int,
-                "openInterest": oi_int,
-                "premium":      last * vol_int * 100,
+                "side": side, "strike": float(c.get("strike", 0)),
+                "expiry": c.get("expiry", ""), "dte": int(c.get("dte", 0)),
+                "last": last, "volume": vol_int, "openInterest": oi_int,
+                "premium": last * vol_int * 100,
             })
-
     if not rows:
         return pd.DataFrame(), payload
     return pd.DataFrame(rows), payload
 
 
+def _rsi_plain(rsi: float | None) -> str:
+    """Plain text RSI label (no HTML) for use in DataFrames."""
+    if rsi is None:
+        return "—"
+    if rsi >= 80:  return f"OVERBOUGHT ({rsi:.1f})"
+    if rsi >= 60:  return f"BULLISH ({rsi:.1f})"
+    if rsi >= 45:  return f"NEUTRAL ({rsi:.1f})"
+    if rsi >= 30:  return f"BEARISH ({rsi:.1f})"
+    return f"OVERSOLD ({rsi:.1f})"
+
+
 def _render_tab1(cfg: dict):
-    st.header("Options Flow — Top Contracts")
+    """Latest scanner run — rich multi-section report from archive JSON."""
 
-    df, payload = _load_archive_chain()
-
-    if df.empty or payload is None:
+    files = sorted(glob.glob("archive/AAPL_*.json"), reverse=True)
+    if not files:
         st.info("No archive data found. Run the scanner first (`python dailyScaner.py`).")
         return
 
-    vol_block = payload.get("volume", {})
-    spot   = payload.get("spot", "—")
-    ts_str = payload.get("timestamp", "")
+    try:
+        with open(files[0]) as f:
+            curr = json.load(f)
+    except Exception as e:
+        st.error(f"Could not read archive: {e}")
+        return
+
+    prev = None
+    if len(files) > 1:
+        try:
+            with open(files[1]) as f:
+                prev = json.load(f)
+        except Exception:
+            pass
+
+    spot      = float(curr.get("spot") or 0)
+    direction = curr.get("direction", "—")
+    ts_str    = curr.get("timestamp", "")
+    vol       = curr.get("volume") or {}
+    tfs       = curr.get("timeframes") or {}
+    mags      = curr.get("signal_magnets") or {}
+    or_data   = curr.get("or_data") or {}
+    pc_ratio  = float(vol.get("pc_ratio") or 0)
+
     if ts_str:
         ts_et = datetime.fromisoformat(ts_str).astimezone(ET)
-        st.caption(f"Data from archive run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
+        st.caption(f"Latest run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
 
-    # ── Summary pills (straight from scanner-computed values) ─────────────────
-    total_call_vol = int(vol_block.get("total_call_vol") or 0)
-    total_put_vol  = int(vol_block.get("total_put_vol")  or 0)
-    pc_ratio       = float(vol_block.get("pc_ratio")     or 0)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Spot (last run)",     f"${spot}")
-    c2.metric("Total call volume",   f"{total_call_vol:,}")
-    c3.metric("Total put volume",    f"{total_put_vol:,}")
-    c4.metric("P/C vol ratio",       f"{pc_ratio:.2f}")
-    c5.metric("Top contracts shown", len(df))
-
-    # ── Filters ───────────────────────────────────────────────────────────────
-    view = df[df["dte"] >= cfg["min_dte"]].copy()
-
-    sort_col = {"Volume": "volume", "Premium $": "premium", "Strike": "strike"}.get(
-        cfg["sort_by"], "volume"
+    # ── Banner ─────────────────────────────────────────────────────────────────
+    dir_color = "#00c853" if "BULL" in direction else "#d50000" if "BEAR" in direction else "#9e9e9e"
+    dir_icon  = "▲" if "BULL" in direction else "▼" if "BEAR" in direction else "─"
+    pc_bias   = "BULLISH SKEW" if pc_ratio < 0.7 else ("BEARISH SKEW" if pc_ratio > 1.0 else "NEUTRAL")
+    st.markdown(
+        f'<div style="background:#1a1a2e;padding:1rem 1.5rem;border-radius:8px;margin-bottom:0.5rem">'
+        f'<span style="font-size:1.8rem;font-weight:900;color:{dir_color}">'
+        f'{dir_icon} {direction}</span>'
+        f'&ensp;<span style="font-size:1.3rem;color:#eee">Spot ${spot:.2f}</span>'
+        f'&ensp;<span style="color:#aaa;font-size:1rem">P/C {pc_ratio:.2f} ← {pc_bias}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
-    if sort_col in view.columns:
-        view = view.sort_values(sort_col, ascending=False, na_position="last")
 
-    # ── Display table ─────────────────────────────────────────────────────────
-    def _side_badge(row):
-        return "🟢 CALL" if row["side"] == "call" else "🔴 PUT"
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Spot",         f"${spot:.2f}")
+    c2.metric("Call Volume",  f"{int(vol.get('total_call_vol') or 0):,}")
+    c3.metric("Put Volume",   f"{int(vol.get('total_put_vol')  or 0):,}")
+    c4.metric("P/C Ratio",    f"{pc_ratio:.2f}")
 
-    def _expiry_label(row):
-        label = row["expiry"]
-        if row["dte"] == 0:
-            label += " (0DTE)"
-        return label
+    # ── Changes vs last run ────────────────────────────────────────────────────
+    if prev:
+        prev_spot = float(prev.get("spot") or 0)
+        prev_pc   = float((prev.get("volume") or {}).get("pc_ratio") or 0)
+        try:
+            prev_ts = datetime.fromisoformat(prev.get("timestamp","")).astimezone(ET)
+            prev_ts_str = prev_ts.strftime("%Y-%m-%d %H:%M ET")
+        except Exception:
+            prev_ts_str = "previous run"
+        spot_chg = spot - prev_spot
+        pc_chg   = pc_ratio - prev_pc
+        pct_chg  = (spot_chg / prev_spot * 100) if prev_spot else 0
 
-    display = pd.DataFrame({
-        "Side":         view.apply(_side_badge, axis=1),
-        "Strike":       view["strike"].map(lambda x: f"${x:.1f}"),
-        "Expiry":       view.apply(_expiry_label, axis=1),
-        "DTE":          view["dte"],
-        "Last":         view["last"].map(lambda x: f"${x:.2f}"),
-        "Volume":       view["volume"].map(lambda x: f"{int(x):,}"),
-        "Vol/OI":       view.apply(
-            lambda r: f"{r['volume']/r['openInterest']:.1f}x"
-            if r["openInterest"] > 0 else "—", axis=1
-        ),
-        "OI":           view["openInterest"].map(lambda x: f"{int(x):,}"),
-        "Est. Premium": view["premium"].map(_fmt_dollars),
-    })
+        st.markdown("---")
+        st.markdown(
+            f'<b style="font-size:1rem">CHANGES vs last run</b> '
+            f'<span style="color:#888;font-size:0.85rem">since {prev_ts_str}</span>',
+            unsafe_allow_html=True,
+        )
 
-    st.dataframe(display, use_container_width=True, height=500)
-    st.caption(
-        f"{len(view)} contracts shown "
-        f"(top 10 calls + top 10 puts by volume from last scanner run)"
-    )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.metric("Spot",     f"${spot:.2f}",    delta=f"{spot_chg:+.2f} ({pct_chg:+.1f}%)")
+            st.metric("P/C Ratio",f"{pc_ratio:.3f}", delta=f"{pc_chg:+.3f}")
+        with col_b:
+            rsi_parts = []
+            for tf in ["5M", "10M", "15M", "1H", "4H", "1D"]:
+                c_rsi = (tfs.get(tf) or {}).get("rsi")
+                p_rsi = ((prev.get("timeframes") or {}).get(tf) or {}).get("rsi")
+                if c_rsi is not None and p_rsi is not None:
+                    d = c_rsi - p_rsi
+                    rsi_parts.append(f"**{tf}:** {p_rsi:.1f}→{c_rsi:.1f} ({d:+.1f})")
+            if rsi_parts:
+                st.markdown("**RSI shifts**  \n" + "  \n".join(rsi_parts))
+
+        prev_mags = prev.get("signal_magnets") or {}
+        for side in ("call", "put"):
+            cm = mags.get(side) or {}
+            pm = prev_mags.get(side) or {}
+            if cm and pm and cm.get("strike") != pm.get("strike"):
+                icon = "▲ CALL" if side == "call" else "▼ PUT"
+                st.info(
+                    f"**{icon} MAGNET shifted:** "
+                    f"${pm.get('strike')} ({pm.get('expiry')}) → "
+                    f"${cm.get('strike')} ({cm.get('expiry')})  ← STRIKE CHANGE"
+                )
+
+    # ── Multi-timeframe table ──────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Multi-Timeframe")
+    tf_rows = []
+    for tf in ["5M", "10M", "15M", "1H", "4H", "1D"]:
+        d    = tfs.get(tf) or {}
+        rsi  = d.get("rsi")
+        hist = d.get("hist")
+        vs   = d.get("vs")
+        tf_rows.append({
+            "TF":        tf,
+            "RSI":       _rsi_plain(rsi),
+            "MACD":      (f"{'BULLISH' if (hist or 0) > 0 else 'BEARISH'} [hist {hist:+.4f}]"
+                          if hist is not None else "—"),
+            "Vol Spike": f"{vs:.2f}×" if vs is not None else "—",
+            "Support":   f"${d.get('support', '—')}",
+            "Resist":    f"${d.get('resist', '—')}",
+        })
+    st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
+
+    # ── Top calls + puts ───────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Top Volume Contracts")
+    col_c, col_p = st.columns(2)
+
+    for col, key, label in [
+        (col_c, "top_calls", "🟢 CALL Volume"),
+        (col_p, "top_puts",  "🔴 PUT Volume"),
+    ]:
+        contracts = vol.get(key) or []
+        with col:
+            st.markdown(f"**{label}**")
+            rows = []
+            for i, c in enumerate(contracts):
+                v   = int(c.get("volume") or 0)
+                oi  = int(c.get("openInterest") or 0)
+                voi = v / oi if oi > 0 else 0
+                rows.append({
+                    "Strike":  f"${float(c.get('strike', 0)):.1f}" + (" ★" if i == 0 else ""),
+                    "Expiry":  c.get("expiry", ""),
+                    "DTE":     int(c.get("dte", 0)),
+                    "Last":    f"${float(c.get('lastPrice') or 0):.2f}",
+                    "Volume":  f"{v:,}",
+                    "Vol/OI":  f"{voi:.1f}x",
+                    "OI":      f"{oi:,}",
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No data")
+
+    # ── Signal magnets ─────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Signal Magnets")
+    m1, m2 = st.columns(2)
+    for col, side, color in [(m1, "call", "#00c853"), (m2, "put", "#d50000")]:
+        m = mags.get(side) or {}
+        with col:
+            if m:
+                v   = int(m.get("volume") or 0)
+                oi  = max(int(m.get("openInterest") or 0), 1)
+                iv  = float(m.get("impliedVolatility") or 0)
+                label = "🟢 CALL MAGNET" if side == "call" else "🔴 PUT MAGNET"
+                st.markdown(
+                    f'<div style="border-left:4px solid {color};padding:0.5rem 1rem;margin-bottom:0.5rem">'
+                    f'<b style="color:{color}">{label}</b><br>'
+                    f'Strike <b>${m.get("strike","?")} </b>'
+                    f'Expiry {m.get("expiry","?")} &nbsp; DTE {m.get("dte","?")}<br>'
+                    f'Vol {v:,} &nbsp; OI {oi:,} &nbsp; '
+                    f'<b>Vol/OI {v/oi:.1f}x</b> &nbsp; IV {iv:.1%}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── Opening Range Breakout ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Opening Range Breakout")
+    or1, or2 = st.columns(2)
+    for col, tf_key in [(or1, "5M"), (or2, "15M")]:
+        or_tf = or_data.get(tf_key) or {}
+        with col:
+            if or_tf:
+                bias     = or_tf.get("bias", "—")
+                bias_dir = or_tf.get("bias_dir", "")
+                color    = "#00c853" if bias_dir == "bull" else "#d50000" if bias_dir == "bear" else "#aaa"
+                st.markdown(
+                    f'<div style="border:1px solid #333;padding:0.75rem 1rem;border-radius:6px">'
+                    f'<b>{tf_key} OR</b> ({or_tf.get("open_time","?")} ET)<br>'
+                    f'<span style="color:{color};font-weight:bold;font-size:1.1rem">{bias}</span><br>'
+                    f'<span style="color:#888;font-size:0.85rem">'
+                    f'Open ${or_tf.get("open",0):.2f} &nbsp; '
+                    f'High ${or_tf.get("high",0):.2f} &nbsp; '
+                    f'Low ${or_tf.get("low",0):.2f} &nbsp; '
+                    f'Range ${or_tf.get("range",0):.2f} ({or_tf.get("range_pct",0):.2f}%)'
+                    f'</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -493,59 +629,110 @@ def _render_weekly_run(payload: dict, spot: float | str, run_time: str):
             st.markdown(thesis)
 
 
-def _render_tab2():
-    st.header("Scanner Archive")
-
-    # Gather both daily and weekly archives
-    all_files: list[tuple[str, str, str]] = []  # (run_date, run_time, fpath)
-
-    for pattern in ["archive/AAPL_*.json", "archive_weekly/AAPL_*.json"]:
-        for fpath in glob.glob(pattern):
+@st.cache_data(ttl=120)
+def _scan_archive_metadata() -> list[dict]:
+    """
+    Read minimal metadata from every archive file. Cached for 2 minutes.
+    Only parses top-level JSON fields — no heavy rendering.
+    """
+    rows: list[dict] = []
+    for pattern, atype in [
+        ("archive/AAPL_*.json",        "Daily"),
+        ("archive_weekly/AAPL_*.json", "Weekly"),
+    ]:
+        for fpath in sorted(glob.glob(pattern), reverse=True):
             fname = os.path.basename(fpath)
             try:
                 parts    = fname.replace("AAPL_", "").replace(".json", "").split("_")
                 run_date = f"{parts[0][:4]}-{parts[0][4:6]}-{parts[0][6:]}"
-                run_time = f"{parts[1][:2]}:{parts[1][2:4]}:{parts[1][4:]}"
+                run_time = f"{parts[1][:2]}:{parts[1][2:4]}"
             except Exception:
-                run_date, run_time = "unknown", "?"
-            all_files.append((run_date, run_time, fpath))
+                run_date, run_time = "?", "?"
+            try:
+                with open(fpath) as f:
+                    p = json.load(f)
+                spot      = p.get("spot")
+                direction = p.get("direction", "—")
+                pc_ratio  = (p.get("volume") or {}).get("pc_ratio")
+                score     = p.get("checklist_score")
+            except Exception:
+                spot = direction = pc_ratio = score = None
+            rows.append({
+                "fpath":     fpath,
+                "type":      atype,
+                "date":      run_date,
+                "time":      run_time,
+                "spot":      spot,
+                "direction": direction or "—",
+                "pc_ratio":  pc_ratio,
+                "score":     score,
+            })
+    return rows
 
-    if not all_files:
+
+def _render_tab2():
+    st.header("Scanner Archive")
+
+    meta = _scan_archive_metadata()
+    if not meta:
         st.info("No archive files found in archive/ or archive_weekly/")
         return
 
-    # Group by date, newest first
-    by_date: dict[str, list] = {}
-    for run_date, run_time, fpath in all_files:
-        by_date.setdefault(run_date, []).append((run_time, fpath))
+    # ── Summary table (metadata only — fast) ──────────────────────────────────
+    table_rows = [{
+        "Type":      r["type"],
+        "Date":      r["date"],
+        "Time":      r["time"],
+        "Spot":      f"${r['spot']:.2f}" if r["spot"] is not None else "—",
+        "Direction": r["direction"],
+        "P/C":       f"{r['pc_ratio']:.2f}" if r["pc_ratio"] is not None else "—",
+        "Score":     f"{r['score']}/5" if r["score"] is not None else "—",
+    } for r in meta]
 
-    sorted_days = sorted(by_date.keys(), reverse=True)
+    st.dataframe(
+        pd.DataFrame(table_rows),
+        use_container_width=True,
+        hide_index=True,
+        height=260,
+    )
 
-    for day in sorted_days:
-        runs = sorted(by_date[day], reverse=True)
-        label = (
-            f"📅 {day}  —  {len(runs)} run{'s' if len(runs)>1 else ''}"
-        )
-        with st.expander(label, expanded=(day == sorted_days[0])):
-            for run_time, fpath in runs:
-                try:
-                    with open(fpath) as f:
-                        payload = json.load(f)
-                except Exception:
-                    st.error(f"Could not read {fpath}")
-                    continue
+    st.markdown("---")
 
-                is_weekly = "checklist_score" in payload
-                spot      = payload.get("spot", "—")
-                src_tag   = "📆 Weekly" if is_weekly else "📊 Daily"
-                st.markdown(f"**{src_tag} · {run_time} ET**", unsafe_allow_html=True)
+    # ── Run selector — only ONE run rendered at a time ────────────────────────
+    options = [
+        f"{'📆' if r['type']=='Weekly' else '📊'}  {r['date']}  {r['time']}  |  "
+        f"{r['direction']}  ·  Spot ${r['spot']:.2f}" if r["spot"] else
+        f"{'📆' if r['type']=='Weekly' else '📊'}  {r['date']}  {r['time']}"
+        for r in meta
+    ]
+    sel_idx = st.selectbox(
+        "Select run to view details:",
+        range(len(options)),
+        format_func=lambda i: options[i],
+    )
 
-                if is_weekly:
-                    _render_weekly_run(payload, spot, run_time)
-                else:
-                    _render_daily_run(payload, spot, run_time)
+    if sel_idx is None:
+        return
 
-                st.divider()
+    sel = meta[sel_idx]
+    try:
+        with open(sel["fpath"]) as f:
+            payload = json.load(f)
+    except Exception as e:
+        st.error(f"Could not read {sel['fpath']}: {e}")
+        return
+
+    spot      = payload.get("spot", "—")
+    is_weekly = "checklist_score" in payload
+    src_tag   = "📆 Weekly" if is_weekly else "📊 Daily"
+
+    st.markdown(f"**{src_tag} · {sel['date']} {sel['time']} ET · Spot ${spot}**")
+    st.divider()
+
+    if is_weekly:
+        _render_weekly_run(payload, spot, sel["time"])
+    else:
+        _render_daily_run(payload, spot, sel["time"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
