@@ -85,13 +85,13 @@ def _run_daily_scanner() -> tuple[bool, str]:
             cwd=_SCANNER_DIR,
             capture_output=True,
             text=True,
-            timeout=300,   # 5-min hard cap
+            timeout=1800,   # 30-min hard cap
         )
         elapsed = time.time() - t0
         out = result.stdout + ("\n" + result.stderr if result.stderr.strip() else "")
         return result.returncode == 0, f"[{elapsed:.0f}s]\n{out}"
     except subprocess.TimeoutExpired:
-        return False, "Scanner timed out after 5 minutes."
+        return False, "Scanner timed out after 30 minutes."
     except Exception as exc:
         return False, f"Could not launch scanner: {exc}"
 
@@ -111,7 +111,7 @@ def _sidebar() -> dict:
         )
 
         if run_scan:
-            with st.spinner("Running daily scanner… (may take 1–2 min)"):
+            with st.spinner("Running daily scanner… (may take a few minutes)"):
                 ok, output = _run_daily_scanner()
             if ok:
                 st.success("Scan complete — archive updated.")
@@ -356,10 +356,10 @@ def _render_tab1(cfg: dict):
         st.markdown("### The Magnets — Top 5 Calls / Top 5 Puts")
         st.caption("🔥 Vol/OI heatmap — values ≥ 2.0x glow hot (unusual vs open interest)")
 
-        for key, label in [("top_calls", "Top 5 CALLS"), ("top_puts", "Top 5 PUTS")]:
+        for key, label in [("top_calls", "Top 10 CALLS"), ("top_puts", "Top 10 PUTS")]:
             contracts = vol.get(key) or []
             st.markdown(f"**{label}**")
-            styled = _contracts_table(contracts, n=5)
+            styled = _contracts_table(contracts, n=10)
             if styled is not None:
                 st.dataframe(styled, use_container_width=True, hide_index=True)
             else:
