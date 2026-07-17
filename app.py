@@ -182,6 +182,85 @@ def _load_archive_chain() -> tuple[pd.DataFrame, dict | None]:
     return pd.DataFrame(rows), payload
 
 
+def _render_pc_term_chart(chart_pc: dict[str, float | None]) -> None:
+    """
+    Altair bar chart — P/C ratio per expiry.
+    - Bars blue when < 1 (call-heavy), red when ≥ 1 (put-heavy).
+    - Dashed reference line at y = 1.0.
+    - ⚠ text marker above any expiry whose P/C is None (data gap).
+    - Expiries with either side's volume = 0 are rendered as gap markers only.
+    Data comes exclusively from chart_pc (already aggregated from archive).
+    All ET-aware dates are preserved as-is from the archive expiry strings.
+    """
+    import altair as alt
+
+    valid = {exp: pc for exp, pc in chart_pc.items() if pc is not None}
+    gaps  = [exp for exp, pc in chart_pc.items() if pc is None]
+
+    layers = []
+
+    if valid:
+        bar_df = pd.DataFrame([
+            {"expiry": exp, "pc": pc, "side": "Put-heavy" if pc >= 1 else "Call-heavy"}
+            for exp, pc in sorted(valid.items())
+        ])
+        bars = (
+            alt.Chart(bar_df)
+            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+            .encode(
+                x=alt.X("expiry:O",
+                         sort=sorted(valid.keys()),
+                         axis=alt.Axis(labelAngle=-40, title=None)),
+                y=alt.Y("pc:Q",
+                         title="P/C ratio",
+                         scale=alt.Scale(domainMin=0)),
+                color=alt.Color(
+                    "side:N",
+                    scale=alt.Scale(
+                        domain=["Call-heavy", "Put-heavy"],
+                        range=["#1565c0", "#c62828"],
+                    ),
+                    legend=alt.Legend(title=None, orient="top-right"),
+                ),
+                tooltip=[
+                    alt.Tooltip("expiry:O", title="Expiry"),
+                    alt.Tooltip("pc:Q", format=".3f", title="P/C"),
+                    alt.Tooltip("side:N", title="Bias"),
+                ],
+            )
+        )
+        layers.append(bars)
+
+    # Dashed reference line at y = 1.0
+    rule = (
+        alt.Chart(pd.DataFrame({"y": [1.0]}))
+        .mark_rule(strokeDash=[6, 3], color="#888", strokeWidth=1.5)
+        .encode(y="y:Q")
+    )
+    layers.append(rule)
+
+    # ⚠ gap markers
+    if gaps:
+        gap_df = pd.DataFrame({"expiry": sorted(gaps), "label": ["⚠"] * len(gaps), "y": [0.05] * len(gaps)})
+        gap_marks = (
+            alt.Chart(gap_df)
+            .mark_text(fontSize=14, color="#ff6d00", dy=-6)
+            .encode(
+                x=alt.X("expiry:O", sort=sorted(chart_pc.keys())),
+                y=alt.Y("y:Q"),
+                text=alt.Text("label:N"),
+                tooltip=[alt.Tooltip("expiry:O", title="Data gap — zero volume on one side")],
+            )
+        )
+        layers.append(gap_marks)
+
+    if layers:
+        chart = alt.layer(*layers).properties(height=200)
+        st.altair_chart(chart, use_container_width=True)
+        gap_note = f"  ·  ⚠ = data gap: {', '.join(sorted(gaps))}" if gaps else ""
+        st.caption(f"< 1 call-heavy · > 1 put-heavy{gap_note}")
+
+
 def _rsi_plain(rsi: float | None) -> str:
     """Plain text RSI label (no HTML) for use in DataFrames."""
     if rsi is None:
@@ -262,8 +341,8 @@ def _build_expiry_table(
         cv, pv  = d["call_vol"], d["put_vol"]
         dte     = d["dte"]
         data_gap = (cv == 0 or pv == 0)
-        pc      = (pv / cv) if not data_gap else None
-        chart_pc[exp] = pc if pc is not None else 0.0
+        pc       = (pv / cv) if not data_gap else None
+        chart_pc[exp] = pc   # None means data gap — caller must handle
 
         if pc is None:
             bias = ""
@@ -366,19 +445,24 @@ def _render_tab1(cfg: dict):
     # ══ Two-column main layout ════════════════════════════════════════════════
     left, right = st.columns([1, 1.4], gap="large")
 
-    # ── LEFT: The Magnets ─────────────────────────────────────────────────────
+    # ── LEFT: The Magnets (calls | puts side-by-side) ────────────────────────
     with left:
-        st.markdown("### The Magnets — Top 5 Calls / Top 5 Puts")
+        st.markdown("### The Magnets — Top Calls / Top Puts")
         st.caption("🔥 Vol/OI heatmap — values ≥ 2.0x glow hot (unusual vs open interest)")
 
-        for key, label in [("top_calls", "Top 10 CALLS"), ("top_puts", "Top 10 PUTS")]:
+        call_col, put_col = st.columns(2, gap="small")
+        for col, key, label in [
+            (call_col, "top_calls", "🟢 Top CALLS"),
+            (put_col,  "top_puts",  "🔴 Top PUTS"),
+        ]:
             contracts = vol.get(key) or []
-            st.markdown(f"**{label}**")
-            styled = _contracts_table(contracts, n=10)
-            if styled is not None:
-                st.dataframe(styled, use_container_width=True, hide_index=True)
-            else:
-                st.caption("No data")
+            with col:
+                st.markdown(f"**{label}**")
+                styled = _contracts_table(contracts, n=10)
+                if styled is not None:
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No data")
 
     # ── RIGHT: Volume by Expiry ───────────────────────────────────────────────
     with right:
@@ -408,13 +492,8 @@ def _render_tab1(cfg: dict):
             )
             st.dataframe(styled_exp, use_container_width=True, hide_index=True)
 
-            # Bar chart — P/C ratio by expiry
-            if chart_pc:
-                chart_df = pd.DataFrame(
-                    {"P/C ratio": list(chart_pc.values())},
-                    index=list(chart_pc.keys()),
-                )
-                st.bar_chart(chart_df, height=200, color="#1565c0")
+            # ── P/C term structure bar chart ──────────────────────────────
+            _render_pc_term_chart(chart_pc)
         else:
             st.caption("No expiry data available")
 
