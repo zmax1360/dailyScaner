@@ -58,11 +58,17 @@ def _fmt_dollars(v) -> str:
     return f"${v:.0f}"
 
 
+def _market_is_closed() -> bool:
+    """True when the regular session is not open right now."""
+    return not market_is_open(_now_et())
+
+
 def _market_banner():
-    now = _now_et()
-    if not market_is_open(now):
-        st.warning(
-            f"⚠️  MARKET CLOSED — data is end-of-day  "
+    """Persistent MARKET CLOSED banner — shown on every tab when session is not open."""
+    if _market_is_closed():
+        now = _now_et()
+        st.error(
+            f"🔴  MARKET CLOSED — DATA IS END-OF-DAY  "
             f"({now.strftime('%A %H:%M ET')})",
             icon="🔴",
         )
@@ -253,18 +259,25 @@ def _build_expiry_table(
     rows, chart_pc = [], {}
     for exp in sorted(curr_exp):
         d  = curr_exp[exp]
-        cv, pv = d["call_vol"], d["put_vol"]
-        dte    = d["dte"]
-        pc     = pv / cv if cv > 0 else 0
-        chart_pc[exp] = pc
+        cv, pv  = d["call_vol"], d["put_vol"]
+        dte     = d["dte"]
+        data_gap = (cv == 0 or pv == 0)
+        pc      = (pv / cv) if not data_gap else None
+        chart_pc[exp] = pc if pc is not None else 0.0
 
-        if pc < 0.7:   bias = "▲ BULLISH"
+        if pc is None:
+            bias = ""
+        elif pc < 0.7:   bias = "▲ BULLISH"
         elif pc < 0.9: bias = "▲ MILD BULLISH"
         elif pc < 1.1: bias = "— NEUTRAL"
         elif pc < 1.5: bias = "▼ MILD BEARISH"
         else:          bias = "▼ BEARISH"
 
-        notable = abs(pc - overall_pc) > 0.25 if overall_pc > 0 else False
+        notable = (
+            abs(pc - overall_pc) > 0.25
+            if (pc is not None and overall_pc > 0)
+            else False
+        )
 
         pd_   = prev_exp.get(exp, {})
         cv_d  = cv - pd_.get("call_vol", 0) if prev_vol else None
@@ -281,9 +294,9 @@ def _build_expiry_table(
             "DTE":      f"{dte}d",
             "CALL VOL": f"{cv:,}",
             "PUT VOL":  f"{pv:,}",
-            "P/C":      f"{pc:.2f}",
+            "P/C":      f"{pc:.2f}" if pc is not None else "n/a",
             "BIAS":     bias,
-            "NOTABLE":  "◄ notable" if notable else "",
+            "NOTABLE":  "⚠ data gap" if data_gap else ("◄ notable" if notable else ""),
             "CALL Δ":   _ds(cv_d),
             "PUT Δ":    _ds(pv_d),
         })
@@ -324,9 +337,10 @@ def _render_tab1(cfg: dict):
     prev_vol  = (prev.get("volume") or {}) if prev else None
 
     # ── Top bar ───────────────────────────────────────────────────────────────
-    dir_color = "#00c853" if "BULL" in direction else "#d50000" if "BEAR" in direction else "#9e9e9e"
-    dir_icon  = "▲" if "BULL" in direction else "▼" if "BEAR" in direction else "─"
-    pc_bias   = "BULLISH SKEW" if pc_ratio < 0.7 else ("BEARISH SKEW" if pc_ratio > 1.0 else "NEUTRAL")
+    dir_color    = "#00c853" if "BULL" in direction else "#d50000" if "BEAR" in direction else "#9e9e9e"
+    dir_icon     = "▲" if "BULL" in direction else "▼" if "BEAR" in direction else "─"
+    pc_bias      = "BULLISH SKEW" if pc_ratio < 0.7 else ("BEARISH SKEW" if pc_ratio > 1.0 else "NEUTRAL")
+    hist_suffix  = " (historical)" if _market_is_closed() else ""
 
     if ts_str:
         ts_et = datetime.fromisoformat(ts_str).astimezone(ET)
@@ -334,7 +348,8 @@ def _render_tab1(cfg: dict):
 
     st.markdown(
         f'<div style="background:#1a1a2e;padding:0.75rem 1.5rem;border-radius:8px;margin-bottom:0.5rem">'
-        f'<span style="font-size:1.5rem;font-weight:900;color:{dir_color}">{dir_icon} {direction}</span>'
+        f'<span style="font-size:1.5rem;font-weight:900;color:{dir_color}">'
+        f'{dir_icon} {direction}{hist_suffix}</span>'
         f'&ensp;<span style="font-size:1.1rem;color:#eee">Spot ${spot:.2f}</span>'
         f'&ensp;<span style="color:#aaa">P/C {pc_ratio:.2f} ← {pc_bias}</span>'
         f'</div>',
@@ -533,235 +548,202 @@ def _rsi_label(v) -> str:
 
 
 def _render_daily_run(payload: dict, spot: float | str, run_time: str):
-    """Checklist card layout for daily scanner archives."""
-    direction = payload.get("direction")          # "BULLISH" / "BEARISH" / "NEUTRAL" / None
+    """Display archived daily scanner data — no pass/fail verdicts computed here."""
+    direction = payload.get("direction", "—")
     or_data   = payload.get("or_data") or {}
     tfs       = payload.get("timeframes") or {}
     vol       = payload.get("volume") or {}
     magnets   = payload.get("signal_magnets") or {}
-
     or_15m    = or_data.get("15M") or {}
     or_5m     = or_data.get("5M")  or {}
     pc_ratio  = vol.get("pc_ratio")
-    rsi_1d    = tfs.get("1D", {}).get("rsi")
-    rsi_1h    = tfs.get("1H", {}).get("rsi")
+    tc        = int(vol.get("total_call_vol") or 0)
+    tp        = int(vol.get("total_put_vol")  or 0)
 
-    # ── 1. Daily Trend ───────────────────────────────────────────────────────
-    bias_dir  = or_15m.get("bias_dir")           # "bull" / "bear" / "neutral" / "forming"
-    trend_pass = (direction == "BULLISH") if direction else None
-    or_bias   = or_15m.get("bias", "—")
-    or_5m_bias = or_5m.get("bias", "—")
-    trend_sum = (
-        f"Direction={direction or '—'};  15M OR: {or_bias};  5M OR: {or_5m_bias}"
-    )
-    trend_det = (
-        f"**Direction (engine):** {direction or '—'}<br>"
-        f"**15M OR:** H={or_15m.get('high','—')}  L={or_15m.get('low','—')}  "
-        f"Range={or_15m.get('range','—')}pt ({or_15m.get('range_pct','—')}%)  "
-        f"Bias: **{or_bias}**<br>"
-        f"**5M OR:** H={or_5m.get('high','—')}  L={or_5m.get('low','—')}  "
-        f"Bias: **{or_5m_bias}**"
-    )
-
-    # ── 2. P/C Skew ──────────────────────────────────────────────────────────
-    pc_pass   = (pc_ratio < 0.95) if pc_ratio is not None else None
-    pc_sum    = f"Near-term P/C={pc_ratio:.2f} (want < 0.95 for calls)" if pc_ratio is not None else "—"
-    tc = vol.get("total_call_vol", 0); tp = vol.get("total_put_vol", 0)
-    pc_det    = (
-        f"**P/C ratio:** {pc_ratio if pc_ratio is not None else '—'}<br>"
-        f"**Total call vol:** {int(tc):,} &nbsp; **Total put vol:** {int(tp):,}"
-    )
-
-    # ── 3. Vol/OI ≥ 2x ───────────────────────────────────────────────────────
-    best_voi  = None
-    best_side = None
-    voi_lines = []
-    for side in ("call", "put"):
-        m = magnets.get(side)
-        if m and m.get("openInterest", 0) > 0:
-            voi = m["volume"] / m["openInterest"]
-            voi_lines.append(
-                f"**{side.upper()}** ${m.get('strike','?')} exp {m.get('expiry','?')} "
-                f"DTE {m.get('dte','?')}  Vol={int(m['volume']):,}  "
-                f"OI={int(m['openInterest']):,}  **Vol/OI={voi:.1f}x**"
-            )
-            if best_voi is None or voi > best_voi:
-                best_voi = voi; best_side = side
-        else:
-            voi_lines.append(f"**{side.upper()}** — none qualified")
-    voi_pass = (best_voi >= 2.0) if best_voi is not None else None
-    voi_sum  = f"Max Vol/OI={best_voi:.2f}x ({best_side})" if best_voi is not None else "—"
-    voi_det  = "<br>".join(voi_lines) if voi_lines else "No magnet data in this archive."
-
-    # ── 4. RSI Health (1D not overbought) ────────────────────────────────────
-    rsi_pass  = (rsi_1d < 70) if rsi_1d is not None else None
-    rsi_sum   = (
-        f"1D RSI={rsi_1d:.1f}  1H RSI={rsi_1h:.1f}" if rsi_1d and rsi_1h
-        else f"1D RSI={rsi_1d}" if rsi_1d else "—"
-    )
-    rsi_rows  = "".join(
-        f"<b>{tf}</b>: RSI {_rsi_label(d.get('rsi'))} &nbsp; MACD hist {d.get('hist','—')}<br>"
-        for tf, d in tfs.items()
-    )
-    rsi_det   = rsi_rows or "No timeframe data in this archive."
-
-    # ── 5. OR Clear (15M not inside range) ───────────────────────────────────
-    or_clear_pass = (bias_dir in ("bull", "bear")) if bias_dir else None
-    or_clear_sum  = f"15M OR bias: {or_bias}" if or_bias != "—" else "OR data not in this archive"
-    or_clear_det  = (
-        f"15M OR high {or_15m.get('high','—')} / low {or_15m.get('low','—')}<br>"
-        f"Range {or_15m.get('range','—')}pt — **{or_bias}**<br>"
-        f"Open time {or_15m.get('open_time','—')} ET"
-    )
-
-    # ── Banner ───────────────────────────────────────────────────────────────
-    checks   = [trend_pass, pc_pass, voi_pass, rsi_pass, or_clear_pass]
-    n_pass   = sum(1 for c in checks if c is True)
-    n_scored = sum(1 for c in checks if c is not None)
-    dir_color = {"BULLISH": "#00c853", "BEARISH": "#d50000"}.get(direction, "#9e9e9e")
-    if direction == "BULLISH" and n_pass >= 4:
-        banner_bg, banner_icon, verdict_txt = "#1a3a1a", "✅", "GO"
-    elif direction == "BEARISH" or n_pass <= 1:
-        banner_bg, banner_icon, verdict_txt = "#3a1a1a", "🔴", "CAUTION"
-    else:
-        banner_bg, banner_icon, verdict_txt = "#2a2a1a", "⚠️", "MIXED"
-
+    # ── Direction banner (from archive, not re-evaluated) ─────────────────────
+    dir_color   = {"BULLISH": "#00c853", "BEARISH": "#d50000"}.get(direction, "#9e9e9e")
+    dir_icon    = "▲" if direction == "BULLISH" else "▼" if direction == "BEARISH" else "─"
+    hist_suffix = " (historical)" if _market_is_closed() else ""
     st.markdown(
-        f'<div style="background:{banner_bg};padding:1rem 1.5rem;border-radius:8px;margin-bottom:1rem">'
+        f'<div style="background:#1a1a2e;padding:0.75rem 1.5rem;border-radius:8px;margin-bottom:0.5rem">'
         f'<span style="font-size:1.4rem;font-weight:900;color:{dir_color}">'
-        f'{banner_icon} {verdict_txt} &nbsp;·&nbsp; {n_pass}/{n_scored} checks &nbsp;·&nbsp; '
-        f'{direction or "—"}'
-        f'</span><br>'
-        f'<span style="color:#aaa;font-size:0.85rem">Daily scanner · {run_time} ET · Spot ${spot}</span>'
+        f'{dir_icon} {direction}{hist_suffix}</span>'
+        f'&ensp;<span style="color:#eee">Spot ${spot}</span>'
+        f'&ensp;<span style="color:#aaa">P/C {pc_ratio:.2f}</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
-    st.caption("Daily Scanner — 5-Point Snapshot")
 
-    cols = st.columns(5)
-    items = [
-        ("Daily Trend",   trend_pass,     trend_sum,     trend_det),
-        ("P/C Skew",      pc_pass,        pc_sum,        pc_det),
-        ("Vol/OI ≥ 2x",  voi_pass,       voi_sum,       voi_det),
-        ("RSI < 70",      rsi_pass,       rsi_sum,       rsi_det),
-        ("OR Clear",      or_clear_pass,  or_clear_sum,  or_clear_det),
-    ]
-    for col, (name, passed, summary, detail) in zip(cols, items):
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Spot",        f"${spot}")
+    m2.metric("Call Volume", f"{tc:,}")
+    m3.metric("Put Volume",  f"{tp:,}")
+    m4.metric("P/C Ratio",   f"{pc_ratio:.2f}" if pc_ratio is not None else "—")
+
+    # ── Signal magnets ────────────────────────────────────────────────────────
+    mc1, mc2 = st.columns(2)
+    for col, side, color, label in [
+        (mc1, "call", "#00c853", "🟢 CALL MAGNET"),
+        (mc2, "put",  "#d50000", "🔴 PUT MAGNET"),
+    ]:
+        m = magnets.get(side) or {}
         with col:
-            _check_card(name, passed, summary, detail)
+            if m:
+                v   = int(m.get("volume") or 0)
+                oi  = max(int(m.get("openInterest") or 0), 1)
+                iv  = float(m.get("impliedVolatility") or 0)
+                st.markdown(
+                    f'<div style="border-left:4px solid {color};padding:0.4rem 0.8rem">'
+                    f'<b style="color:{color}">{label}</b><br>'
+                    f'${m.get("strike","?")} &nbsp; exp {m.get("expiry","?")} &nbsp; DTE {m.get("dte","?")}<br>'
+                    f'Vol {v:,} &nbsp; OI {oi:,} &nbsp; Vol/OI <b>{v/oi:.1f}x</b> &nbsp; IV {iv:.1%}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── Multi-timeframe table ─────────────────────────────────────────────────
+    st.markdown("**Multi-Timeframe**")
+    tf_rows = []
+    for tf in ["5M", "10M", "15M", "1H", "4H", "1D"]:
+        d    = tfs.get(tf) or {}
+        rsi  = d.get("rsi")
+        hist = d.get("hist")
+        vs   = d.get("vs")
+        tf_rows.append({
+            "TF":        tf,
+            "RSI":       _rsi_plain(rsi),
+            "MACD":      (f"{'BULLISH' if (hist or 0) > 0 else 'BEARISH'} [{hist:+.4f}]"
+                          if hist is not None else "—"),
+            "Vol Spike": f"{vs:.2f}×" if vs is not None else "—",
+            "Support":   f"${d.get('support', '—')}",
+            "Resist":    f"${d.get('resist', '—')}",
+        })
+    st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
+
+    # ── Opening Range ─────────────────────────────────────────────────────────
+    st.markdown("**Opening Range**")
+    or1, or2 = st.columns(2)
+    for col, tf_key, or_tf in [(or1, "5M", or_5m), (or2, "15M", or_15m)]:
+        with col:
+            if or_tf:
+                bias  = or_tf.get("bias", "—")
+                bdir  = or_tf.get("bias_dir", "")
+                bcolor = "#00c853" if bdir == "bull" else "#d50000" if bdir == "bear" else "#aaa"
+                st.markdown(
+                    f'<div style="border:1px solid #333;padding:0.5rem 0.75rem;border-radius:6px">'
+                    f'<b>{tf_key} OR</b> ({or_tf.get("open_time","?")} ET)'
+                    f'&ensp;<span style="color:{bcolor};font-weight:bold">{bias}</span><br>'
+                    f'<span style="color:#888;font-size:0.8rem">'
+                    f'O ${or_tf.get("open",0):.2f} '
+                    f'H ${or_tf.get("high",0):.2f} '
+                    f'L ${or_tf.get("low",0):.2f} '
+                    f'Rng ${or_tf.get("range",0):.2f}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── No checklist in daily archive ─────────────────────────────────────────
+    st.info(
+        "No checklist in daily archive — "
+        "run the **weekly scanner** for the 5-point gate evaluation.",
+        icon="ℹ️",
+    )
 
 
 def _render_weekly_run(payload: dict, spot: float | str, run_time: str):
-    """Checklist card layout for weekly scanner archives."""
-    macro    = payload.get("macro") or {}
-    oi       = payload.get("oi_structure") or {}
-    daily    = payload.get("daily") or {}
-    score    = payload.get("checklist_score")
-    e_date   = payload.get("earnings_date")
-    e_days   = payload.get("earnings_days")
-    thesis   = payload.get("thesis", "")
+    """Display archived weekly scanner data — score from archive, no verdicts recomputed."""
+    macro  = payload.get("macro") or {}
+    oi     = payload.get("oi_structure") or {}
+    daily  = payload.get("daily") or {}
+    weekly = payload.get("weekly") or {}
+    score  = payload.get("checklist_score")
+    e_date = payload.get("earnings_date")
+    e_days = payload.get("earnings_days")
+    thesis = payload.get("thesis", "")
 
-    spy      = macro.get("SPY")  or {}
-    qqq      = macro.get("QQQ")  or {}
-    vix_d    = macro.get("^VIX") or {}
+    spy   = macro.get("SPY")  or {}
+    qqq   = macro.get("QQQ")  or {}
+    vix_d = macro.get("^VIX") or {}
 
-    # ── 1. Macro Trend (SPY + QQQ above EMA20) ───────────────────────────────
-    spy_ok  = spy.get("above_ema20"); qqq_ok = qqq.get("above_ema20")
-    macro_pass = (spy_ok and qqq_ok) if (spy_ok is not None and qqq_ok is not None) else None
-    macro_sum  = (
-        f"SPY {'✓' if spy_ok else '✗'} EMA20  QQQ {'✓' if qqq_ok else '✗'} EMA20"
-        if spy_ok is not None else "—"
-    )
-    macro_det  = (
-        f"**SPY:** ${spy.get('spot','—')}  EMA20 ${spy.get('ema20','—')}  "
-        f"5d {spy.get('ret5d','—'):+.1f}%<br>" if spy.get('spot') else ""
-    ) + (
-        f"**QQQ:** ${qqq.get('spot','—')}  EMA20 ${qqq.get('ema20','—')}  "
-        f"5d {qqq.get('ret5d','—'):+.1f}%<br>" if qqq.get('spot') else ""
-    )
-
-    # ── 2. VIX < 20 ──────────────────────────────────────────────────────────
-    vix_spot = vix_d.get("spot")
-    vix_pass = (vix_spot < 20) if vix_spot is not None else None
-    vix_sum  = f"VIX={vix_spot:.2f}" if vix_spot is not None else "—"
-    vix_det  = (
-        f"**VIX:** {vix_spot:.2f}  (< 20 = cheap options, good for buying debit spreads)<br>"
-        f"5d return: {vix_d.get('ret5d','—')}"
-    ) if vix_spot else "VIX not in this archive."
-
-    # ── 3. Daily Trend (AAPL above EMA14) ────────────────────────────────────
-    d_spot  = daily.get("spot"); ema14 = daily.get("ema14")
-    trend_pass = (d_spot > ema14) if (d_spot and ema14) else None
-    trend_sum  = (
-        f"${d_spot:.2f} vs EMA14 ${ema14:.2f}  ({'above ✓' if trend_pass else 'below ✗'})"
-        if d_spot else "—"
-    )
-    trend_det  = (
-        f"**Spot:** ${d_spot}  **EMA14:** ${ema14}  **EMA28:** ${daily.get('ema28','—')}"
-        f"  **EMA50:** ${daily.get('ema50','—')}<br>"
-        f"**RSI(14):** {daily.get('rsi','—')}  **MACD hist:** {daily.get('macd_hist','—')}<br>"
-        f"**ATR(14):** ${daily.get('atr','—')}  "
-        f"Support ${daily.get('support','—')}  Resist ${daily.get('resist','—')}"
-    ) if d_spot else "Daily data not in this archive."
-
-    # ── 4. P/C OI Skew (< 0.80) ──────────────────────────────────────────────
-    pc_oi   = oi.get("pc_oi")
-    pc_pass = (pc_oi < 0.80) if pc_oi is not None else None
-    pc_sum  = f"Near-term P/C OI={pc_oi:.2f} (want < 0.80 for calls)" if pc_oi is not None else "—"
-    pc_det  = (
-        f"**P/C OI ratio:** {pc_oi}<br>"
-        f"**Total call OI:** {int(oi.get('total_call_oi',0)):,}  "
-        f"**Total put OI:** {int(oi.get('total_put_oi',0)):,}<br>"
-        f"**Max pain:** ${oi.get('max_pain','—')}  "
-        f"**IV skew:** {oi.get('iv_skew','—')}%"
-    ) if pc_oi is not None else "OI structure not in this archive."
-
-    # ── 5. Earnings > 7 days ──────────────────────────────────────────────────
-    earn_pass = (e_days > 7) if e_days is not None else None
-    earn_sum  = (
-        f"Next earnings hint {e_date} ({e_days}d away)"
-        if e_days is not None else "No earnings date in this archive"
-    )
-    earn_det  = (
-        f"**Earnings date:** {e_date}<br>**Days away:** {e_days}<br>"
-        f"{'✅ Safe window' if earn_pass else '⚠️ Too close — avoid holding through earnings'}"
-    ) if e_days is not None else earn_sum
-
-    # ── Banner ───────────────────────────────────────────────────────────────
-    checks  = [macro_pass, vix_pass, trend_pass, pc_pass, earn_pass]
-    n_pass  = sum(1 for c in checks if c is True)
-    display_score = score if score is not None else n_pass
-
-    if display_score >= 4:
-        banner_bg, banner_icon, verdict_txt = "#1a3a1a", "✅", "TRADE APPROVED"
-    elif display_score >= 3:
-        banner_bg, banner_icon, verdict_txt = "#2a2a1a", "⚠️", "MARGINAL"
+    # ── Score banner — verbatim from archive ──────────────────────────────────
+    if score is not None:
+        if score >= 4:
+            bg, icon = "#1a3a1a", "✅"
+        elif score >= 3:
+            bg, icon = "#2a2a1a", "⚠️"
+        else:
+            bg, icon = "#3a1a1a", "🔴"
+        st.markdown(
+            f'<div style="background:{bg};padding:0.75rem 1.5rem;border-radius:8px;margin-bottom:0.5rem">'
+            f'<span style="font-size:1.4rem;font-weight:900;color:#fff">'
+            f'{icon} Checklist score: {score}/5</span><br>'
+            f'<span style="color:#aaa;font-size:0.85rem">'
+            f'Weekly scanner · {run_time} ET · Spot ${spot}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
     else:
-        banner_bg, banner_icon, verdict_txt = "#3a1a1a", "🔴", "NO-GO"
+        st.markdown(f"**Weekly scanner · {run_time} ET · Spot ${spot}**")
 
-    st.markdown(
-        f'<div style="background:{banner_bg};padding:1rem 1.5rem;border-radius:8px;margin-bottom:1rem">'
-        f'<span style="font-size:1.4rem;font-weight:900;color:#fff">'
-        f'{banner_icon} {verdict_txt} &nbsp;·&nbsp; {display_score}/5 &nbsp;·&nbsp; '
-        f'{"BULLISH" if trend_pass else ("BEARISH" if trend_pass is False else "—")}'
-        f'</span><br>'
-        f'<span style="color:#aaa;font-size:0.85rem">Weekly scanner · {run_time} ET · Spot ${spot}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-    st.caption("Execution Gate — 5-Point Checklist")
+    st.caption("Score and all field values read verbatim from archive — no criteria recomputed here.")
 
-    cols = st.columns(5)
-    items = [
-        ("Macro Clear",   macro_pass,  macro_sum,  macro_det),
-        ("VIX < 20",      vix_pass,    vix_sum,    vix_det),
-        ("Daily Trend",   trend_pass,  trend_sum,  trend_det),
-        ("P/C Skew",      pc_pass,     pc_sum,     pc_det),
-        ("Earnings > 7d", earn_pass,   earn_sum,   earn_det),
-    ]
-    for col, (name, passed, summary, detail) in zip(cols, items):
-        with col:
-            _check_card(name, passed, summary, detail)
+    # ── Data table: values as recorded by the scanner ─────────────────────────
+    rows = []
+
+    # Macro
+    for ticker, td in [("SPY", spy), ("QQQ", qqq)]:
+        if td.get("spot"):
+            above = td.get("above_ema20")
+            rows.append({
+                "Field":  f"{ticker} vs EMA20",
+                "Value":  f"${td['spot']:.2f} / EMA20 ${td.get('ema20','—')}",
+                "Detail": f"above_ema20={above}  5d={td.get('ret5d','—'):+.1f}%  RSI={td.get('rsi','—')}",
+            })
+
+    vix_spot = vix_d.get("spot")
+    if vix_spot is not None:
+        rows.append({
+            "Field":  "VIX",
+            "Value":  f"{vix_spot:.2f}",
+            "Detail": f"EMA20 {vix_d.get('ema20','—')}  5d {vix_d.get('ret5d','—'):+.1f}%",
+        })
+
+    d_spot = daily.get("spot")
+    if d_spot:
+        rows.append({
+            "Field":  "AAPL Daily",
+            "Value":  f"${d_spot:.2f} / EMA14 ${daily.get('ema14','—')}",
+            "Detail": f"RSI {daily.get('rsi','—')}  MACD hist {daily.get('macd_hist','—')}  "
+                      f"EMA28 ${daily.get('ema28','—')}  EMA50 ${daily.get('ema50','—')}",
+        })
+
+    w_spot = weekly.get("spot")
+    if w_spot:
+        rows.append({
+            "Field":  "AAPL Weekly",
+            "Value":  f"${w_spot:.2f} / EMA14 ${weekly.get('ema14','—')}",
+            "Detail": f"RSI {weekly.get('rsi','—')}  MACD hist {weekly.get('macd_hist','—')}",
+        })
+
+    pc_oi = oi.get("pc_oi")
+    if pc_oi is not None:
+        rows.append({
+            "Field":  "P/C OI (near-term)",
+            "Value":  f"{pc_oi:.3f}",
+            "Detail": f"Call OI {int(oi.get('total_call_oi',0)):,}  "
+                      f"Put OI {int(oi.get('total_put_oi',0)):,}  "
+                      f"Max pain ${oi.get('max_pain','—')}  IV skew {oi.get('iv_skew','—')}%",
+        })
+
+    if e_date is not None:
+        rows.append({
+            "Field":  "Earnings",
+            "Value":  f"{e_date}  ({e_days}d away)",
+            "Detail": "",
+        })
+
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     if thesis:
         with st.popover("📄 Weekly thesis", use_container_width=True):
@@ -803,15 +785,25 @@ def _render_expiry_vol_table(vol_curr: dict, vol_prev: dict | None, overall_pc: 
         d   = curr[exp]
         cv, pv = d["call_vol"], d["put_vol"]
         dte = d["dte"]
-        pc  = pv / cv if cv > 0 else 0
 
-        if pc < 0.7:   bias = "▲ BULLISH"
-        elif pc < 0.9: bias = "▲ MILD BULLISH"
-        elif pc < 1.1: bias = "- NEUTRAL"
-        elif pc < 1.5: bias = "▼ MILD BEARISH"
-        else:          bias = "▼ BEARISH"
+        # Guard: zero on either side → genuine data gap, not a valid P/C
+        data_gap = (cv == 0 or pv == 0)
+        if data_gap:
+            pc   = None
+            bias = ""
+        else:
+            pc = pv / cv
+            if pc < 0.7:   bias = "▲ BULLISH"
+            elif pc < 0.9: bias = "▲ MILD BULLISH"
+            elif pc < 1.1: bias = "- NEUTRAL"
+            elif pc < 1.5: bias = "▼ MILD BEARISH"
+            else:          bias = "▼ BEARISH"
 
-        notable = abs(pc - overall_pc) > 0.25 if overall_pc > 0 else False
+        notable = (
+            abs(pc - overall_pc) > 0.25
+            if (pc is not None and overall_pc > 0)
+            else False
+        )
         pd_     = prev.get(exp, {})
         cv_d    = cv - pd_.get("call_vol", 0) if vol_prev else None
         pv_d    = pv - pd_.get("put_vol",  0) if vol_prev else None
@@ -827,12 +819,11 @@ def _render_expiry_vol_table(vol_curr: dict, vol_prev: dict | None, overall_pc: 
             "DTE":      f"{dte}d",
             "CALL VOL": f"{cv:,}",
             "PUT VOL":  f"{pv:,}",
-            "P/C":      f"{pc:.2f}",
+            "P/C":      f"{pc:.2f}" if pc is not None else "n/a",
             "BIAS":     bias,
-            "NOTABLE":  "◄ notable" if notable else "",
+            "NOTABLE":  "⚠ possible data gap" if data_gap else ("◄ notable" if notable else ""),
             "CALL Δ":   _ds(cv_d),
             "PUT Δ":    _ds(pv_d),
-            # numeric shadows for styling
             "_cv_d":    cv_d,
             "_pv_d":    pv_d,
         })
@@ -1164,22 +1155,24 @@ def _render_tab3(cfg: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    _market_banner()
     cfg = _sidebar()
 
     tab1, tab2, tab3 = st.tabs([
-        "📈 Flow table",
-        "📋 Scanner runs",
-        "🔬 Spread gate",
+        "📈 Options Flow",
+        "📋 Scanner Archive",
+        "🔬 Spread Gate",
     ])
 
     with tab1:
+        _market_banner()
         _render_tab1(cfg)
 
     with tab2:
+        _market_banner()
         _render_tab2()
 
     with tab3:
+        _market_banner()
         _render_tab3(cfg)
 
 
