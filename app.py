@@ -7,6 +7,9 @@ functions or archive JSON files. No indicators recomputed here.
 import glob
 import json
 import os
+import subprocess
+import sys
+import time
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
@@ -67,20 +70,61 @@ def _market_banner():
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
+_SCANNER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _run_daily_scanner() -> tuple[bool, str]:
+    """
+    Invoke dailyScaner.py with the same Python that runs Streamlit.
+    Returns (success, combined_output).
+    """
+    t0 = time.time()
+    try:
+        result = subprocess.run(
+            [sys.executable, "dailyScaner.py"],
+            cwd=_SCANNER_DIR,
+            capture_output=True,
+            text=True,
+            timeout=300,   # 5-min hard cap
+        )
+        elapsed = time.time() - t0
+        out = result.stdout + ("\n" + result.stderr if result.stderr.strip() else "")
+        return result.returncode == 0, f"[{elapsed:.0f}s]\n{out}"
+    except subprocess.TimeoutExpired:
+        return False, "Scanner timed out after 5 minutes."
+    except Exception as exc:
+        return False, f"Could not launch scanner: {exc}"
+
+
 def _sidebar() -> dict:
     with st.sidebar:
         st.title("📊 AAPL Scanner")
-        st.caption("Display layer — no analysis computed here")
+        st.caption("Display layer — results from archive JSONs")
         st.divider()
 
-        run = st.button("🔄 Reload archive", use_container_width=True, type="primary")
+        st.markdown("**Daily scan**")
+        run_scan = st.button(
+            "🚀 Run Daily Scan",
+            use_container_width=True,
+            type="primary",
+            help="Runs dailyScaner.py and saves a new archive JSON",
+        )
 
+        if run_scan:
+            with st.spinner("Running daily scanner… (may take 1–2 min)"):
+                ok, output = _run_daily_scanner()
+            if ok:
+                st.success("Scan complete — archive updated.")
+                _scan_archive_metadata.clear()   # bust cache so Tab 2 reloads
+            else:
+                st.error("Scanner returned an error.")
+            with st.expander("Scanner output", expanded=not ok):
+                st.code(output[-4000:], language="text")   # last 4 KB
+
+        st.divider()
         st.subheader("Flow filters")
         min_dte = st.number_input("Min DTE", min_value=0, value=1, step=1)
-        sort_by = st.selectbox(
-            "Sort by",
-            ["Volume", "Premium $", "Strike"],
-        )
+        sort_by = st.selectbox("Sort by", ["Volume", "Premium $", "Strike"])
 
         st.divider()
         latest = _latest_archive()
@@ -90,7 +134,7 @@ def _sidebar() -> dict:
             st.caption(f"Spot at run: ${latest.get('spot', '—')}")
 
     return {
-        "run": run,
+        "run": run_scan,
         "min_dte": min_dte,
         "sort_by": sort_by,
         "latest_archive": latest,
