@@ -143,8 +143,112 @@ def _rsi_plain(rsi: float | None) -> str:
     return f"OVERSOLD ({rsi:.1f})"
 
 
+def _voi_style(val: str) -> str:
+    """Pandas Styler cell function — heat-gradient background for VOL/OI column."""
+    try:
+        v = float(str(val).replace("x", "").replace("🔥", "").strip())
+    except (ValueError, AttributeError):
+        return ""
+    if v >= 100: return "background-color:#7f0000;color:#fff;font-weight:bold"
+    if v >= 50:  return "background-color:#b71c1c;color:#fff;font-weight:bold"
+    if v >= 20:  return "background-color:#d50000;color:#fff;font-weight:bold"
+    if v >= 10:  return "background-color:#e65100;color:#fff;font-weight:bold"
+    if v >= 5:   return "background-color:#ff6d00;color:#fff;font-weight:bold"
+    if v >= 2:   return "background-color:#ffa726;color:#000;font-weight:bold"
+    return ""
+
+
+def _contracts_table(contracts: list, n: int = 5) -> pd.DataFrame | None:
+    """Build a styled DataFrame from a top_calls / top_puts list."""
+    rows = []
+    for c in contracts[:n]:
+        v   = int(c.get("volume") or 0)
+        oi  = max(int(c.get("openInterest") or 0), 1)
+        voi = v / oi
+        rows.append({
+            "EXPIRY":  c.get("expiry", ""),
+            "STRIKE":  f"${float(c.get('strike', 0)):.1f}",
+            "PRICE":   f"${float(c.get('lastPrice') or 0):.2f}",
+            "VOLUME":  f"{v:,}",
+            "OI":      f"{oi:,}",
+            "VOL/OI":  f"{voi:.2f}x 🔥" if voi >= 2 else f"{voi:.2f}x",
+            "_voi":    voi,
+        })
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    styled = df.drop(columns=["_voi"]).style.map(_voi_style, subset=["VOL/OI"])
+    return styled
+
+
+def _build_expiry_table(
+    vol: dict, prev_vol: dict | None, overall_pc: float
+) -> tuple[list[dict], dict[str, float]]:
+    """
+    Group top_calls + top_puts by expiry, compute P/C and Δ vs previous run.
+    Returns (rows_for_table, {expiry: pc_ratio}) for the bar chart.
+    """
+    curr_exp: dict[str, dict] = {}
+    for side_key, vol_key in [("call_vol", "top_calls"), ("put_vol", "top_puts")]:
+        for c in (vol.get(vol_key) or []):
+            exp = c.get("expiry", "?")
+            dte = int(c.get("dte", 0))
+            v   = int(c.get("volume") or 0)
+            if exp not in curr_exp:
+                curr_exp[exp] = {"dte": dte, "call_vol": 0, "put_vol": 0}
+            curr_exp[exp][side_key] += v
+
+    prev_exp: dict[str, dict] = {}
+    if prev_vol:
+        for side_key, vol_key in [("call_vol", "top_calls"), ("put_vol", "top_puts")]:
+            for c in (prev_vol.get(vol_key) or []):
+                exp = c.get("expiry", "?")
+                v   = int(c.get("volume") or 0)
+                prev_exp.setdefault(exp, {"call_vol": 0, "put_vol": 0})[side_key] += v
+
+    rows, chart_pc = [], {}
+    for exp in sorted(curr_exp):
+        d  = curr_exp[exp]
+        cv, pv = d["call_vol"], d["put_vol"]
+        dte    = d["dte"]
+        pc     = pv / cv if cv > 0 else 0
+        chart_pc[exp] = pc
+
+        if pc < 0.7:   bias = "▲ BULLISH"
+        elif pc < 0.9: bias = "▲ MILD BULLISH"
+        elif pc < 1.1: bias = "— NEUTRAL"
+        elif pc < 1.5: bias = "▼ MILD BEARISH"
+        else:          bias = "▼ BEARISH"
+
+        notable = abs(pc - overall_pc) > 0.25 if overall_pc > 0 else False
+
+        pd_   = prev_exp.get(exp, {})
+        cv_d  = cv - pd_.get("call_vol", 0) if prev_vol else None
+        pv_d  = pv - pd_.get("put_vol",  0) if prev_vol else None
+
+        def _ds(v):
+            if v is None: return "·0"
+            if v > 0: return f"▲+{v:,}"
+            if v < 0: return f"▼{v:,}"
+            return "·0"
+
+        rows.append({
+            "EXPIRY":   exp,
+            "DTE":      f"{dte}d",
+            "CALL VOL": f"{cv:,}",
+            "PUT VOL":  f"{pv:,}",
+            "P/C":      f"{pc:.2f}",
+            "BIAS":     bias,
+            "NOTABLE":  "◄ notable" if notable else "",
+            "CALL Δ":   _ds(cv_d),
+            "PUT Δ":    _ds(pv_d),
+        })
+
+    return rows, chart_pc
+
+
 def _render_tab1(cfg: dict):
-    """Latest scanner run — rich multi-section report from archive JSON."""
+    """Options Flow — Magnets heatmap + Volume-by-Expiry term structure."""
 
     files = sorted(glob.glob("archive/AAPL_*.json"), reverse=True)
     if not files:
@@ -155,8 +259,7 @@ def _render_tab1(cfg: dict):
         with open(files[0]) as f:
             curr = json.load(f)
     except Exception as e:
-        st.error(f"Could not read archive: {e}")
-        return
+        st.error(f"Could not read archive: {e}"); return
 
     prev = None
     if len(files) > 1:
@@ -174,176 +277,168 @@ def _render_tab1(cfg: dict):
     mags      = curr.get("signal_magnets") or {}
     or_data   = curr.get("or_data") or {}
     pc_ratio  = float(vol.get("pc_ratio") or 0)
+    prev_vol  = (prev.get("volume") or {}) if prev else None
 
-    if ts_str:
-        ts_et = datetime.fromisoformat(ts_str).astimezone(ET)
-        st.caption(f"Latest run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
-
-    # ── Banner ─────────────────────────────────────────────────────────────────
+    # ── Top bar ───────────────────────────────────────────────────────────────
     dir_color = "#00c853" if "BULL" in direction else "#d50000" if "BEAR" in direction else "#9e9e9e"
     dir_icon  = "▲" if "BULL" in direction else "▼" if "BEAR" in direction else "─"
     pc_bias   = "BULLISH SKEW" if pc_ratio < 0.7 else ("BEARISH SKEW" if pc_ratio > 1.0 else "NEUTRAL")
+
+    if ts_str:
+        ts_et = datetime.fromisoformat(ts_str).astimezone(ET)
+        st.caption(f"Last run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
+
     st.markdown(
-        f'<div style="background:#1a1a2e;padding:1rem 1.5rem;border-radius:8px;margin-bottom:0.5rem">'
-        f'<span style="font-size:1.8rem;font-weight:900;color:{dir_color}">'
-        f'{dir_icon} {direction}</span>'
-        f'&ensp;<span style="font-size:1.3rem;color:#eee">Spot ${spot:.2f}</span>'
-        f'&ensp;<span style="color:#aaa;font-size:1rem">P/C {pc_ratio:.2f} ← {pc_bias}</span>'
+        f'<div style="background:#1a1a2e;padding:0.75rem 1.5rem;border-radius:8px;margin-bottom:0.5rem">'
+        f'<span style="font-size:1.5rem;font-weight:900;color:{dir_color}">{dir_icon} {direction}</span>'
+        f'&ensp;<span style="font-size:1.1rem;color:#eee">Spot ${spot:.2f}</span>'
+        f'&ensp;<span style="color:#aaa">P/C {pc_ratio:.2f} ← {pc_bias}</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Spot",        f"${spot:.2f}")
+    m2.metric("Call Volume", f"{int(vol.get('total_call_vol') or 0):,}")
+    m3.metric("Put Volume",  f"{int(vol.get('total_put_vol')  or 0):,}")
+    m4.metric("P/C Ratio",   f"{pc_ratio:.2f}")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Spot",         f"${spot:.2f}")
-    c2.metric("Call Volume",  f"{int(vol.get('total_call_vol') or 0):,}")
-    c3.metric("Put Volume",   f"{int(vol.get('total_put_vol')  or 0):,}")
-    c4.metric("P/C Ratio",    f"{pc_ratio:.2f}")
+    st.markdown("---")
 
-    # ── Changes vs last run ────────────────────────────────────────────────────
+    # ══ Two-column main layout ════════════════════════════════════════════════
+    left, right = st.columns([1, 1.4], gap="large")
+
+    # ── LEFT: The Magnets ─────────────────────────────────────────────────────
+    with left:
+        st.markdown("### The Magnets — Top 5 Calls / Top 5 Puts")
+        st.caption("🔥 Vol/OI heatmap — values ≥ 2.0x glow hot (unusual vs open interest)")
+
+        for key, label in [("top_calls", "Top 5 CALLS"), ("top_puts", "Top 5 PUTS")]:
+            contracts = vol.get(key) or []
+            st.markdown(f"**{label}**")
+            styled = _contracts_table(contracts, n=5)
+            if styled is not None:
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No data")
+
+    # ── RIGHT: Volume by Expiry ───────────────────────────────────────────────
+    with right:
+        st.markdown("### Volume by Expiry — P/C term structure")
+        st.caption("Institutional-style skew across the expiry curve")
+
+        exp_rows, chart_pc = _build_expiry_table(vol, prev_vol, pc_ratio)
+
+        if exp_rows:
+            exp_df = pd.DataFrame(exp_rows)
+
+            def _bias_style(val: str) -> str:
+                if "BULL" in str(val): return "color:#00c853;font-weight:bold"
+                if "BEAR" in str(val): return "color:#d50000;font-weight:bold"
+                return "color:#9e9e9e"
+
+            def _delta_style(val: str) -> str:
+                s = str(val)
+                if s.startswith("▲"): return "color:#00c853"
+                if s.startswith("▼"): return "color:#d50000"
+                return "color:#666"
+
+            styled_exp = (
+                exp_df.style
+                .map(_bias_style,   subset=["BIAS"])
+                .map(_delta_style,  subset=["CALL Δ", "PUT Δ"])
+            )
+            st.dataframe(styled_exp, use_container_width=True, hide_index=True)
+
+            # Bar chart — P/C ratio by expiry
+            if chart_pc:
+                chart_df = pd.DataFrame(
+                    {"P/C ratio": list(chart_pc.values())},
+                    index=list(chart_pc.keys()),
+                )
+                st.bar_chart(chart_df, height=200, color="#1565c0")
+        else:
+            st.caption("No expiry data available")
+
+    # ══ Collapsible detail sections ═══════════════════════════════════════════
+    with st.expander("📊 Multi-Timeframe Detail", expanded=False):
+        tf_rows = []
+        for tf in ["5M", "10M", "15M", "1H", "4H", "1D"]:
+            d    = tfs.get(tf) or {}
+            rsi  = d.get("rsi")
+            hist = d.get("hist")
+            vs   = d.get("vs")
+            tf_rows.append({
+                "TF":        tf,
+                "RSI":       _rsi_plain(rsi),
+                "MACD":      (f"{'BULLISH' if (hist or 0) > 0 else 'BEARISH'} [{hist:+.4f}]"
+                              if hist is not None else "—"),
+                "Vol Spike": f"{vs:.2f}×" if vs is not None else "—",
+                "Support":   f"${d.get('support', '—')}",
+                "Resist":    f"${d.get('resist', '—')}",
+            })
+        st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
+
     if prev:
         prev_spot = float(prev.get("spot") or 0)
         prev_pc   = float((prev.get("volume") or {}).get("pc_ratio") or 0)
         try:
-            prev_ts = datetime.fromisoformat(prev.get("timestamp","")).astimezone(ET)
-            prev_ts_str = prev_ts.strftime("%Y-%m-%d %H:%M ET")
+            prev_ts_str = datetime.fromisoformat(prev.get("timestamp", "")).astimezone(ET).strftime("%Y-%m-%d %H:%M ET")
         except Exception:
             prev_ts_str = "previous run"
         spot_chg = spot - prev_spot
         pc_chg   = pc_ratio - prev_pc
         pct_chg  = (spot_chg / prev_spot * 100) if prev_spot else 0
 
-        st.markdown("---")
-        st.markdown(
-            f'<b style="font-size:1rem">CHANGES vs last run</b> '
-            f'<span style="color:#888;font-size:0.85rem">since {prev_ts_str}</span>',
-            unsafe_allow_html=True,
-        )
+        with st.expander(f"📈 Changes vs last run  (since {prev_ts_str})", expanded=False):
+            ca, cb = st.columns(2)
+            with ca:
+                st.metric("Spot",      f"${spot:.2f}",    delta=f"{spot_chg:+.2f} ({pct_chg:+.1f}%)")
+                st.metric("P/C Ratio", f"{pc_ratio:.3f}", delta=f"{pc_chg:+.3f}")
+            with cb:
+                rsi_lines = []
+                for tf in ["5M", "10M", "15M", "1H", "4H", "1D"]:
+                    cr = (tfs.get(tf) or {}).get("rsi")
+                    pr = ((prev.get("timeframes") or {}).get(tf) or {}).get("rsi")
+                    if cr is not None and pr is not None:
+                        rsi_lines.append(f"**{tf}:** {pr:.1f}→{cr:.1f} ({cr-pr:+.1f})")
+                if rsi_lines:
+                    st.markdown("**RSI shifts**  \n" + "  \n".join(rsi_lines))
+            prev_mags = prev.get("signal_magnets") or {}
+            for side in ("call", "put"):
+                cm = mags.get(side) or {}
+                pm = prev_mags.get(side) or {}
+                if cm and pm and cm.get("strike") != pm.get("strike"):
+                    icon = "▲ CALL" if side == "call" else "▼ PUT"
+                    st.info(
+                        f"**{icon} MAGNET shifted:** "
+                        f"${pm.get('strike')} ({pm.get('expiry')}) → "
+                        f"${cm.get('strike')} ({cm.get('expiry')})  ← STRIKE CHANGE"
+                    )
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.metric("Spot",     f"${spot:.2f}",    delta=f"{spot_chg:+.2f} ({pct_chg:+.1f}%)")
-            st.metric("P/C Ratio",f"{pc_ratio:.3f}", delta=f"{pc_chg:+.3f}")
-        with col_b:
-            rsi_parts = []
-            for tf in ["5M", "10M", "15M", "1H", "4H", "1D"]:
-                c_rsi = (tfs.get(tf) or {}).get("rsi")
-                p_rsi = ((prev.get("timeframes") or {}).get(tf) or {}).get("rsi")
-                if c_rsi is not None and p_rsi is not None:
-                    d = c_rsi - p_rsi
-                    rsi_parts.append(f"**{tf}:** {p_rsi:.1f}→{c_rsi:.1f} ({d:+.1f})")
-            if rsi_parts:
-                st.markdown("**RSI shifts**  \n" + "  \n".join(rsi_parts))
-
-        prev_mags = prev.get("signal_magnets") or {}
-        for side in ("call", "put"):
-            cm = mags.get(side) or {}
-            pm = prev_mags.get(side) or {}
-            if cm and pm and cm.get("strike") != pm.get("strike"):
-                icon = "▲ CALL" if side == "call" else "▼ PUT"
-                st.info(
-                    f"**{icon} MAGNET shifted:** "
-                    f"${pm.get('strike')} ({pm.get('expiry')}) → "
-                    f"${cm.get('strike')} ({cm.get('expiry')})  ← STRIKE CHANGE"
-                )
-
-    # ── Multi-timeframe table ──────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("Multi-Timeframe")
-    tf_rows = []
-    for tf in ["5M", "10M", "15M", "1H", "4H", "1D"]:
-        d    = tfs.get(tf) or {}
-        rsi  = d.get("rsi")
-        hist = d.get("hist")
-        vs   = d.get("vs")
-        tf_rows.append({
-            "TF":        tf,
-            "RSI":       _rsi_plain(rsi),
-            "MACD":      (f"{'BULLISH' if (hist or 0) > 0 else 'BEARISH'} [hist {hist:+.4f}]"
-                          if hist is not None else "—"),
-            "Vol Spike": f"{vs:.2f}×" if vs is not None else "—",
-            "Support":   f"${d.get('support', '—')}",
-            "Resist":    f"${d.get('resist', '—')}",
-        })
-    st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
-
-    # ── Top calls + puts ───────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("Top Volume Contracts")
-    col_c, col_p = st.columns(2)
-
-    for col, key, label in [
-        (col_c, "top_calls", "🟢 CALL Volume"),
-        (col_p, "top_puts",  "🔴 PUT Volume"),
-    ]:
-        contracts = vol.get(key) or []
-        with col:
-            st.markdown(f"**{label}**")
-            rows = []
-            for i, c in enumerate(contracts):
-                v   = int(c.get("volume") or 0)
-                oi  = int(c.get("openInterest") or 0)
-                voi = v / oi if oi > 0 else 0
-                rows.append({
-                    "Strike":  f"${float(c.get('strike', 0)):.1f}" + (" ★" if i == 0 else ""),
-                    "Expiry":  c.get("expiry", ""),
-                    "DTE":     int(c.get("dte", 0)),
-                    "Last":    f"${float(c.get('lastPrice') or 0):.2f}",
-                    "Volume":  f"{v:,}",
-                    "Vol/OI":  f"{voi:.1f}x",
-                    "OI":      f"{oi:,}",
-                })
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No data")
-
-    # ── Signal magnets ─────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("Signal Magnets")
-    m1, m2 = st.columns(2)
-    for col, side, color in [(m1, "call", "#00c853"), (m2, "put", "#d50000")]:
-        m = mags.get(side) or {}
-        with col:
-            if m:
-                v   = int(m.get("volume") or 0)
-                oi  = max(int(m.get("openInterest") or 0), 1)
-                iv  = float(m.get("impliedVolatility") or 0)
-                label = "🟢 CALL MAGNET" if side == "call" else "🔴 PUT MAGNET"
-                st.markdown(
-                    f'<div style="border-left:4px solid {color};padding:0.5rem 1rem;margin-bottom:0.5rem">'
-                    f'<b style="color:{color}">{label}</b><br>'
-                    f'Strike <b>${m.get("strike","?")} </b>'
-                    f'Expiry {m.get("expiry","?")} &nbsp; DTE {m.get("dte","?")}<br>'
-                    f'Vol {v:,} &nbsp; OI {oi:,} &nbsp; '
-                    f'<b>Vol/OI {v/oi:.1f}x</b> &nbsp; IV {iv:.1%}'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-    # ── Opening Range Breakout ─────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("Opening Range Breakout")
-    or1, or2 = st.columns(2)
-    for col, tf_key in [(or1, "5M"), (or2, "15M")]:
-        or_tf = or_data.get(tf_key) or {}
-        with col:
-            if or_tf:
-                bias     = or_tf.get("bias", "—")
-                bias_dir = or_tf.get("bias_dir", "")
-                color    = "#00c853" if bias_dir == "bull" else "#d50000" if bias_dir == "bear" else "#aaa"
-                st.markdown(
-                    f'<div style="border:1px solid #333;padding:0.75rem 1rem;border-radius:6px">'
-                    f'<b>{tf_key} OR</b> ({or_tf.get("open_time","?")} ET)<br>'
-                    f'<span style="color:{color};font-weight:bold;font-size:1.1rem">{bias}</span><br>'
-                    f'<span style="color:#888;font-size:0.85rem">'
-                    f'Open ${or_tf.get("open",0):.2f} &nbsp; '
-                    f'High ${or_tf.get("high",0):.2f} &nbsp; '
-                    f'Low ${or_tf.get("low",0):.2f} &nbsp; '
-                    f'Range ${or_tf.get("range",0):.2f} ({or_tf.get("range_pct",0):.2f}%)'
-                    f'</span>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+    with st.expander("⏰ Opening Range Breakout", expanded=False):
+        or1, or2 = st.columns(2)
+        for col, tf_key in [(or1, "5M"), (or2, "15M")]:
+            or_tf = or_data.get(tf_key) or {}
+            with col:
+                if or_tf:
+                    bias     = or_tf.get("bias", "—")
+                    bias_dir = or_tf.get("bias_dir", "")
+                    color    = "#00c853" if bias_dir == "bull" else "#d50000" if bias_dir == "bear" else "#aaa"
+                    st.markdown(
+                        f'<div style="border:1px solid #333;padding:0.75rem 1rem;border-radius:6px">'
+                        f'<b>{tf_key} OR</b> ({or_tf.get("open_time","?")} ET)<br>'
+                        f'<span style="color:{color};font-weight:bold;font-size:1.1rem">{bias}</span><br>'
+                        f'<span style="color:#888;font-size:0.85rem">'
+                        f'Open ${or_tf.get("open",0):.2f} &nbsp; '
+                        f'High ${or_tf.get("high",0):.2f} &nbsp; '
+                        f'Low ${or_tf.get("low",0):.2f} &nbsp; '
+                        f'Range ${or_tf.get("range",0):.2f} ({or_tf.get("range_pct",0):.2f}%)'
+                        f'</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption(f"No {tf_key} OR data in this archive.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
