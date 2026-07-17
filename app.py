@@ -285,7 +285,7 @@ def _check_card(name: str, passed: bool | None, summary: str, detail: str):
         f'<span style="color:{summary_color};font-size:0.9rem">{arrow}{summary}</span>',
         unsafe_allow_html=True,
     )
-    with st.expander("detail"):
+    with st.popover("detail", use_container_width=True):
         st.markdown(detail, unsafe_allow_html=True)
     st.write("")
 
@@ -534,7 +534,7 @@ def _render_weekly_run(payload: dict, spot: float | str, run_time: str):
             _check_card(name, passed, summary, detail)
 
     if thesis:
-        with st.expander("📄 Weekly thesis"):
+        with st.popover("📄 Weekly thesis", use_container_width=True):
             st.markdown(thesis)
 
 
