@@ -73,14 +73,13 @@ def _sidebar() -> dict:
         st.caption("Display layer — no analysis computed here")
         st.divider()
 
-        run = st.button("🔄 Run scan", use_container_width=True, type="primary")
+        run = st.button("🔄 Reload archive", use_container_width=True, type="primary")
 
         st.subheader("Flow filters")
         min_dte = st.number_input("Min DTE", min_value=0, value=1, step=1)
-        min_dvol = st.number_input("Min Δvolume", min_value=0, value=0, step=100)
         sort_by = st.selectbox(
             "Sort by",
-            ["Premium $", "Δ-premium", "Volume", "Strike"],
+            ["Volume", "Premium $", "Strike"],
         )
 
         st.divider()
@@ -93,110 +92,95 @@ def _sidebar() -> dict:
     return {
         "run": run,
         "min_dte": min_dte,
-        "min_dvol": min_dvol,
         "sort_by": sort_by,
         "latest_archive": latest,
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Flow table
+# TAB 1 — Flow table (reads from archive — no live data fetched)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SORT_MAP = {
-    "Premium $":  "premium",
-    "Δ-premium":  "delta_premium",
-    "Volume":     "volume",
-    "Strike":     "strike",
-}
+def _load_archive_chain() -> tuple[pd.DataFrame, dict | None]:
+    """
+    Build a flat per-contract DataFrame from the most recent daily archive JSON.
+    Uses top_calls / top_puts stored by the scanner; no live data fetched.
+    Returns (df, raw_payload).
+    """
+    files = sorted(glob.glob("archive/AAPL_*.json"), reverse=True)
+    if not files:
+        return pd.DataFrame(), None
+    try:
+        with open(files[0]) as f:
+            payload = json.load(f)
+    except Exception:
+        return pd.DataFrame(), None
 
+    vol_block = payload.get("volume", {})
+    rows: list[dict] = []
+    for side, key in [("call", "top_calls"), ("put", "top_puts")]:
+        for c in vol_block.get(key, []):
+            vol  = c.get("volume")  or 0
+            oi   = c.get("openInterest") or 0
+            last = float(c.get("lastPrice") or 0.0)
+            vol_int = int(vol) if not (isinstance(vol, float) and vol != vol) else 0
+            oi_int  = int(oi)  if not (isinstance(oi,  float) and oi  != oi)  else 0
+            rows.append({
+                "side":         side,
+                "strike":       float(c.get("strike", 0)),
+                "expiry":       c.get("expiry", ""),
+                "dte":          int(c.get("dte", 0)),
+                "last":         last,
+                "volume":       vol_int,
+                "openInterest": oi_int,
+                "premium":      last * vol_int * 100,
+            })
 
-def _run_scan_and_store():
-    """Fetch chain, diff vs snapshot, save new snapshot. Returns enriched df."""
-    with st.spinner("Fetching full options chain…"):
-        current = data_adapter.fetch_full_chain()
-
-    if current.empty:
-        st.error("Chain fetch returned no data. Check network / market hours.")
-        return None
-
-    current["premium"] = current["volume"].astype(float) * current["mid"].astype(float) * 100
-
-    prev_df, prev_ts = ss.load_snapshot()
-    if prev_df is not None and prev_ts is not None:
-        enriched = ss.compute_deltas(current, prev_df, prev_ts)
-    else:
-        enriched = current.copy()
-        enriched["delta_volume"]  = None
-        enriched["delta_premium"] = None
-        enriched["is_new"]        = False
-        enriched["is_stale_day"]  = False
-        enriched["is_block"]      = False
-
-    ss.save_snapshot(current)
-    st.session_state["flow_df"]  = enriched
-    st.session_state["scan_ts"]  = datetime.now(ET).isoformat()
-    return enriched
+    if not rows:
+        return pd.DataFrame(), payload
+    return pd.DataFrame(rows), payload
 
 
 def _render_tab1(cfg: dict):
-    st.header("Options Flow")
+    st.header("Options Flow — Top Contracts")
 
-    # Run scan
-    if cfg["run"]:
-        _run_scan_and_store()
+    df, payload = _load_archive_chain()
 
-    df: pd.DataFrame | None = st.session_state.get("flow_df")
-    if df is None:
-        st.info("Press **Run scan** to load the options chain.")
+    if df.empty or payload is None:
+        st.info("No archive data found. Run the scanner first (`python dailyScaner.py`).")
         return
 
-    # ── Summary pills ────────────────────────────────────────────────────────
-    latest = cfg["latest_archive"]
-    spot   = latest.get("spot", "—") if latest else "—"
+    vol_block = payload.get("volume", {})
+    spot   = payload.get("spot", "—")
+    ts_str = payload.get("timestamp", "")
+    if ts_str:
+        ts_et = datetime.fromisoformat(ts_str).astimezone(ET)
+        st.caption(f"Data from archive run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
 
-    calls_df = df[df["side"] == "call"]
-    puts_df  = df[df["side"] == "put"]
-    total_call_prem = calls_df["premium"].sum()
-    total_put_prem  = puts_df["premium"].sum()
-    pc_vol = (
-        puts_df["volume"].sum() / calls_df["volume"].sum()
-        if calls_df["volume"].sum() > 0 else 0
-    )
-    block_count = int(df["is_block"].sum()) if "is_block" in df.columns else 0
+    # ── Summary pills (straight from scanner-computed values) ─────────────────
+    total_call_vol = int(vol_block.get("total_call_vol") or 0)
+    total_put_vol  = int(vol_block.get("total_put_vol")  or 0)
+    pc_ratio       = float(vol_block.get("pc_ratio")     or 0)
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Spot (last run)", f"${spot}")
-    c2.metric("Call premium", _fmt_dollars(total_call_prem))
-    c3.metric("Put premium",  _fmt_dollars(total_put_prem))
-    c4.metric("P/C vol ratio", f"{pc_vol:.2f}")
-    c5.metric("🔥 Blocks", block_count)
+    c1.metric("Spot (last run)",     f"${spot}")
+    c2.metric("Total call volume",   f"{total_call_vol:,}")
+    c3.metric("Total put volume",    f"{total_put_vol:,}")
+    c4.metric("P/C vol ratio",       f"{pc_ratio:.2f}")
+    c5.metric("Top contracts shown", len(df))
 
-    # ── Stale warning ────────────────────────────────────────────────────────
-    stale = df.get("is_stale_day", pd.Series([False])).iloc[0] if len(df) else False
-    if stale:
-        st.info(
-            "ℹ️  Δ columns are greyed out — previous snapshot is from a prior day. "
-            "Refresh again to start tracking intraday deltas.",
-            icon="📅",
-        )
-
-    # ── Apply filters ────────────────────────────────────────────────────────
+    # ── Filters ───────────────────────────────────────────────────────────────
     view = df[df["dte"] >= cfg["min_dte"]].copy()
-    view = view[view["volume"] > 0]
-    if cfg["min_dvol"] > 0 and not stale:
-        view = view[view["delta_volume"].fillna(0) >= cfg["min_dvol"]]
 
-    sort_col = _SORT_MAP.get(cfg["sort_by"], "premium")
+    sort_col = {"Volume": "volume", "Premium $": "premium", "Strike": "strike"}.get(
+        cfg["sort_by"], "volume"
+    )
     if sort_col in view.columns:
         view = view.sort_values(sort_col, ascending=False, na_position="last")
 
-    # ── Build display table ──────────────────────────────────────────────────
+    # ── Display table ─────────────────────────────────────────────────────────
     def _side_badge(row):
-        base = "🟢 CALL" if row["side"] == "call" else "🔴 PUT"
-        if row.get("is_new"):
-            base += " 🆕"
-        return base
+        return "🟢 CALL" if row["side"] == "call" else "🔴 PUT"
 
     def _expiry_label(row):
         label = row["expiry"]
@@ -204,55 +188,26 @@ def _render_tab1(cfg: dict):
             label += " (0DTE)"
         return label
 
-    def _dvol(row):
-        if stale or row.get("delta_volume") is None:
-            return "—"
-        return f"{int(row['delta_volume']):+,}"
-
-    def _dprem(row):
-        if stale or row.get("delta_premium") is None:
-            return "—"
-        prefix = "🔥 " if row.get("is_block") else ""
-        return prefix + _fmt_dollars(row["delta_premium"])
-
     display = pd.DataFrame({
-        "Side":       view.apply(_side_badge, axis=1),
-        "Strike":     view["strike"].map(lambda x: f"${x:.1f}"),
-        "Expiry":     view.apply(_expiry_label, axis=1),
-        "DTE":        view["dte"],
-        "Mid":        view["mid"].map(lambda x: f"${x:.2f}"),
-        "Volume":     view["volume"].map(lambda x: f"{int(x):,}"),
-        "Δ Volume":   view.apply(_dvol, axis=1),
-        "Vol/OI":     view.apply(
+        "Side":         view.apply(_side_badge, axis=1),
+        "Strike":       view["strike"].map(lambda x: f"${x:.1f}"),
+        "Expiry":       view.apply(_expiry_label, axis=1),
+        "DTE":          view["dte"],
+        "Last":         view["last"].map(lambda x: f"${x:.2f}"),
+        "Volume":       view["volume"].map(lambda x: f"{int(x):,}"),
+        "Vol/OI":       view.apply(
             lambda r: f"{r['volume']/r['openInterest']:.1f}x"
             if r["openInterest"] > 0 else "—", axis=1
         ),
-        "OI":         view["openInterest"].map(lambda x: f"{int(x):,}"),
-        "Premium $":  view["premium"].map(_fmt_dollars),
-        "Δ Premium":  view.apply(_dprem, axis=1),
+        "OI":           view["openInterest"].map(lambda x: f"{int(x):,}"),
+        "Est. Premium": view["premium"].map(_fmt_dollars),
     })
 
-    # Highlight block rows
-    def _highlight(row):
-        idx = row.name
-        if idx < len(view):
-            orig = view.iloc[idx]
-            if orig.get("is_block"):
-                return ["background-color: #3d1a00"] * len(row)
-            if orig.get("is_new"):
-                return ["background-color: #2a2a00"] * len(row)
-        return [""] * len(row)
-
-    st.dataframe(
-        display.style.apply(_highlight, axis=1),
-        use_container_width=True,
-        height=600,
+    st.dataframe(display, use_container_width=True, height=500)
+    st.caption(
+        f"{len(view)} contracts shown "
+        f"(top 10 calls + top 10 puts by volume from last scanner run)"
     )
-
-    scan_ts = st.session_state.get("scan_ts")
-    if scan_ts:
-        ts_et = datetime.fromisoformat(scan_ts).strftime("%H:%M:%S ET")
-        st.caption(f"Last refresh: {ts_et}  ·  {len(view):,} contracts shown")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
