@@ -14,7 +14,15 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
-TICKER = sys.argv[1].upper() if len(sys.argv) > 1 else "AAPL"
+def _parse_ticker() -> str:
+    """Read ticker from argv[1], ignoring pytest/script paths (must be 1-5 alpha chars)."""
+    if len(sys.argv) > 1:
+        candidate = sys.argv[1]
+        if candidate.isalpha() and 1 <= len(candidate) <= 5:
+            return candidate.upper()
+    return "AAPL"
+
+TICKER = _parse_ticker()
 
 # Minimum open interest for a contract to be eligible as a magnet / signal.
 # Below this, vol/OI "conviction" is a division-by-noise artifact.
