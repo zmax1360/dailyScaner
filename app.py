@@ -9,8 +9,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -37,8 +38,8 @@ def _now_et() -> datetime:
     return datetime.now(ET)
 
 
-def _latest_archive() -> dict | None:
-    files = sorted(glob.glob("archive/AAPL_*.json"), reverse=True)
+def _latest_archive(ticker: str = "AAPL") -> dict | None:
+    files = sorted(glob.glob(f"archive/{ticker}_*.json"), reverse=True)
     if not files:
         return None
     try:
@@ -79,15 +80,15 @@ def _market_banner():
 _SCANNER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _run_daily_scanner() -> tuple[bool, str]:
+def _run_daily_scanner(ticker: str = "AAPL") -> tuple[bool, str]:
     """
-    Invoke dailyScaner.py with the same Python that runs Streamlit.
+    Invoke dailyScaner.py <ticker> with the same Python that runs Streamlit.
     Returns (success, combined_output).
     """
     t0 = time.time()
     try:
         result = subprocess.run(
-            [sys.executable, "dailyScaner.py"],
+            [sys.executable, "dailyScaner.py", ticker.upper()],
             cwd=_SCANNER_DIR,
             capture_output=True,
             text=True,
@@ -97,52 +98,146 @@ def _run_daily_scanner() -> tuple[bool, str]:
         out = result.stdout + ("\n" + result.stderr if result.stderr.strip() else "")
         return result.returncode == 0, f"[{elapsed:.0f}s]\n{out}"
     except subprocess.TimeoutExpired:
-        return False, "Scanner timed out after 30 minutes."
+        return False, f"{ticker} scanner timed out after 30 minutes."
     except Exception as exc:
-        return False, f"Could not launch scanner: {exc}"
+        return False, f"Could not launch scanner for {ticker}: {exc}"
+
+
+def _discover_tickers() -> list[str]:
+    """
+    Return sorted list of tickers that have at least one daily archive file.
+    Derived purely from filenames — no JSON parsing.
+    Example: archive/AAPL_20260717_0930.json → "AAPL"
+    """
+    seen: set[str] = set()
+    for fpath in glob.glob("archive/*.json"):
+        name = os.path.basename(fpath)
+        parts = name.split("_")
+        if len(parts) >= 3:          # TICKER_YYYYMMDD_HHMM.json
+            seen.add(parts[0].upper())
+    return sorted(seen) or ["AAPL"]  # always at least AAPL
+
+
+# Module-level background-scan state keyed by ticker.
+# {ticker: {"running": bool, "last_ok": bool|None, "last_ts": str|None, "t0": float}}
+_BG: dict[str, dict] = {}
+
+def _bg_state(ticker: str) -> dict:
+    """Return (creating if absent) the state dict for a given ticker."""
+    if ticker not in _BG:
+        _BG[ticker] = {"running": False, "last_ok": None, "last_ts": None, "t0": 0.0}
+    return _BG[ticker]
+
+def _bg_scan_worker(ticker: str) -> None:
+    """Runs in a daemon thread — never blocks the Streamlit event loop."""
+    ok, _ = _run_daily_scanner(ticker)
+    s = _bg_state(ticker)
+    s["running"] = False
+    s["last_ok"] = ok
+    s["last_ts"] = _now_et().strftime("%H:%M ET")
+    if ok:
+        _scan_archive_metadata.clear()   # next fragment fire will show fresh data
+
+
+@st.fragment(run_every=timedelta(minutes=5))
+def _auto_scan_watcher():
+    """
+    Fires every 5 minutes via Streamlit's server-side timer.
+    During market hours: launches one background daemon thread per known ticker
+    (from archive filenames). Each ticker has an independent cooldown so they
+    don't block each other. Non-blocking — event loop never stalls.
+    """
+    if _market_is_closed():
+        st.caption("⏸ Auto-scan paused — market closed")
+        return
+
+    tickers = _discover_tickers()
+    now     = time.time()
+    launched, scanning, done = [], [], []
+
+    for ticker in tickers:
+        s = _bg_state(ticker)
+        if s["running"]:
+            elapsed = int(now - s["t0"])
+            scanning.append(f"⏳ {ticker} ({elapsed}s)…")
+        elif s["t0"] > 0 and (now - s["t0"]) < 270:   # 4.5-min cooldown
+            icon = "✅" if s["last_ok"] else "⚠"
+            done.append(f"{icon} {ticker}: {s.get('last_ts','—')}")
+        else:
+            s["running"] = True
+            s["t0"]      = now
+            threading.Thread(target=_bg_scan_worker, args=(ticker,), daemon=True).start()
+            launched.append(ticker)
+
+    lines = (
+        ([f"🔄 Launched: {', '.join(launched)}"] if launched else [])
+        + scanning + done
+    )
+    for line in lines:
+        st.caption(line)
 
 
 def _sidebar() -> dict:
     with st.sidebar:
-        st.title("📊 AAPL Scanner")
+        st.title("📊 Options Scanner")
         st.caption("Display layer — results from archive JSONs")
         st.divider()
 
-        st.markdown("**Daily scan**")
+        # ── Ticker selector ───────────────────────────────────────────────
+        known_tickers = _discover_tickers()
+        default_idx   = known_tickers.index("AAPL") if "AAPL" in known_tickers else 0
+        focus_ticker  = st.selectbox(
+            "Focus ticker",
+            known_tickers,
+            index=default_idx,
+            help="All tabs show data for this ticker. Add new tickers in the Tickers tab.",
+        )
+
+        st.divider()
+
+        # ── Manual scan for focus ticker ──────────────────────────────────
+        st.markdown(f"**Daily scan — {focus_ticker}**")
         run_scan = st.button(
-            "🚀 Run Daily Scan",
+            f"🚀 Run Scan for {focus_ticker}",
             use_container_width=True,
             type="primary",
-            help="Runs dailyScaner.py and saves a new archive JSON",
+            help=f"Runs dailyScaner.py {focus_ticker} and saves a new archive JSON",
         )
 
         if run_scan:
-            with st.spinner("Running daily scanner… (may take a few minutes)"):
-                ok, output = _run_daily_scanner()
+            with st.spinner(f"Scanning {focus_ticker}… (may take a few minutes)"):
+                ok, output = _run_daily_scanner(focus_ticker)
             if ok:
-                st.success("Scan complete — archive updated.")
-                _scan_archive_metadata.clear()   # bust cache so Tab 2 reloads
+                st.success(f"{focus_ticker} scan complete — archive updated.")
+                _scan_archive_metadata.clear()
             else:
-                st.error("Scanner returned an error.")
+                st.error(f"{focus_ticker} scanner returned an error.")
             with st.expander("Scanner output", expanded=not ok):
-                st.code(output[-4000:], language="text")   # last 4 KB
+                st.code(output[-4000:], language="text")
+
+        # ── Auto-scan status / watcher ────────────────────────────────────
+        _auto_scan_watcher()
 
         st.divider()
         st.subheader("Flow filters")
-        min_dte = st.number_input("Min DTE", min_value=0, value=1, step=1)
-        sort_by = st.selectbox("Sort by", ["Volume", "Premium $", "Strike"])
+        min_dte  = st.number_input("Min DTE", min_value=0, value=1, step=1)
+        top_n    = st.number_input("Top N contracts/side", min_value=1, max_value=30, value=5, step=1,
+                                   help="How many top calls / puts to show in The Magnets panel")
+        sort_by  = st.selectbox("Sort by", ["Volume", "Premium $", "Strike"])
 
         st.divider()
-        latest = _latest_archive()
+        latest = _latest_archive(focus_ticker)
         if latest:
             ts = datetime.fromisoformat(latest["timestamp"]).astimezone(ET)
             st.caption(f"Last archive: {ts.strftime('%Y-%m-%d %H:%M ET')}")
             st.caption(f"Spot at run: ${latest.get('spot', '—')}")
 
     return {
-        "run": run_scan,
-        "min_dte": min_dte,
-        "sort_by": sort_by,
+        "run":            run_scan,
+        "ticker":         focus_ticker,
+        "min_dte":        min_dte,
+        "top_n":          int(top_n),
+        "sort_by":        sort_by,
         "latest_archive": latest,
     }
 
@@ -151,9 +246,9 @@ def _sidebar() -> dict:
 # TAB 1 — Latest Run (full rich report from most recent archive JSON)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _load_archive_chain() -> tuple[pd.DataFrame, dict | None]:
+def _load_archive_chain(ticker: str = "AAPL") -> tuple[pd.DataFrame, dict | None]:
     """Return per-contract DataFrame + raw payload for the latest daily archive."""
-    files = sorted(glob.glob("archive/AAPL_*.json"), reverse=True)
+    files = sorted(glob.glob(f"archive/{ticker}_*.json"), reverse=True)
     if not files:
         return pd.DataFrame(), None
     try:
@@ -386,9 +481,10 @@ def _build_expiry_table(
 def _render_tab1(cfg: dict):
     """Options Flow — Magnets heatmap + Volume-by-Expiry term structure."""
 
-    files = sorted(glob.glob("archive/AAPL_*.json"), reverse=True)
+    ticker = cfg.get("ticker", "AAPL")
+    files  = sorted(glob.glob(f"archive/{ticker}_*.json"), reverse=True)
     if not files:
-        st.info("No archive data found. Run the scanner first (`python dailyScaner.py`).")
+        st.info(f"No archive data found for {ticker}. Run the scanner first or pick a different ticker.")
         return
 
     try:
@@ -415,15 +511,55 @@ def _render_tab1(cfg: dict):
     pc_ratio  = float(vol.get("pc_ratio") or 0)
     prev_vol  = (prev.get("volume") or {}) if prev else None
 
-    # ── Top bar ───────────────────────────────────────────────────────────────
-    dir_color    = "#00c853" if "BULL" in direction else "#d50000" if "BEAR" in direction else "#9e9e9e"
-    dir_icon     = "▲" if "BULL" in direction else "▼" if "BEAR" in direction else "─"
-    pc_bias      = "BULLISH SKEW" if pc_ratio < 0.7 else ("BEARISH SKEW" if pc_ratio > 1.0 else "NEUTRAL")
-    hist_suffix  = " (historical)" if _market_is_closed() else ""
+    # ── Quote strip (session block — absent in older archives) ────────────────
+    session     = curr.get("session") or {}
+    prev_close  = session.get("prev_close")
+    open_today  = session.get("open")
+    day_high    = session.get("day_high")
+    day_low     = session.get("day_low")
+    spot_label  = "Close" if _market_is_closed() else "Spot"
 
     if ts_str:
         ts_et = datetime.fromisoformat(ts_str).astimezone(ET)
         st.caption(f"Last run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
+
+    if prev_close is not None:
+        chg     = spot - prev_close
+        chg_pct = chg / prev_close * 100 if prev_close else 0
+        chg_color = "#00c853" if chg >= 0 else "#d50000"
+        chg_sign  = "+" if chg >= 0 else ""
+        parts = [
+            f'<span style="font-size:1.1rem;font-weight:700;color:#eee">'
+            f'{ticker} &nbsp; {spot_label} <b>${spot:.2f}</b></span>',
+            f'<span style="color:{chg_color};font-weight:bold">'
+            f'{chg_sign}${chg:.2f} ({chg_sign}{chg_pct:.2f}%)</span>',
+        ]
+        if open_today is not None:
+            parts.append(f'<span style="color:#aaa">Open ${open_today:.2f}</span>')
+        parts.append(f'<span style="color:#aaa">Prev close ${prev_close:.2f}</span>')
+        if day_high is not None and day_low is not None:
+            parts.append(f'<span style="color:#888">H ${day_high:.2f} &nbsp; L ${day_low:.2f}</span>')
+        st.markdown(
+            '<div style="background:#0d1117;padding:0.6rem 1.2rem;border-radius:6px;'
+            'margin-bottom:0.5rem;display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap">'
+            + "&ensp;·&ensp;".join(parts)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        # Older archive without session block — show spot only
+        st.markdown(
+            f'<div style="background:#0d1117;padding:0.6rem 1.2rem;border-radius:6px;margin-bottom:0.5rem">'
+            f'<span style="font-size:1.1rem;font-weight:700;color:#eee">'
+            f'{ticker} &nbsp; {spot_label} <b>${spot:.2f}</b></span></div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Direction / P/C banner ────────────────────────────────────────────────
+    dir_color    = "#00c853" if "BULL" in direction else "#d50000" if "BEAR" in direction else "#9e9e9e"
+    dir_icon     = "▲" if "BULL" in direction else "▼" if "BEAR" in direction else "─"
+    pc_bias      = "BULLISH SKEW" if pc_ratio < 0.7 else ("BEARISH SKEW" if pc_ratio > 1.0 else "NEUTRAL")
+    hist_suffix  = " (historical)" if _market_is_closed() else ""
 
     st.markdown(
         f'<div style="background:#1a1a2e;padding:0.75rem 1.5rem;border-radius:8px;margin-bottom:0.5rem">'
@@ -442,80 +578,107 @@ def _render_tab1(cfg: dict):
 
     st.markdown("---")
 
-    # ══ Two-column main layout ════════════════════════════════════════════════
-    left, right = st.columns([1, 1.4], gap="large")
-
-    # ── LEFT: The Magnets (calls | puts side-by-side) ────────────────────────
-    with left:
-        st.markdown("### The Magnets — Top Calls / Top Puts")
-        st.caption("🔥 Vol/OI heatmap — values ≥ 2.0x glow hot (unusual vs open interest)")
-
-        call_col, put_col = st.columns(2, gap="small")
-        for col, key, label in [
-            (call_col, "top_calls", "🟢 Top CALLS"),
-            (put_col,  "top_puts",  "🔴 Top PUTS"),
-        ]:
-            contracts = vol.get(key) or []
-            with col:
-                st.markdown(f"**{label}**")
-                styled = _contracts_table(contracts, n=10)
-                if styled is not None:
-                    st.dataframe(styled, use_container_width=True, hide_index=True)
-                else:
-                    st.caption("No data")
-
-    # ── RIGHT: Volume by Expiry ───────────────────────────────────────────────
-    with right:
-        st.markdown("### Volume by Expiry — P/C term structure")
-        st.caption("Institutional-style skew across the expiry curve")
-
-        exp_rows, chart_pc = _build_expiry_table(vol, prev_vol, pc_ratio)
-
-        if exp_rows:
-            exp_df = pd.DataFrame(exp_rows)
-
-            def _bias_style(val: str) -> str:
-                if "BULL" in str(val): return "color:#00c853;font-weight:bold"
-                if "BEAR" in str(val): return "color:#d50000;font-weight:bold"
-                return "color:#9e9e9e"
-
-            def _delta_style(val: str) -> str:
-                s = str(val)
-                if s.startswith("▲"): return "color:#00c853"
-                if s.startswith("▼"): return "color:#d50000"
-                return "color:#666"
-
-            styled_exp = (
-                exp_df.style
-                .map(_bias_style,   subset=["BIAS"])
-                .map(_delta_style,  subset=["CALL Δ", "PUT Δ"])
-            )
-            st.dataframe(styled_exp, use_container_width=True, hide_index=True)
-
-            # ── P/C term structure bar chart ──────────────────────────────
-            _render_pc_term_chart(chart_pc)
-        else:
-            st.caption("No expiry data available")
-
-    # ══ Collapsible detail sections ═══════════════════════════════════════════
-    with st.expander("📊 Multi-Timeframe Detail", expanded=False):
+    # ── Multi-Timeframe Detail (above magnets so context comes first) ─────────
+    prev_tfs = (prev.get("timeframes") or {}) if prev else {}
+    with st.expander("📊 Multi-Timeframe Detail", expanded=True):
         tf_rows = []
         for tf in ["5M", "10M", "15M", "1H", "4H", "1D"]:
             d    = tfs.get(tf) or {}
+            pd_  = prev_tfs.get(tf) or {}
             rsi  = d.get("rsi")
             hist = d.get("hist")
             vs   = d.get("vs")
+            p_rsi  = pd_.get("rsi")
+            p_hist = pd_.get("hist")
+
+            d_rsi  = (rsi  - p_rsi)  if (rsi  is not None and p_rsi  is not None) else None
+            d_hist = (hist - p_hist) if (hist is not None and p_hist is not None) else None
+
             tf_rows.append({
                 "TF":        tf,
                 "RSI":       _rsi_plain(rsi),
-                "MACD":      (f"{'BULLISH' if (hist or 0) > 0 else 'BEARISH'} [{hist:+.4f}]"
-                              if hist is not None else "—"),
+                "ΔRSI":      f"{d_rsi:+.1f}" if d_rsi is not None else "—",
+                "MACD hist": f"{hist:+.4f}"  if hist  is not None else "—",
+                "ΔMACD":     f"{d_hist:+.4f}" if d_hist is not None else "—",
                 "Vol Spike": f"{vs:.2f}×" if vs is not None else "—",
                 "Support":   f"${d.get('support', '—')}",
                 "Resist":    f"${d.get('resist', '—')}",
+                "_d_rsi":    d_rsi,
+                "_d_hist":   d_hist,
             })
-        st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
 
+        df_tf = pd.DataFrame(tf_rows)
+
+        def _delta_style(val: str) -> str:
+            s = str(val)
+            if s.startswith("+"): return "color:#00c853;font-weight:bold"
+            if s.startswith("-"): return "color:#d50000;font-weight:bold"
+            return "color:#666"
+
+        dcols = ["TF","RSI","ΔRSI","MACD hist","ΔMACD","Vol Spike","Support","Resist"]
+        if not prev_tfs:
+            dcols = ["TF","RSI","MACD hist","Vol Spike","Support","Resist"]
+
+        styled_tf = df_tf[dcols].style
+        if prev_tfs:
+            styled_tf = styled_tf.map(_delta_style, subset=["ΔRSI", "ΔMACD"])
+
+        st.dataframe(styled_tf, use_container_width=True, hide_index=True)
+
+    # ── The Magnets (calls | puts side-by-side) ──────────────────────────────
+    top_n = cfg.get("top_n", 5)
+    st.markdown(f"### The Magnets — Top {top_n} Calls / Top {top_n} Puts")
+    st.caption("🔥 Vol/OI heatmap — values ≥ 2.0x glow hot (unusual vs open interest)")
+
+    call_col, put_col = st.columns(2, gap="small")
+    for col, key, label in [
+        (call_col, "top_calls", f"🟢 Top {top_n} CALLS"),
+        (put_col,  "top_puts",  f"🔴 Top {top_n} PUTS"),
+    ]:
+        contracts = vol.get(key) or []
+        with col:
+            st.markdown(f"**{label}**")
+            styled = _contracts_table(contracts, n=top_n)
+            if styled is not None:
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No data")
+
+    st.markdown("---")
+
+    # ── Volume by Expiry — P/C term structure (below magnets) ────────────────
+    st.markdown("### Volume by Expiry — P/C term structure")
+    st.caption("Institutional-style skew across the expiry curve")
+
+    exp_rows, chart_pc = _build_expiry_table(vol, prev_vol, pc_ratio)
+
+    if exp_rows:
+        exp_df = pd.DataFrame(exp_rows)
+
+        def _bias_style(val: str) -> str:
+            if "BULL" in str(val): return "color:#00c853;font-weight:bold"
+            if "BEAR" in str(val): return "color:#d50000;font-weight:bold"
+            return "color:#9e9e9e"
+
+        def _delta_style(val: str) -> str:
+            s = str(val)
+            if s.startswith("▲"): return "color:#00c853"
+            if s.startswith("▼"): return "color:#d50000"
+            return "color:#666"
+
+        styled_exp = (
+            exp_df.style
+            .map(_bias_style,   subset=["BIAS"])
+            .map(_delta_style,  subset=["CALL Δ", "PUT Δ"])
+        )
+        st.dataframe(styled_exp, use_container_width=True, hide_index=True)
+
+        # ── P/C term structure bar chart ──────────────────────────────────
+        _render_pc_term_chart(chart_pc)
+    else:
+        st.caption("No expiry data available")
+
+    # ══ Collapsible detail sections ═══════════════════════════════════════════
     if prev:
         prev_spot = float(prev.get("spot") or 0)
         prev_pc   = float((prev.get("volume") or {}).get("pc_ratio") or 0)
@@ -527,7 +690,7 @@ def _render_tab1(cfg: dict):
         pc_chg   = pc_ratio - prev_pc
         pct_chg  = (spot_chg / prev_spot * 100) if prev_spot else 0
 
-        with st.expander(f"📈 Changes vs last run  (since {prev_ts_str})", expanded=False):
+        with st.expander(f"📈 Changes vs last run  (since {prev_ts_str})", expanded=True):
             ca, cb = st.columns(2)
             with ca:
                 st.metric("Spot",      f"${spot:.2f}",    delta=f"{spot_chg:+.2f} ({pct_chg:+.1f}%)")
@@ -553,30 +716,34 @@ def _render_tab1(cfg: dict):
                         f"${cm.get('strike')} ({cm.get('expiry')})  ← STRIKE CHANGE"
                     )
 
-    with st.expander("⏰ Opening Range Breakout", expanded=False):
-        or1, or2 = st.columns(2)
-        for col, tf_key in [(or1, "5M"), (or2, "15M")]:
+    with st.expander("⏰ Opening Range Breakout", expanded=True):
+        or_rows = []
+        for tf_key in ["5M", "15M"]:
             or_tf = or_data.get(tf_key) or {}
-            with col:
-                if or_tf:
-                    bias     = or_tf.get("bias", "—")
-                    bias_dir = or_tf.get("bias_dir", "")
-                    color    = "#00c853" if bias_dir == "bull" else "#d50000" if bias_dir == "bear" else "#aaa"
-                    st.markdown(
-                        f'<div style="border:1px solid #333;padding:0.75rem 1rem;border-radius:6px">'
-                        f'<b>{tf_key} OR</b> ({or_tf.get("open_time","?")} ET)<br>'
-                        f'<span style="color:{color};font-weight:bold;font-size:1.1rem">{bias}</span><br>'
-                        f'<span style="color:#888;font-size:0.85rem">'
-                        f'Open ${or_tf.get("open",0):.2f} &nbsp; '
-                        f'High ${or_tf.get("high",0):.2f} &nbsp; '
-                        f'Low ${or_tf.get("low",0):.2f} &nbsp; '
-                        f'Range ${or_tf.get("range",0):.2f} ({or_tf.get("range_pct",0):.2f}%)'
-                        f'</span>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.caption(f"No {tf_key} OR data in this archive.")
+            if or_tf:
+                or_rows.append({
+                    "TF":        tf_key,
+                    "Open time": or_tf.get("open_time", "—"),
+                    "Open":      f"${or_tf.get('open', 0):.2f}",
+                    "High":      f"${or_tf.get('high', 0):.2f}",
+                    "Low":       f"${or_tf.get('low', 0):.2f}",
+                    "Range":     f"${or_tf.get('range', 0):.2f} ({or_tf.get('range_pct', 0):.2f}%)",
+                    "Current":   f"${float(or_tf.get('current') or spot):.2f}",
+                    "Bias":      or_tf.get("bias", "—"),
+                })
+        if or_rows:
+            def _or_bias_style(val: str) -> str:
+                if "BULL" in str(val): return "color:#00c853;font-weight:bold"
+                if "BEAR" in str(val): return "color:#d50000;font-weight:bold"
+                return "color:#9e9e9e"
+            or_df = pd.DataFrame(or_rows)
+            st.dataframe(
+                or_df.style.map(_or_bias_style, subset=["Bias"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("No Opening Range data in this archive.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -955,6 +1122,191 @@ def _render_expiry_vol_table(vol_curr: dict, vol_prev: dict | None, overall_pc: 
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
+def _render_expiry_drill_down(
+    vol_curr: dict, expiry: str, vol_prev: dict | None = None
+) -> None:
+    """
+    Calls + puts filtered to one expiry, shown side-by-side.
+    When vol_prev is provided, shows ΔPrice and ΔVol vs the previous run:
+    green = increased, red = decreased.
+    """
+    def _filter(vol, key):
+        return [c for c in (vol.get(key) or []) if c.get("expiry") == expiry] if vol else []
+
+    def _signed(n: int | float, fmt_int: bool = True) -> str:
+        if n > 0: return f"+{int(n):,}" if fmt_int else f"+{n:.2f}"
+        if n < 0: return f"{int(n):,}"  if fmt_int else f"{n:.2f}"
+        return "·0"
+
+    def _delta_style(val: str) -> str:
+        s = str(val)
+        if s.startswith("+"): return "color:#00c853;font-weight:bold"
+        if s.startswith("-"): return "color:#d50000;font-weight:bold"
+        return "color:#666"
+
+    st.markdown(f"#### {expiry} — Contract Detail")
+    cc, pc_ = st.columns(2, gap="small")
+
+    for col, curr_key, prev_key, label in [
+        (cc,  "top_calls", "top_calls", "🟢 CALLS"),
+        (pc_, "top_puts",  "top_puts",  "🔴 PUTS"),
+    ]:
+        curr_contracts = _filter(vol_curr, curr_key)
+        prev_by_strike = {
+            float(c.get("strike", 0)): c
+            for c in _filter(vol_prev, prev_key)
+        } if vol_prev else {}
+
+        with col:
+            st.markdown(f"**{label}**")
+            if not curr_contracts:
+                st.caption("No contracts for this expiry.")
+                continue
+
+            rows = []
+            for c in curr_contracts:
+                strike = float(c.get("strike") or 0)
+                vol    = int(c.get("volume") or 0)
+                oi     = int(c.get("openInterest") or 0)
+                price  = float(c.get("lastPrice") or 0)
+                iv     = float(c.get("impliedVolatility") or 0)
+                voi    = vol / max(oi, 1)
+
+                p      = prev_by_strike.get(strike)
+                d_price = price - float(p.get("lastPrice") or 0) if p else None
+                d_vol   = vol   - int(p.get("volume") or 0)     if p else None
+
+                row = {
+                    "Strike": f"${strike:.1f}",
+                    "Price":  f"${price:.2f}",
+                    "Volume": f"{vol:,}",
+                    "OI":     f"{oi:,}",
+                    "VOL/OI": f"{voi:.2f}x 🔥" if voi >= 2 else f"{voi:.2f}x",
+                    "IV":     f"{iv:.1%}" if iv > 0 else "—",
+                }
+                if vol_prev:
+                    row["ΔPrice"] = _signed(d_price, fmt_int=False) if d_price is not None else "new"
+                    row["ΔVol"]   = _signed(d_vol)                  if d_vol   is not None else "new"
+                rows.append(row)
+
+            df = pd.DataFrame(rows)
+            dcols = ["Strike","Price","Volume","OI","VOL/OI","IV"]
+            if vol_prev:
+                dcols = ["Strike","Price","ΔPrice","Volume","ΔVol","OI","VOL/OI","IV"]
+
+            styled = df[dcols].style
+            if vol_prev:
+                styled = styled.map(_delta_style, subset=["ΔPrice", "ΔVol"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def _render_expiry_vol_interactive(
+    vol_curr: dict, vol_prev: dict | None, pc_ratio: float
+) -> None:
+    """
+    Volume by Expiry table with clickable row selection (Tab 2).
+    Clicking an expiry row shows a drill-down of its individual contracts.
+    """
+    curr: dict[str, dict] = {}
+    for side_key, vol_key in [("call_vol", "top_calls"), ("put_vol", "top_puts")]:
+        for c in (vol_curr.get(vol_key) or []):
+            exp = c.get("expiry", "?")
+            dte = int(c.get("dte", 0))
+            v   = int(c.get("volume") or 0)
+            if exp not in curr:
+                curr[exp] = {"dte": dte, "call_vol": 0, "put_vol": 0}
+            curr[exp][side_key] += v
+
+    prev_agg: dict[str, dict] = {}
+    if vol_prev:
+        for side_key, vol_key in [("call_vol", "top_calls"), ("put_vol", "top_puts")]:
+            for c in (vol_prev.get(vol_key) or []):
+                exp = c.get("expiry", "?")
+                v   = int(c.get("volume") or 0)
+                prev_agg.setdefault(exp, {"call_vol": 0, "put_vol": 0})[side_key] += v
+
+    if not curr:
+        st.caption("No volume data in this archive.")
+        return
+
+    def _ds(v):
+        if v is None: return ""
+        if v > 0:     return f"+{v:,}"
+        if v < 0:     return f"{v:,}"
+        return "·0"
+
+    rows, expiry_list = [], []
+    for exp in sorted(curr):
+        d  = curr[exp]
+        cv, pv = d["call_vol"], d["put_vol"]
+        dte = d["dte"]
+        data_gap = (cv == 0 or pv == 0)
+        pc = (pv / cv) if not data_gap else None
+
+        if pc is None:   bias = ""
+        elif pc < 0.7:   bias = "▲ BULLISH"
+        elif pc < 0.9:   bias = "▲ MILD BULLISH"
+        elif pc < 1.1:   bias = "─ NEUTRAL"
+        elif pc < 1.5:   bias = "▼ MILD BEARISH"
+        else:            bias = "▼ BEARISH"
+
+        notable = (abs(pc - pc_ratio) > 0.25 if (pc is not None and pc_ratio > 0) else False)
+        pd_     = prev_agg.get(exp, {})
+        cv_d    = cv - pd_.get("call_vol", 0) if vol_prev else None
+        pv_d    = pv - pd_.get("put_vol",  0) if vol_prev else None
+
+        rows.append({
+            "EXPIRY":   exp,
+            "DTE":      f"{dte}d",
+            "CALL VOL": f"{cv:,}",
+            "PUT VOL":  f"{pv:,}",
+            "P/C":      f"{pc:.2f}" if pc is not None else "n/a",
+            "BIAS":     bias,
+            "NOTABLE":  "⚠ data gap" if data_gap else ("◄ notable" if notable else ""),
+            "CALL Δ":   _ds(cv_d),
+            "PUT Δ":    _ds(pv_d),
+            "_cv_d":    cv_d,
+            "_pv_d":    pv_d,
+        })
+        expiry_list.append(exp)
+
+    df   = pd.DataFrame(rows)
+    dcols = ["EXPIRY","DTE","CALL VOL","PUT VOL","P/C","BIAS","NOTABLE","CALL Δ","PUT Δ"]
+    if not vol_prev:
+        dcols = [c for c in dcols if c not in ("CALL Δ","PUT Δ")]
+    disp = df[dcols].copy()
+
+    def _style_bias(val: str) -> str:
+        if "BULL" in str(val): return "color:#00c853;font-weight:bold"
+        if "BEAR" in str(val): return "color:#d50000;font-weight:bold"
+        return "color:#9e9e9e"
+
+    def _style_delta(val: str) -> str:
+        s = str(val)
+        if s.startswith("+"): return "color:#00c853;font-weight:bold"
+        if s.startswith("-"): return "color:#d50000;font-weight:bold"
+        return "color:#666"
+
+    styled = disp.style.map(_style_bias, subset=["BIAS"])
+    if vol_prev:
+        styled = styled.map(_style_delta, subset=["CALL Δ", "PUT Δ"])
+
+    st.caption("Click a row to see the contracts for that expiry.")
+    event = st.dataframe(
+        styled,
+        on_select="rerun",
+        selection_mode="single-row",
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    sel = event.selection.rows
+    if sel:
+        sel_exp = expiry_list[sel[0]]
+        st.markdown("---")
+        _render_expiry_drill_down(vol_curr, sel_exp, vol_prev)
+
+
 @st.cache_data(ttl=120)
 def _scan_archive_metadata() -> list[dict]:
     """
@@ -963,15 +1315,16 @@ def _scan_archive_metadata() -> list[dict]:
     """
     rows: list[dict] = []
     for pattern, atype in [
-        ("archive/AAPL_*.json",        "Daily"),
-        ("archive_weekly/AAPL_*.json", "Weekly"),
+        ("archive/*.json",        "Daily"),
+        ("archive_weekly/*.json", "Weekly"),
     ]:
         for fpath in sorted(glob.glob(pattern), reverse=True):
             fname = os.path.basename(fpath)
             try:
-                parts    = fname.replace("AAPL_", "").replace(".json", "").split("_")
-                run_date = f"{parts[0][:4]}-{parts[0][4:6]}-{parts[0][6:]}"
-                run_time = f"{parts[1][:2]}:{parts[1][2:4]}"
+                parts    = fname.replace(".json", "").split("_")
+                # parts[0]=TICKER, parts[1]=YYYYMMDD, parts[2]=HHMM
+                run_date = f"{parts[1][:4]}-{parts[1][4:6]}-{parts[1][6:]}"
+                run_time = f"{parts[2][:2]}:{parts[2][2:4]}"
             except Exception:
                 run_date, run_time = "?", "?"
             try:
@@ -996,97 +1349,346 @@ def _scan_archive_metadata() -> list[dict]:
     return rows
 
 
-def _render_tab2():
-    st.header("Scanner Archive")
-
-    meta = _scan_archive_metadata()
-    if not meta:
-        st.info("No archive files found in archive/ or archive_weekly/")
+def _render_tab2(cfg: dict):
+    ticker = cfg.get("ticker", "AAPL")
+    # Load most recent daily archive for the selected ticker
+    files = sorted(glob.glob(f"archive/{ticker}_*.json"), reverse=True)
+    if not files:
+        st.info(f"No archive data found for {ticker}. Run the scanner or pick a different ticker.")
         return
 
-    # ── Summary table (metadata only — fast) ──────────────────────────────────
-    table_rows = [{
-        "Type":      r["type"],
-        "Date":      r["date"],
-        "Time":      r["time"],
-        "Spot":      f"${r['spot']:.2f}" if r["spot"] is not None else "—",
-        "Direction": r["direction"],
-        "P/C":       f"{r['pc_ratio']:.2f}" if r["pc_ratio"] is not None else "—",
-        "Score":     f"{r['score']}/5" if r["score"] is not None else "—",
-    } for r in meta]
-
-    st.dataframe(
-        pd.DataFrame(table_rows),
-        use_container_width=True,
-        hide_index=True,
-        height=260,
-    )
-
-    st.markdown("---")
-
-    # ── Run selector — only ONE run rendered at a time ────────────────────────
-    options = [
-        f"{'📆' if r['type']=='Weekly' else '📊'}  {r['date']}  {r['time']}  |  "
-        f"{r['direction']}  ·  Spot ${r['spot']:.2f}" if r["spot"] else
-        f"{'📆' if r['type']=='Weekly' else '📊'}  {r['date']}  {r['time']}"
-        for r in meta
-    ]
-    sel_idx = st.selectbox(
-        "Select run to view details:",
-        range(len(options)),
-        format_func=lambda i: options[i],
-    )
-
-    if sel_idx is None:
-        return
-
-    sel = meta[sel_idx]
     try:
-        with open(sel["fpath"]) as f:
+        with open(files[0]) as f:
             payload = json.load(f)
     except Exception as e:
-        st.error(f"Could not read {sel['fpath']}: {e}")
+        st.error(f"Could not read archive: {e}")
         return
 
-    # Load the previous run of the same type for delta computation
     prev_payload = None
-    for i in range(sel_idx + 1, len(meta)):
-        if meta[i]["type"] == sel["type"]:
+    if len(files) > 1:
+        try:
+            with open(files[1]) as f:
+                prev_payload = json.load(f)
+        except Exception:
+            pass
+
+    vol_curr = payload.get("volume") or {}
+    vol_prev = (prev_payload.get("volume") or {}) if prev_payload else None
+    pc_ratio = float(vol_curr.get("pc_ratio") or 0)
+
+    try:
+        ts_et = datetime.fromisoformat(payload.get("timestamp", "")).astimezone(ET).strftime("%Y-%m-%d %H:%M ET")
+    except Exception:
+        ts_et = "—"
+    st.caption(f"Most recent daily run · {ts_et}")
+
+    if prev_payload:
+        try:
+            prev_et = datetime.fromisoformat(prev_payload.get("timestamp", "")).astimezone(ET).strftime("%H:%M ET")
+        except Exception:
+            prev_et = "previous run"
+        st.caption(f"CALL Δ / PUT Δ vs {prev_et}  ·  green = higher  ·  red = lower")
+
+    _render_expiry_vol_interactive(vol_curr, vol_prev, pc_ratio)
+
+    st.markdown("---")
+    st.markdown("### Theta & Gamma by Strike")
+    st.caption("Black-Scholes greeks computed from archived IV · calls green · puts red · Δ vs previous run")
+    _render_greeks_panel(
+        vol_curr,
+        float(payload.get("spot") or 0),
+        vol_prev,
+        float(prev_payload.get("spot") or 0) if prev_payload else 0.0,
+    )
+
+
+def _norm_cdf(x: float) -> float:
+    import math
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _norm_pdf(x: float) -> float:
+    import math
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+def _bs_greeks(
+    S: float, K: float, iv: float, dte_days: int,
+    r: float = 0.05, is_call: bool = True,
+) -> tuple[float | None, float | None]:
+    """
+    Black-Scholes gamma and theta.
+    Returns (gamma, theta_per_calendar_day).
+    Theta is in dollars (negative = time decay cost per day).
+    Returns (None, None) when inputs are invalid (e.g. 0DTE, zero IV).
+    """
+    import math
+    if dte_days <= 0 or iv <= 0.001 or S <= 0 or K <= 0:
+        return None, None
+    try:
+        T    = dte_days / 365.0
+        sqT  = math.sqrt(T)
+        d1   = (math.log(S / K) + (r + 0.5 * iv ** 2) * T) / (iv * sqT)
+        d2   = d1 - iv * sqT
+        nd1  = _norm_pdf(d1)
+        disc = math.exp(-r * T)
+
+        gamma = nd1 / (S * iv * sqT)
+
+        theta_annual = -(S * nd1 * iv) / (2 * sqT)
+        if is_call:
+            theta_annual -= r * K * disc * _norm_cdf(d2)
+        else:
+            theta_annual += r * K * disc * _norm_cdf(-d2)
+
+        return gamma, theta_annual / 365.0
+    except Exception:
+        return None, None
+
+
+def _render_greeks_panel(
+    vol_curr: dict, spot: float,
+    vol_prev: dict | None = None, prev_spot: float = 0.0,
+) -> None:
+    """
+    Theta & Gamma by strike — computed from Black-Scholes using archive IV.
+    When vol_prev/prev_spot are provided, adds ΔGamma and ΔTheta columns:
+    green = increased (gamma up / theta less negative), red = decreased.
+    No live fetches. 0DTE contracts show '—' for greeks.
+    """
+    import altair as alt
+
+    # Build prev lookup: (side, strike, expiry) → contract
+    prev_lookup: dict[tuple, dict] = {}
+    if vol_prev:
+        for side_key, vol_key in [("CALL","top_calls"), ("PUT","top_puts")]:
+            for c in (vol_prev.get(vol_key) or []):
+                k = (side_key, float(c.get("strike",0)), c.get("expiry",""))
+                prev_lookup[k] = c
+
+    def _signed_greek(v: float | None, precision: int = 5) -> str:
+        if v is None: return "—"
+        fmt = f"+{v:.{precision}f}" if v > 0 else f"{v:.{precision}f}"
+        return fmt
+
+    def _delta_style(val: str) -> str:
+        s = str(val)
+        if s.startswith("+"): return "color:#00c853;font-weight:bold"
+        if s.startswith("-"): return "color:#d50000;font-weight:bold"
+        return "color:#666"
+
+    rows = []
+    for side, vol_key, is_call in [
+        ("CALL", "top_calls", True),
+        ("PUT",  "top_puts",  False),
+    ]:
+        for c in (vol_curr.get(vol_key) or []):
+            strike = float(c.get("strike") or 0)
+            iv     = float(c.get("impliedVolatility") or 0)
+            dte    = int(c.get("dte") or 0)
+            expiry = c.get("expiry", "?")
+            price  = float(c.get("lastPrice") or 0)
+
+            gamma, theta = _bs_greeks(spot, strike, iv, dte, is_call=is_call)
+
+            # Previous greeks
+            p = prev_lookup.get((side, strike, expiry))
+            if p and prev_spot > 0:
+                p_iv  = float(p.get("impliedVolatility") or 0)
+                p_dte = int(p.get("dte") or 0)
+                pg, pt = _bs_greeks(prev_spot, strike, p_iv, p_dte, is_call=is_call)
+            else:
+                pg, pt = None, None
+
+            d_gamma = (gamma - pg) if (gamma is not None and pg is not None) else None
+            d_theta = (theta - pt) if (theta is not None and pt is not None) else None
+
+            row = {
+                "Side":    side,
+                "Strike":  f"${strike:.1f}",
+                "Expiry":  expiry,
+                "DTE":     f"{dte}d",
+                "Price":   f"${price:.2f}",
+                "IV":      f"{iv:.1%}" if iv > 0 else "—",
+                "Gamma":   f"{gamma:.5f}" if gamma is not None else "—",
+                "Theta/d": f"${theta:.4f}" if theta is not None else "—",
+                "_strike": strike,
+                "_gamma":  gamma,
+                "_theta":  theta,
+            }
+            if vol_prev:
+                row["ΔGamma"] = _signed_greek(d_gamma, 5)
+                row["ΔTheta"] = _signed_greek(d_theta, 4)
+            rows.append(row)
+
+    if not rows:
+        st.caption("No contract data for greeks.")
+        return
+
+    df = pd.DataFrame(rows)
+
+    def _side_style(val: str) -> str:
+        if val == "CALL": return "color:#00c853;font-weight:bold"
+        if val == "PUT":  return "color:#d50000;font-weight:bold"
+        return ""
+
+    display_cols = ["Side","Strike","Expiry","DTE","Price","IV","Gamma","Theta/d"]
+    if vol_prev:
+        display_cols = ["Side","Strike","Expiry","DTE","Price","IV",
+                        "Gamma","ΔGamma","Theta/d","ΔTheta"]
+
+    styled = df[display_cols].style.map(_side_style, subset=["Side"])
+    if vol_prev:
+        styled = styled.map(_delta_style, subset=["ΔGamma", "ΔTheta"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # ── Altair charts: Gamma | Theta by strike ─────────────────────────────
+    chart_df = df[df["_gamma"].notna()].copy()
+    if chart_df.empty:
+        st.caption("All contracts are 0DTE — greeks undefined.")
+        return
+
+    color_scale = alt.Scale(domain=["CALL","PUT"], range=["#00c853","#d50000"])
+
+    def _greek_chart(field: str, title: str, fmt: str) -> alt.Chart:
+        return (
+            alt.Chart(chart_df)
+            .mark_bar(opacity=0.85)
+            .encode(
+                x=alt.X("_strike:Q", title="Strike ($)",
+                         axis=alt.Axis(format="$.0f")),
+                y=alt.Y(f"{field}:Q", title=title),
+                color=alt.Color("Side:N", scale=color_scale,
+                                legend=alt.Legend(title=None, orient="top-right")),
+                xOffset="Side:N",
+                tooltip=[
+                    alt.Tooltip("Side:N"),
+                    alt.Tooltip("_strike:Q", title="Strike", format="$.1f"),
+                    alt.Tooltip(f"{field}:Q", title=title, format=fmt),
+                    alt.Tooltip("Expiry:N"),
+                    alt.Tooltip("IV:N"),
+                ],
+            )
+            .properties(title=title, height=220)
+        )
+
+    gc, tc = st.columns(2, gap="small")
+    with gc:
+        st.altair_chart(_greek_chart("_gamma", "Gamma", ".5f"), use_container_width=True)
+    with tc:
+        st.altair_chart(_greek_chart("_theta", "Theta ($/day)", ".4f"), use_container_width=True)
+
+    st.caption(
+        "Gamma: rate of delta change per $1 move in spot.  "
+        "Theta: option value lost per calendar day (negative = cost).  "
+        "Computed from Black-Scholes using archived IV — not live quotes."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Ticker Manager
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_tab4() -> None:
+    """
+    Ticker Manager — run the daily scanner for any symbol and see the status
+    of every ticker that already has archive data.
+    Adding a ticker here is as simple as running it once; it then appears
+    in the sidebar focus-ticker selector automatically.
+    """
+    st.markdown("### Run scanner for a new ticker")
+    st.caption(
+        "Enter any valid symbol (e.g. TSLA, NVDA, SPY). "
+        "The scanner saves results to `archive/{TICKER}_*.json` — "
+        "the ticker then appears in the sidebar selector automatically."
+    )
+
+    col_input, col_btn = st.columns([3, 1], gap="small")
+    with col_input:
+        new_ticker = st.text_input(
+            "Ticker symbol",
+            placeholder="e.g. TSLA",
+            label_visibility="collapsed",
+        ).strip().upper()
+    with col_btn:
+        run_new = st.button("🚀 Run scan", type="primary", use_container_width=True)
+
+    if run_new:
+        if not new_ticker or not new_ticker.isalpha():
+            st.error("Enter a valid ticker symbol (letters only).")
+        else:
+            with st.spinner(f"Scanning {new_ticker}… (may take several minutes)"):
+                ok, output = _run_daily_scanner(new_ticker)
+            if ok:
+                st.success(f"✅ {new_ticker} scan complete — it now appears in the ticker selector.")
+                _scan_archive_metadata.clear()
+            else:
+                st.error(f"❌ Scan failed for {new_ticker}.")
+            with st.expander("Scanner output", expanded=not ok):
+                st.code(output[-4000:], language="text")
+
+    st.markdown("---")
+    st.markdown("### Known tickers")
+    st.caption("All tickers that have at least one daily archive file. Click **Run** to refresh any of them.")
+
+    known = _discover_tickers()
+    if not known:
+        st.info("No archive files found yet. Run a scan above to get started.")
+        return
+
+    # Build summary table
+    rows = []
+    for t in known:
+        files = sorted(glob.glob(f"archive/{t}_*.json"), reverse=True)
+        last_ts, last_spot, last_dir = "—", "—", "—"
+        if files:
             try:
-                with open(meta[i]["fpath"]) as f:
-                    prev_payload = json.load(f)
+                with open(files[0]) as f:
+                    p = json.load(f)
+                ts_raw  = p.get("timestamp", "")
+                last_ts = datetime.fromisoformat(ts_raw).astimezone(ET).strftime("%Y-%m-%d %H:%M ET") if ts_raw else "—"
+                last_spot = f"${float(p.get('spot') or 0):.2f}"
+                last_dir  = p.get("direction", "—")
             except Exception:
                 pass
-            break
+        s = _bg_state(t)
+        if s["running"]:
+            status = f"⏳ scanning ({int(time.time()-s['t0'])}s)…"
+        elif s.get("last_ts"):
+            status = f"{'✅' if s['last_ok'] else '⚠'} last auto: {s['last_ts']}"
+        else:
+            status = "—"
+        rows.append({
+            "Ticker":     t,
+            "Last scan":  last_ts,
+            "Spot":       last_spot,
+            "Direction":  last_dir,
+            "Auto-scan":  status,
+            "# files":    len(files),
+        })
 
-    spot      = payload.get("spot", "—")
-    is_weekly = "checklist_score" in payload
-    src_tag   = "📆 Weekly" if is_weekly else "📊 Daily"
+    def _dir_style(val: str) -> str:
+        if "BULL" in str(val): return "color:#00c853;font-weight:bold"
+        if "BEAR" in str(val): return "color:#d50000;font-weight:bold"
+        return "color:#9e9e9e"
 
-    st.markdown(f"**{src_tag} · {sel['date']} {sel['time']} ET · Spot ${spot}**")
-    st.divider()
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df.style.map(_dir_style, subset=["Direction"]),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    if is_weekly:
-        _render_weekly_run(payload, spot, sel["time"])
-    else:
-        # ── Volume by Expiry table ─────────────────────────────────────────
-        vol_curr = payload.get("volume") or {}
-        vol_prev = (prev_payload.get("volume") or {}) if prev_payload else None
-        pc_ratio = float(vol_curr.get("pc_ratio") or 0)
-
-        st.markdown("#### Volume by Expiry")
-        if prev_payload:
-            prev_ts = prev_payload.get("timestamp", "")
-            try:
-                prev_et = datetime.fromisoformat(prev_ts).astimezone(ET).strftime("%H:%M ET")
-            except Exception:
-                prev_et = "previous run"
-            st.caption(f"CALL Δ / PUT Δ vs {prev_et}  ·  green = higher  ·  red = lower")
-        _render_expiry_vol_table(vol_curr, vol_prev, pc_ratio)
-
-        st.divider()
-        # ── 5-point checklist ──────────────────────────────────────────────
-        _render_daily_run(payload, spot, sel["time"])
+    st.markdown("**Run scan for a specific ticker:**")
+    sel_ticker = st.selectbox("Select ticker to rescan", known, key="tab4_rescan_select")
+    if st.button(f"🔄 Rescan {sel_ticker}", key="tab4_rescan_btn"):
+        with st.spinner(f"Rescanning {sel_ticker}…"):
+            ok, output = _run_daily_scanner(sel_ticker)
+        if ok:
+            st.success(f"✅ {sel_ticker} rescanned.")
+            _scan_archive_metadata.clear()
+        else:
+            st.error(f"❌ Rescan failed for {sel_ticker}.")
+        with st.expander("Output", expanded=not ok):
+            st.code(output[-4000:], language="text")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1236,10 +1838,11 @@ def _render_tab3(cfg: dict):
 def main():
     cfg = _sidebar()
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📈 Options Flow",
         "📋 Scanner Archive",
         "🔬 Spread Gate",
+        "🗂 Tickers",
     ])
 
     with tab1:
@@ -1248,11 +1851,14 @@ def main():
 
     with tab2:
         _market_banner()
-        _render_tab2()
+        _render_tab2(cfg)
 
     with tab3:
         _market_banner()
         _render_tab3(cfg)
+
+    with tab4:
+        _render_tab4()
 
 
 if __name__ == "__main__" or True:

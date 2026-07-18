@@ -635,7 +635,7 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
     print(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
 
 # ?? ARCHIVE ???????????????????????????????????????????????????????????????????
-def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None):
+def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None):
     os.makedirs("archive", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"archive/{TICKER}_{ts}.json"
@@ -645,6 +645,7 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
         "spot": spot,
         "or_data": or_data,        # dashboard: OR band + breakout state per run
         "direction": direction,    # dashboard: scanner's direction verdict per run
+        "session": session,        # dashboard: quote-strip fields (open, prev_close, high, low)
         "timeframes": {},
         # BUGFIX 2026-07-16b: persist the QUALIFIED magnets so the next
         # run's diff compares like-with-like. Previously the diff used
@@ -718,8 +719,50 @@ def run():
     total_pv0 = int(puts_all["volume"].sum())
     pc0 = round(total_pv0 / total_cv0, 3) if total_cv0 > 0 else 0
     direction0, _, _ = direction_score(tf_data, pc0)
+
+    # -- Session block: open, prev_close, day_high, day_low ------------------
+    # Derived from frames["1D"] — already fetched, no extra network call.
+    session = None
+    try:
+        dfd = frames.get("1D")
+        if dfd is not None and len(dfd) >= 2:
+            from zoneinfo import ZoneInfo
+            _ET = ZoneInfo("America/New_York")
+            today_et = datetime.now(_ET).date()
+            last_row  = dfd.iloc[-1]
+            last_date = last_row.name
+            # Normalise to a plain date for comparison
+            if hasattr(last_date, "date"):
+                last_date = last_date.date()
+            else:
+                last_date = pd.Timestamp(last_date).date()
+
+            if last_date == today_et:
+                # Today's bar exists: use its Open/High/Low; prev_close = row[-2]
+                open_today  = float(last_row["Open"])
+                day_high    = float(last_row["High"])
+                day_low     = float(last_row["Low"])
+                prev_close  = float(dfd.iloc[-2]["Close"])
+            else:
+                # Pre-market: today's bar not yet open; treat last row as prev close
+                open_today  = None
+                day_high    = None
+                day_low     = None
+                prev_close  = float(last_row["Close"])
+
+            session = {
+                "open":       open_today,
+                "prev_close": prev_close,
+                "day_high":   day_high,
+                "day_low":    day_low,
+            }
+    except Exception:
+        session = None
+    # ------------------------------------------------------------------------
+
     fname_json, fname_txt = save_archive(spot, tf_data, calls_all, puts_all,
-                                         or_data=or_data, direction=direction0)
+                                         or_data=or_data, direction=direction0,
+                                         session=session)
 
     # capture report as plain text
     import io

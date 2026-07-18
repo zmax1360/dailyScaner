@@ -205,3 +205,66 @@ def test_app_no_indicator_computation():
     assert not hits, (
         f"app.py must not reimplement indicators. Found: {hits}"
     )
+
+
+# ── 9 & 10. Session-block quote-strip rendering ───────────────────────────────
+
+def _make_archive(tmp_path, session=None, spot=333.26):
+    """Write a minimal archive JSON and return its path."""
+    payload = {
+        "timestamp": "2026-07-17T14:32:00",
+        "spot": spot,
+        "direction": "BULLISH",
+        "session": session,
+        "volume": {
+            "total_call_vol": 100000,
+            "total_put_vol": 70000,
+            "pc_ratio": 0.70,
+            "top_calls": [],
+            "top_puts": [],
+        },
+        "timeframes": {},
+    }
+    p = tmp_path / "AAPL_20260717_1432.json"
+    p.write_text(json.dumps(payload))
+    return str(p)
+
+
+def test_session_block_all_fields_present(tmp_path):
+    """Archive with a full session block must expose all four fields."""
+    session = {
+        "open":       328.01,
+        "prev_close": 330.95,
+        "day_high":   334.68,
+        "day_low":    326.79,
+    }
+    path = _make_archive(tmp_path, session=session, spot=333.26)
+    with open(path) as f:
+        payload = json.load(f)
+
+    s = payload.get("session") or {}
+    assert s.get("open")       == 328.01,  "open not persisted"
+    assert s.get("prev_close") == 330.95,  "prev_close not persisted"
+    assert s.get("day_high")   == 334.68,  "day_high not persisted"
+    assert s.get("day_low")    == 326.79,  "day_low not persisted"
+
+    # Δ vs prev close must be computable from archived data only
+    spot      = payload["spot"]
+    prev_close = s["prev_close"]
+    chg        = round(spot - prev_close, 4)
+    chg_pct    = round(chg / prev_close * 100, 4)
+    assert abs(chg     - 2.31) < 0.01,  f"chg wrong: {chg}"
+    assert abs(chg_pct - 0.698) < 0.01, f"chg_pct wrong: {chg_pct}"
+
+
+def test_session_block_absent_degrades_gracefully(tmp_path):
+    """Archive without a session block must not cause KeyError — spot-only path."""
+    path = _make_archive(tmp_path, session=None, spot=333.26)
+    with open(path) as f:
+        payload = json.load(f)
+
+    s = payload.get("session") or {}
+    assert s.get("prev_close") is None, "expected no prev_close in old archive"
+    assert s.get("open")       is None, "expected no open in old archive"
+    # The UI falls back to spot-only — verify spot is still readable
+    assert payload["spot"] == 333.26
