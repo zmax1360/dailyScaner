@@ -97,6 +97,61 @@ def fetch_full_chain(ticker: str = "AAPL") -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def fetch_daily_ohlc(ticker: str = "AAPL") -> dict | None:
+    """
+    Fetch today's daily Open / High / Low / Close for *ticker*.
+
+    Returns:
+        {"open": float, "high": float, "low": float, "close": float,
+         "prev_close": float | None}
+    or None on any failure. No analysis is performed here.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="5d", interval="1d")
+        if hist is None or hist.empty:
+            return None
+        row = hist.iloc[-1]
+        o = _safe_float(row.get("Open"))
+        h = _safe_float(row.get("High"))
+        l = _safe_float(row.get("Low"))
+        c = _safe_float(row.get("Close"))
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            return None
+        prev_close = None
+        if len(hist) >= 2:
+            prev_close = _safe_float(hist.iloc[-2].get("Close"))
+            if prev_close <= 0:
+                prev_close = None
+        return {
+            "open": o, "high": h, "low": l, "close": c,
+            "prev_close": prev_close,
+        }
+    except Exception:
+        return None
+
+
+def fetch_macro_snapshot() -> dict | None:
+    """
+    Fetch SPY, QQQ, and ^VIX daily bars for macro gravity filtering.
+
+    Returns a dict:
+      {
+        "SPY":  {"open","high","low","close","prev_close"},
+        "QQQ":  {...},
+        "VIX":  {"open","high","low","close","prev_close"},
+      }
+    or None if any required ticker fails. No analysis performed here.
+    """
+    out: dict = {}
+    for key, symbol in [("SPY", "SPY"), ("QQQ", "QQQ"), ("VIX", "^VIX")]:
+        bar = fetch_daily_ohlc(symbol)
+        if not bar:
+            return None
+        out[key] = bar
+    return out
+
+
 def _empty_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=[
         "side", "strike", "expiry", "dte",

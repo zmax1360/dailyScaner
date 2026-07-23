@@ -11,6 +11,7 @@ from datetime import datetime, time as dtime
 import sys
 import json
 import os
+import time
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -87,7 +88,7 @@ def diff_reports(prev, curr_spot, curr_tf, curr_calls, curr_puts, curr_pc):
     # ?? Timeframe RSI shifts ??
     prev_tfs = prev.get("timeframes", {})
     rsi_shifts = []
-    for tf in ["5M","10M","15M","1H","4H","1D"]:
+    for tf in ["5M","10M","15M","45M","1H","4H","1D"]:
         if tf in prev_tfs and tf in curr_tf:
             old_r = prev_tfs[tf]["rsi"]
             new_r = curr_tf[tf]["rsi"]
@@ -249,24 +250,65 @@ def fetch_data():
     t = yf.Ticker(TICKER)
 
     def clean(df):
-        df.index = df.index.tz_localize(None) if df.index.tz else df.index
+        # Guard: empty DataFrame has RangeIndex, not DatetimeIndex
+        if df is None or df.empty:
+            return df if df is not None else pd.DataFrame()
+        if hasattr(df.index, "tz"):
+            df.index = df.index.tz_localize(None) if df.index.tz else df.index
         return df
 
     df5m  = clean(t.history(period="5d",  interval="5m"))
+
+    # Early exit: if 5-minute data is empty the ticker is an index or delisted
+    if df5m.empty:
+        raise ValueError(
+            f"{TICKER} returned no intraday price data. "
+            "Indices (^VIX, ^SPX) and tickers without equity options are not "
+            "supported - the scanner requires a standard options chain."
+        )
+
     df10m = clean(df5m.resample("10min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
     df15m = clean(t.history(period="5d",  interval="15m"))
+    df45m = clean(df5m.resample("45min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
     df1h  = clean(t.history(period="30d", interval="1h"))
     df4h  = clean(df1h.resample("4h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
     dfd   = clean(t.history(period="6mo", interval="1d"))
 
-    frames = {"5M": df5m, "10M": df10m, "15M": df15m, "1H": df1h, "4H": df4h, "1D": dfd}
+    frames = {"5M": df5m, "10M": df10m, "15M": df15m, "45M": df45m, "1H": df1h, "4H": df4h, "1D": dfd}
     spot   = round(float(dfd["Close"].iloc[-1]), 2)
 
     # ALL expiries - no filter
+    # Yahoo sometimes returns HTML/rate-limit pages instead of JSON ? orjson.JSONDecodeError
+    expiries = None
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            expiries = list(t.options or [])
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 * attempt)
+    if expiries is None:
+        raise ValueError(
+            f"{TICKER} options list unavailable from Yahoo "
+            f"({type(last_err).__name__}: {last_err}). "
+            "Usually a temporary rate-limit or empty response - wait ~30s and retry."
+        )
+    if not expiries:
+        raise ValueError(
+            f"{TICKER} has no listed option expiries. "
+            "Indices (^VIX, ^SPX) are not supported - use an equity/ETF with options."
+        )
+
     all_calls, all_puts = [], []
-    for expiry in t.options:
-        chain = t.option_chain(expiry)
+    for expiry in expiries:
+        try:
+            chain = t.option_chain(expiry)
+        except Exception:
+            continue
         for df, lst in [(chain.calls, all_calls), (chain.puts, all_puts)]:
+            if df is None or not hasattr(df, "columns") or df.empty:
+                continue
             cols = ["strike","lastPrice","volume","openInterest","impliedVolatility"]
             for opt_col in ("bid", "ask"):
                 if opt_col in df.columns:
@@ -280,9 +322,15 @@ def fetch_data():
             tmp["volume"] = tmp["volume"].fillna(0)
             tmp["openInterest"] = tmp["openInterest"].fillna(0)
             tmp["expiry"] = expiry
-            # days to expiry
             tmp["dte"] = (datetime.strptime(expiry,"%Y-%m-%d").date() - datetime.today().date()).days
             lst.append(tmp)
+
+    if not all_calls or not all_puts:
+        raise ValueError(
+            f"{TICKER} has no options chain data. "
+            "Indices (^VIX, ^SPX) are not supported - use an ETF with options "
+            "instead (e.g. SPY, QQQ, UVXY for volatility exposure)."
+        )
 
     calls_all = pd.concat(all_calls).sort_values("volume", ascending=False).reset_index(drop=True)
     puts_all  = pd.concat(all_puts).sort_values("volume", ascending=False).reset_index(drop=True)
@@ -394,10 +442,11 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
     W = 68
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # totals
+    # totals - same rounding as save_archive / direction0 (3 dp) so
+    # terminal direction matches the archived direction the dashboard shows.
     total_cv = int(calls_all["volume"].sum())
     total_pv = int(puts_all["volume"].sum())
-    pc_ratio = round(total_pv / total_cv, 2) if total_cv > 0 else 0
+    pc_ratio = round(total_pv / total_cv, 3) if total_cv > 0 else 0
     direction, bv, brv = direction_score(tf_data, pc_ratio)
 
     print()
@@ -424,7 +473,7 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
     print(hdr("?? MULTI-TIMEFRAME ????????????????????????????????????????????"))
     print(f"  {'TF':<5}  {'RSI':<24}  {'MACD':<30}  {'VolSpike':<10}  {'Support':<9}  Resist")
     print("  " + "?"*(W-2))
-    for tf in ["5M","10M","15M","1H","4H","1D"]:
+    for tf in ["5M","10M","15M","45M","1H","4H","1D"]:
         d = tf_data.get(tf)
         if not d: continue
         vs_str = bull(f"{d['vs']}x") if d['vs'] >= 1.5 else dim(f"{d['vs']}x")
@@ -645,11 +694,14 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
 # ?? ARCHIVE ???????????????????????????????????????????????????????????????????
 def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None):
     os.makedirs("archive", exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+    ts_aware = datetime.now(_ET)
+    ts = ts_aware.strftime("%Y%m%d_%H%M%S")
     fname = f"archive/{TICKER}_{ts}.json"
 
     payload = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": ts_aware.isoformat(),
         "spot": spot,
         "or_data": or_data,        # dashboard: OR band + breakout state per run
         "direction": direction,    # dashboard: scanner's direction verdict per run
@@ -729,7 +781,7 @@ def run():
     direction0, _, _ = direction_score(tf_data, pc0)
 
     # -- Session block: open, prev_close, day_high, day_low ------------------
-    # Derived from frames["1D"] — already fetched, no extra network call.
+    # Derived from frames["1D"] - already fetched, no extra network call.
     session = None
     try:
         dfd = frames.get("1D")
@@ -791,4 +843,8 @@ def run():
     print(report_text, end="")
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except ValueError as e:
+        print(f"{C.RED}ERROR:{C.RESET} {e}")
+        sys.exit(1)

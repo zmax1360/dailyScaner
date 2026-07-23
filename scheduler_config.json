@@ -1,0 +1,12 @@
+{
+  "market_open": "09:30",
+  "market_close": "16:00",
+  "post_close_buffer_min": 15,
+  "default_interval_min": 5,
+  "notify_telegram": true,
+  "tickers": {
+    "AAPL": {
+      "interval_min": 5
+    }
+  }
+}
