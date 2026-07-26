@@ -2,6 +2,7 @@
 __pycache__/
 archive/
 archive_weekly/
+data/best_value_archive.csv
 files/
 files.zip
 .env

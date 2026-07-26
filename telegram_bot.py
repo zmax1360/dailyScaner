@@ -27,6 +27,7 @@ import pandas as pd
 
 from news_service import get_news_sentiment, get_market_news
 from best_value import build_best_value_df, resolve_biases_for_ticker
+from cost_distribution import calculate_cost_distribution, BLUE_SKY_TAG, is_blue_sky_breakout
 
 ET       = ZoneInfo("America/New_York")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -563,14 +564,42 @@ def _fmt_report(
         daily_bias, market_state = resolve_biases_for_ticker(
             ticker, payload.get("session") or {}, spot,
         )
+        try:
+            cost = calculate_cost_distribution(ticker, days=180, spot=spot)
+            profited_pct = cost.get("Profited_Shares_Pct")
+        except Exception:
+            profited_pct = None
+            cost = {}
+        from strategy_engine import (
+            ticker_expected_range,
+            recommend_strategy,
+            resolve_has_catalyst,
+            resolve_spot_below_support,
+        )
+        em = ticker_expected_range(spot, vol)
+        has_cat = resolve_has_catalyst(news_bias)
+        below = resolve_spot_below_support(
+            spot,
+            cost_info=cost if isinstance(cost, dict) else None,
+        )
+        opt = recommend_strategy(
+            daily_bias, em.get("IV"), profited_pct, has_cat,
+            spot_below_support=below,
+        )
         bv_df = build_best_value_df(
             vol, spot, prev_vol,
             min_volume=500,
             daily_bias=daily_bias,
             market_state=market_state,
             news_bias=news_bias,
+            profited_shares_pct=profited_pct,
+            upper_1sd=em.get("Upper_1SD"),
+            lower_1sd=em.get("Lower_1SD"),
+            optimal_strategy=opt,
+            has_catalyst=has_cat,
+            spot_below_support=below,
         )
-        if not bv_df.empty and bv_df["Status"].eq("⭐ BEST VALUE").any():
+        if not bv_df.empty and bv_df["Status"].astype(str).str.contains("BEST VALUE", na=False).any():
             has_dvol = "dVol" in bv_df.columns
             L.append("⭐ <b>BEST VALUE OPTION</b>")
             notes = []
@@ -583,6 +612,8 @@ def _fmt_report(
                 notes.append(f"Daily {daily_bias}")
             if market_state in ("BEARISH DRAG", "BULLISH TAILWIND"):
                 notes.append(f"Macro {market_state}")
+            if is_blue_sky_breakout(profited_pct, daily_bias):
+                notes.append(BLUE_SKY_TAG)
             if notes:
                 L.append("<i>" + " · ".join(notes) + "</i>")
             # Show top 3 by score (filtered rows only)
@@ -597,7 +628,7 @@ def _fmt_report(
             rows = [f"<pre>{hdr}"]
             for _, r in ranked.iterrows():
                 voi  = r["volume"] / max(int(r["openInterest"]), 1)
-                star = " ⭐" if r["Status"] == "⭐ BEST VALUE" else ""
+                star = " ⭐" if "BEST VALUE" in str(r.get("Status") or "") else ""
                 exp_s = r["expiry"][5:] if len(r["expiry"]) >= 7 else r["expiry"]
                 line = (
                     f"{r['side']:<5} ${r['strike']:<7.1f} {exp_s:<6} "
@@ -612,7 +643,7 @@ def _fmt_report(
             rows.append("</pre>")
             L.extend(rows)
             # One-liner callout for the winner
-            best = bv_df[bv_df["Status"] == "⭐ BEST VALUE"].iloc[0]
+            best = bv_df[bv_df["Status"].astype(str).str.contains("BEST VALUE", na=False)].iloc[0]
             voi_b = best["volume"] / max(int(best["openInterest"]), 1)
             L.append(
                 f"→ <b>{best['side']} ${best['strike']:.1f}</b> "
