@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily attribution health check at 16:30 ET (approx — launchd uses local time).
+  Install:
+    cp com.optiontrading.health-check.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.optiontrading.health-check.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.optiontrading.health-check</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/alizafarianaraki/works/optionTrading</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/alizafarianaraki/works/Conda/anaconda3/bin/python</string>
+    <string>/Users/alizafarianaraki/works/optionTrading/health_check.py</string>
+    <string>--alert-on-fail</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>16</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/alizafarianaraki/works/optionTrading/health_check.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/alizafarianaraki/works/optionTrading/health_check.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SCANNER_DB</key>
+    <string>/Users/alizafarianaraki/works/optionTrading/data/attribution.db</string>
+  </dict>
+</dict>
+</plist>

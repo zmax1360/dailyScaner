@@ -1,0 +1,38 @@
+"""
+config.py — Single source of truth for scoring thresholds and multipliers.
+
+Every literal that shapes Value_Score lives here. Changing any value changes
+config_hash(SCORING) so attribution runs stay segmentable.
+"""
+
+from __future__ import annotations
+
+# Fingerprint of "engine v1" — hashed into every attribution run.
+SCORING: dict[str, float | int] = {
+    # Base blend
+    "w_lev": 0.4,
+    "w_flow": 0.6,
+    # Universe gates (scoring path + magnet filter)
+    "min_volume": 500,
+    "min_oi_for_magnet": 500,
+    "min_last": 0.01,
+    # Daily bias (against the heavy side)
+    "mult_heavy_bias_against": 0.5,
+    # Macro drag / tailwind (against the opposing side)
+    "mult_macro_against": 0.3,
+    # News alignment
+    "mult_news_against": 0.8,
+    "mult_news_with": 1.2,
+    # VWAP reclaim sniper
+    "mult_vwap_sniper": 1.5,
+    # Strategy engine / 1SD
+    "mult_outside_1sd": 0.2,
+    "mult_plus2_boost": 1.5,
+    "mult_plus1_otm": 0.5,
+    "mult_plus1_itm": 1.3,
+    "mult_zero_outlook": 0.3,
+    # 0DTE gamma reflexivity
+    "mult_0dte_boost": 1.20,
+    # POV institutional urgency
+    "mult_pov_urgency": 1.25,
+}

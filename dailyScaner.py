@@ -15,6 +15,8 @@ import time
 import warnings
 warnings.filterwarnings("ignore")
 
+from config import SCORING
+
 def _parse_ticker() -> str:
     """Read ticker from argv[1], ignoring pytest/script paths (must be 1-5 alpha chars)."""
     if len(sys.argv) > 1:
@@ -27,7 +29,93 @@ TICKER = _parse_ticker()
 
 # Minimum open interest for a contract to be eligible as a magnet / signal.
 # Below this, vol/OI "conviction" is a division-by-noise artifact.
-MIN_OI_FOR_MAGNET = 500
+MIN_OI_FOR_MAGNET = int(SCORING["min_oi_for_magnet"])
+
+
+def _log_scan_attribution(
+    *,
+    ticker: str,
+    spot: float,
+    calls_all: pd.DataFrame,
+    puts_all: pd.DataFrame,
+    vol_curr: dict,
+    vol_prev: dict | None,
+    session: dict | None,
+) -> None:
+    """
+    Score + append attribution rows. Fail-soft: never abort a scan.
+    Lives on the scan path (not Streamlit) so scheduler runs are logged.
+    """
+    try:
+        from attribution import (
+            build_control_rows,
+            engine_sha,
+            log_run,
+            modal_flagged_expiry,
+        )
+        from best_value import build_best_value_df, resolve_biases_for_ticker
+
+        daily_bias, market_state = resolve_biases_for_ticker(
+            ticker, session or {}, spot,
+        )
+        news_bias = None
+        try:
+            from news_service import get_news_sentiment
+            news_bias = (get_news_sentiment(ticker) or {}).get("news_bias")
+        except Exception:
+            pass
+
+        bv_df = build_best_value_df(
+            vol_curr,
+            spot,
+            vol_prev,
+            daily_bias=daily_bias,
+            market_state=market_state,
+            news_bias=news_bias,
+        )
+
+        chain = pd.concat(
+            [
+                calls_all.assign(side="CALL"),
+                puts_all.assign(side="PUT"),
+            ],
+            ignore_index=True,
+        )
+        exp = modal_flagged_expiry(bv_df)
+        if not exp and "expiry" in chain.columns and not chain.empty:
+            # No scored rows — still log ATM control on nearest chain expiry
+            exp = str(chain["expiry"].astype(str).mode().iloc[0])
+        ctrl = (
+            build_control_rows(chain, spot, exp)
+            if exp
+            else build_control_rows(pd.DataFrame(), spot, "")
+        )
+
+        run_id = log_run(
+            ticker=ticker,
+            scored_df=bv_df,
+            cfg=SCORING,
+            spot=spot,
+            daily_bias=daily_bias,
+            market_state=market_state,
+            news_bias=news_bias,
+            control_rows=ctrl,
+            engine_sha_val=engine_sha(),
+        )
+        n = int(bv_df["Value_Score"].notna().sum()) if not bv_df.empty else 0
+        print(
+            f"{C.GRAY}  Attribution ? run_id={run_id[:8]}… "
+            f"scored={n} ctrl={len(ctrl)}{C.RESET}"
+        )
+    except Exception as exc:
+        print(f"{C.YELLOW}  Attribution log failed (scan continues): {exc}{C.RESET}")
+        try:
+            from attribution import alert_attribution_failure
+            alert_attribution_failure(
+                f"ticker={ticker} spot={spot}\n{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
 
 def strip_ansi(text):
     import re
@@ -823,6 +911,30 @@ def run():
     fname_json, fname_txt = save_archive(spot, tf_data, calls_all, puts_all,
                                          or_data=or_data, direction=direction0,
                                          session=session)
+
+    # Attribution: every scored contract + ATM controls (fail-soft)
+    vol_curr = {
+        "top_calls": calls_all[calls_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+        "top_puts": puts_all[puts_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+    }
+    vol_prev_bv = None
+    if prev_result:
+        vol_prev_bv = (prev_result[0] or {}).get("volume")
+    _log_scan_attribution(
+        ticker=TICKER,
+        spot=spot,
+        calls_all=calls_all,
+        puts_all=puts_all,
+        vol_curr=vol_curr,
+        vol_prev=vol_prev_bv,
+        session=session,
+    )
 
     # capture report as plain text
     import io

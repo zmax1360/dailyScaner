@@ -14,10 +14,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from config import SCORING
+
 OVER_PARTICIPATION_THRESH = 3.0
 ROLLING_WINDOW = 15
 URGENCY_TAG = "🚨 INSTITUTIONAL URGENCY DETECTED"
-URGENCY_CALL_MULT = 1.25
+URGENCY_CALL_MULT = float(SCORING["mult_pov_urgency"])
 
 COLOR_HIDDEN = "#00C853"       # emerald — target / hidden participation
 COLOR_LEAKAGE = "#FF00FF"      # magenta — over-participation leak

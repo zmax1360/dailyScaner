@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "option-trading"
+version = "0.1.0"
+description = "Options flow scanner with attribution logging"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit==1.37.1",
+    "pandas==2.3.3",
+    "numpy==1.26.4",
+    "plotly==5.24.1",
+    "yfinance==1.2.0",
+    "pytz==2024.1",
+    "altair==5.0.1",
+    "optionlab==1.6.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==7.4.4",
+    "pytest-cov==7.1.0",
+]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "dashboard.py",
+    "massive_test.py",
+    "dashboard_*.html",
+]
+
+[tool.coverage.report]
+fail_under = 8
+skip_empty = true

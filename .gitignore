@@ -1,8 +1,10 @@
 .DS_Store
+.coverage
 __pycache__/
 archive/
 archive_weekly/
 data/best_value_archive.csv
+data/attribution.db*
 files/
 files.zip
 .env

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd: every 15 min during market hours (approx).
+  Install:
+    cp com.optiontrading.mark-runner.plist ~/Library/LaunchAgents/
+    # edit WorkingDirectory / ProgramArguments paths if needed
+    launchctl load ~/Library/LaunchAgents/com.optiontrading.mark-runner.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.optiontrading.mark-runner</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/alizafarianaraki/works/optionTrading</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/alizafarianaraki/works/Conda/anaconda3/bin/python</string>
+    <string>/Users/alizafarianaraki/works/optionTrading/mark_runner.py</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/alizafarianaraki/works/optionTrading/mark_runner.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/alizafarianaraki/works/optionTrading/mark_runner.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SCANNER_DB</key>
+    <string>/Users/alizafarianaraki/works/optionTrading/data/attribution.db</string>
+  </dict>
+</dict>
+</plist>

@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from config import SCORING
+
 ET = ZoneInfo("America/New_York")
 
 STATE_SQUEEZE = "🚀 0DTE CALL GAMMA SQUEEZE (High Reflexivity)"
@@ -22,7 +24,7 @@ STATE_CASCADE = "🩸 0DTE PUT GAMMA CASCADE (Forced Selling)"
 STATE_NEUTRAL = "⚖️ NEUTRAL 0DTE FLOW (Balanced Hedging)"
 
 ATM_PCT = 0.015  # |K-S|/S ≤ 1.5% → ATM for boost
-BOOST_MULT = 1.20
+BOOST_MULT = float(SCORING["mult_0dte_boost"])
 
 
 def _norm_pdf(x: float) -> float:
