@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS flags (
     mark_t1h    REAL,
     mark_t1d    REAL,
     mark_expiry REAL,
+    marked_t1h_at TEXT,
+    marked_t1d_at TEXT,
+    marked_exp_at TEXT,
     notes       TEXT,
     CHECK (is_control IN (0, 1))
 );
@@ -95,6 +98,9 @@ SELECT
     f.mark_t1h,
     f.mark_t1d,
     f.mark_expiry,
+    f.marked_t1h_at,
+    f.marked_t1d_at,
+    f.marked_exp_at,
     r.config_hash,
     r.engine_sha,
     r.daily_bias,
@@ -113,6 +119,18 @@ SELECT
         THEN (f.mark_expiry - f.mid) / f.mid
     END AS ret_expiry,
     CASE
+        WHEN f.marked_t1h_at IS NOT NULL
+        THEN ROUND((julianday(f.marked_t1h_at) - julianday(f.ts_et)) * 24, 2)
+    END AS hours_t1h,
+    CASE
+        WHEN f.marked_t1d_at IS NOT NULL
+        THEN ROUND((julianday(f.marked_t1d_at) - julianday(f.ts_et)) * 24, 2)
+    END AS hours_t1d,
+    CASE
+        WHEN f.marked_exp_at IS NOT NULL
+        THEN ROUND((julianday(f.marked_exp_at) - julianday(f.ts_et)) * 24, 2)
+    END AS hours_expiry,
+    CASE
         WHEN f.is_control = 1 THEN 'CONTROL'
         WHEN f.rank IS NULL THEN 'UNRANKED'
         WHEN f.rank <= 3 THEN '01-03'
@@ -124,15 +142,29 @@ FROM flags f
 JOIN runs r USING (run_id);
 """
 
-_FLAG_BASE_COLS = ("nlev", "nflow", "base_score")
+# Additive migrations only — never DROP/recreate flags (live rows must survive).
+_FLAG_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
+    ("nlev", "REAL"),
+    ("nflow", "REAL"),
+    ("base_score", "REAL"),
+    ("marked_t1h_at", "TEXT"),
+    ("marked_t1d_at", "TEXT"),
+    ("marked_exp_at", "TEXT"),
+)
+
+_MARK_AT_COL = {
+    "t1h": "marked_t1h_at",
+    "t1d": "marked_t1d_at",
+    "expiry": "marked_exp_at",
+}
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(flags)")}
-    for col in _FLAG_BASE_COLS:
+    for col, sql_type in _FLAG_MIGRATE_COLS:
         if col not in cols:
-            conn.execute(f"ALTER TABLE flags ADD COLUMN {col} REAL")
+            conn.execute(f"ALTER TABLE flags ADD COLUMN {col} {sql_type}")
     conn.executescript(_VIEW_SQL)
 
 
@@ -584,15 +616,17 @@ def write_mark(
         return False
 
     col = {"t1h": "mark_t1h", "t1d": "mark_t1d", "expiry": "mark_expiry"}[horizon]
+    at_col = _MARK_AT_COL[horizon]
+    marked_at = now_et().astimezone(ET).isoformat(timespec="seconds")
     with _db(db_path) as conn:
         cur = conn.execute(
             f"""
             UPDATE flags
-            SET {col} = ?
+            SET {col} = ?, {at_col} = ?
             WHERE flag_id = ?
               AND {col} IS NULL
             """,
-            (v, int(flag_id)),
+            (v, marked_at, int(flag_id)),
         )
         return cur.rowcount == 1
 

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import json
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -11,6 +14,7 @@ import pytz
 
 from attribution import (
     _db,
+    _ensure_schema,
     alert_attribution_failure,
     build_control_rows,
     config_hash,
@@ -245,3 +249,158 @@ def test_marks_are_immutable(tmp_path):
     # Zero / None must not poison
     assert write_mark(fid, "t1d", 0.0, db_path=db) is False
     assert write_mark(fid, "t1d", None, db_path=db) is False
+
+
+def test_mark_records_timestamp(tmp_path, monkeypatch):
+    db = str(tmp_path / "mark_ts.db")
+    chain = _sample_chain()
+    scored = calculate_best_value(chain, spot_price=250.0, now_et=NOW)
+    ctrl = build_control_rows(chain, spot=250.0, expiry="2026-08-21")
+    past = ET.localize(datetime(2026, 7, 20, 9, 0, 0))
+    log_run(
+        ticker="TEST", scored_df=scored, cfg=SCORING, spot=250.0,
+        control_rows=ctrl, db_path=db, ts_et=past,
+    )
+    mark_time = ET.localize(datetime(2026, 7, 20, 12, 0, 0))
+    monkeypatch.setattr("attribution.now_et", lambda: mark_time)
+    with _db(db) as c:
+        fid = c.execute(
+            "SELECT flag_id FROM flags WHERE is_control=0 LIMIT 1"
+        ).fetchone()[0]
+    assert write_mark(fid, "t1h", 2.5, db_path=db) is True
+    with _db(db) as c:
+        row = c.execute(
+            "SELECT mark_t1h, marked_t1h_at FROM flags WHERE flag_id=?",
+            (fid,),
+        ).fetchone()
+    assert row["mark_t1h"] == 2.5
+    assert row["marked_t1h_at"] is not None
+    parsed = datetime.fromisoformat(row["marked_t1h_at"])
+    assert parsed.tzinfo is not None
+    assert parsed.astimezone(ZoneInfo("America/New_York")) == mark_time
+
+
+def test_mark_value_and_timestamp_are_atomic():
+    src = inspect.getsource(write_mark)
+    # Single UPDATE must set value and *_at together; no second statement path.
+    assert "UPDATE flags" in src
+    assert src.count("UPDATE flags") == 1
+    assert "SET {col} = ?, {at_col} = ?" in src
+    assert "AND {col} IS NULL" in src
+    # Rejected writes leave both NULL
+    # (covered operationally below via refuse path)
+
+
+def test_mark_refuse_leaves_both_null(tmp_path):
+    db = str(tmp_path / "atomic.db")
+    chain = _sample_chain()
+    scored = calculate_best_value(chain, spot_price=250.0, now_et=NOW)
+    ctrl = build_control_rows(chain, spot=250.0, expiry="2026-08-21")
+    log_run(
+        ticker="TEST", scored_df=scored, cfg=SCORING, spot=250.0,
+        control_rows=ctrl, db_path=db, ts_et=NOW,
+    )
+    with _db(db) as c:
+        fid = c.execute(
+            "SELECT flag_id FROM flags WHERE is_control=0 LIMIT 1"
+        ).fetchone()[0]
+    assert write_mark(fid, "t1h", 0.0, db_path=db) is False
+    with _db(db) as c:
+        row = c.execute(
+            "SELECT mark_t1h, marked_t1h_at FROM flags WHERE flag_id=?",
+            (fid,),
+        ).fetchone()
+    assert row["mark_t1h"] is None
+    assert row["marked_t1h_at"] is None
+
+
+def test_migration_preserves_existing_rows(tmp_path):
+    db = str(tmp_path / "migrate.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY,
+            ts_et TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            n_scored INTEGER NOT NULL,
+            config_hash TEXT NOT NULL
+        );
+        CREATE TABLE flags (
+            flag_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            ts_et TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            strike REAL NOT NULL,
+            expiry TEXT NOT NULL,
+            score REAL,
+            rank INTEGER,
+            multipliers TEXT NOT NULL DEFAULT '{}',
+            mid REAL,
+            is_control INTEGER NOT NULL DEFAULT 0,
+            mark_t1h REAL,
+            mark_t1d REAL,
+            mark_expiry REAL
+        );
+        INSERT INTO runs VALUES ('r1','2026-07-20T10:00:00-04:00','TEST',1,'abc');
+        INSERT INTO flags (
+            run_id, ts_et, ticker, side, strike, expiry,
+            score, rank, multipliers, mid, is_control
+        ) VALUES (
+            'r1','2026-07-20T10:00:00-04:00','TEST','CALL',250.0,'2026-08-21',
+            0.5, 1, '{"_base":1.0}', 1.25, 0
+        );
+        """
+    )
+    conn.commit()
+    before = conn.execute(
+        "SELECT flag_id, score, mid, ticker FROM flags"
+    ).fetchone()
+    cols_before = {r[1] for r in conn.execute("PRAGMA table_info(flags)")}
+    assert "marked_t1h_at" not in cols_before
+    _ensure_schema(conn)
+    conn.commit()
+    cols_after = {r[1] for r in conn.execute("PRAGMA table_info(flags)")}
+    for col in ("marked_t1h_at", "marked_t1d_at", "marked_exp_at"):
+        assert col in cols_after
+    after = conn.execute(
+        "SELECT flag_id, score, mid, ticker, marked_t1h_at, marked_t1d_at, marked_exp_at "
+        "FROM flags"
+    ).fetchone()
+    assert after[0] == before[0]
+    assert after[1] == before[1]
+    assert after[2] == before[2]
+    assert after[3] == before[3]
+    assert after[4] is None and after[5] is None and after[6] is None
+    n = conn.execute("SELECT COUNT(*) FROM flags").fetchone()[0]
+    assert n == 1
+    conn.close()
+
+
+def test_hours_elapsed_computed(tmp_path, monkeypatch):
+    db = str(tmp_path / "hours.db")
+    chain = _sample_chain()
+    scored = calculate_best_value(chain, spot_price=250.0, now_et=NOW)
+    ctrl = build_control_rows(chain, spot=250.0, expiry="2026-08-21")
+    t0 = ET.localize(datetime(2026, 7, 20, 10, 0, 0))
+    t1 = t0 + timedelta(hours=3)
+    log_run(
+        ticker="TEST", scored_df=scored, cfg=SCORING, spot=250.0,
+        control_rows=ctrl, db_path=db, ts_et=t0,
+    )
+    monkeypatch.setattr("attribution.now_et", lambda: t1)
+    with _db(db) as c:
+        fid = c.execute(
+            "SELECT flag_id FROM flags WHERE is_control=0 LIMIT 1"
+        ).fetchone()[0]
+    assert write_mark(fid, "t1h", 4.0, db_path=db) is True
+    with _db(db) as c:
+        hours = c.execute(
+            "SELECT hours_t1h FROM v_outcomes WHERE flag_id=?", (fid,)
+        ).fetchone()[0]
+        unmarked = c.execute(
+            "SELECT hours_t1d FROM v_outcomes WHERE flag_id=?", (fid,)
+        ).fetchone()[0]
+    assert hours == pytest.approx(3.0, abs=0.05)
+    assert unmarked is None

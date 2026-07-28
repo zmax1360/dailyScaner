@@ -5,6 +5,9 @@ archive/
 archive_weekly/
 data/best_value_archive.csv
 data/attribution.db*
+data/portfolio.json
+data/portfolio_closed.json
+data/journal/
 files/
 files.zip
 .env

@@ -54,7 +54,6 @@ from strategy_engine import (
     resolve_spot_below_support,
     ticker_expected_range,
     attach_optimal_strategy,
-    strategy_cell_style,
 )
 from zero_dte_gex import (
     calculate_0dte_gamma_flow,
@@ -67,6 +66,7 @@ from pov_leakage import (
     render_pov_leakage_chart,
     URGENCY_TAG,
 )
+import portfolio_store as portfolio_store
 
 ET = ZoneInfo("America/New_York")
 
@@ -170,6 +170,7 @@ def _main_tab_labels() -> list[str]:
             ":material/science: Spread Gate",
             ":material/list_alt: Tickers",
             ":material/newspaper: Market News",
+            ":material/menu_book: Journal",
         ]
     return [
         "📈 Options Flow",
@@ -177,6 +178,7 @@ def _main_tab_labels() -> list[str]:
         "🔬 Spread Gate",
         "📁 Tickers",
         "📰 Market News",
+        "📓 Journal",
     ]
 
 
@@ -184,6 +186,48 @@ def _main_tab_labels() -> list[str]:
 
 def _now_et() -> datetime:
     return datetime.now(ET)
+
+
+def _latest_archive_stamp(ticker: str) -> str | None:
+    """Stable fingerprint of the newest archive for auto-refresh detection."""
+    files = sorted(glob.glob(f"archive/{ticker}_*.json"), reverse=True)
+    if not files:
+        return None
+    path = files[0]
+    try:
+        return f"{os.path.basename(path)}|{os.path.getmtime(path):.3f}"
+    except OSError:
+        return os.path.basename(path)
+
+
+def _watch_archive_auto_refresh(ticker: str) -> None:
+    """
+    Poll for a new scheduler/manual archive and full-rerun the page so Tab 1
+    picks up fresh data without a manual browser refresh.
+    """
+    @st.fragment(run_every=timedelta(seconds=20))
+    def _watcher():
+        stamp = _latest_archive_stamp(ticker)
+        key = f"_last_seen_archive_{ticker}"
+        prev = st.session_state.get(key)
+        if stamp is None:
+            st.caption("Waiting for first archive…")
+            return
+        if prev is None:
+            st.session_state[key] = stamp
+            st.caption("Auto-refresh on · watching for new scans")
+            return
+        if stamp != prev:
+            st.session_state[key] = stamp
+            try:
+                _scan_archive_metadata.clear()
+            except Exception:
+                pass
+            st.toast(f"New {ticker} scan detected — refreshing…")
+            st.rerun()
+        st.caption("Auto-refresh on · watching for new scans")
+
+    _watcher()
 
 
 def _latest_archive(ticker: str = "AAPL") -> dict | None:
@@ -830,10 +874,17 @@ def _sidebar() -> dict:
             if ok:
                 st.success(f"{focus_ticker} scan complete — archive updated.")
                 _scan_archive_metadata.clear()
+                stamp = _latest_archive_stamp(focus_ticker)
+                if stamp:
+                    st.session_state[f"_last_seen_archive_{focus_ticker}"] = stamp
+                st.rerun()
             else:
                 st.error(f"{focus_ticker} scanner returned an error.")
             with st.expander("Scanner output", expanded=not ok):
                 st.code(output[-4000:], language="text")
+
+        # Auto-refresh when scheduler (or another process) writes a new archive
+        _watch_archive_auto_refresh(focus_ticker)
 
         # Auto-launch scheduler / telegram bot once per session (status alert is at page top)
         _ensure_services()
@@ -841,8 +892,14 @@ def _sidebar() -> dict:
         st.divider()
         st.subheader("Flow filters")
         min_dte  = st.number_input("Min DTE", min_value=0, value=1, step=1)
-        top_n    = st.number_input("Top N contracts/side", min_value=1, max_value=30, value=5, step=1,
-                                   help="How many top calls / puts to show in The Magnets panel")
+        top_n    = st.number_input(
+            "Top N results",
+            min_value=1,
+            max_value=30,
+            value=5,
+            step=1,
+            help="How many rows to show in Best Value and how many calls/puts in The Magnets",
+        )
         sort_by  = _choice_control(
             "Sort by",
             ["Volume", "Premium $", "Strike"],
@@ -1322,16 +1379,65 @@ def _fmt_compact_shares(n: float | int) -> str:
     return f"{v:.0f}"
 
 
-def _render_volume_analysis(ticker: str, *, compact: bool = False) -> None:
+def _render_volume_analysis(
+    ticker: str,
+    *,
+    compact: bool = False,
+    vol_curr: dict | None = None,
+) -> None:
     """Broker-style Buy / Sell / Neutral volume doughnut + header metrics."""
     import plotly.graph_objects as go
+    from volume_analysis import _classify_tick_rule
 
     with st.container():
         st.markdown("#### 📊 Volume Analysis" if compact else "### 📊 Volume Analysis")
         data = _cached_volume_analysis(ticker)
         total = int(data.get("Total_Volume") or 0)
+        mode = "stock"  # stock tick-rule vs options call/put fallback
+
+        # If the cached fetch was empty (rate-limit / 1m gap), rebuild from the
+        # same 5M bars the VWAP chart already uses — usually already warm.
         if total <= 0:
-            st.caption("No intraday volume data available for this ticker right now.")
+            try:
+                chart_df = _cached_vwap_chart_df(ticker, "5M")
+                if chart_df is not None and not chart_df.empty:
+                    data = _classify_tick_rule(chart_df)
+                    data["ticker"] = ticker
+                    data["source"] = "vwap_chart_5m_fallback"
+                    total = int(data.get("Total_Volume") or 0)
+            except Exception:
+                pass
+
+        # Archive options volume — always available after a scan, no extra Yahoo hit
+        if total <= 0 and isinstance(vol_curr, dict):
+            cv = int(vol_curr.get("total_call_vol") or 0)
+            pv = int(vol_curr.get("total_put_vol") or 0)
+            if cv + pv > 0:
+                mode = "options"
+                total = cv + pv
+                data = {
+                    "Average_Price": 0.0,
+                    "Total_Count": (
+                        len(vol_curr.get("top_calls") or [])
+                        + len(vol_curr.get("top_puts") or [])
+                    ),
+                    "Total_Volume": total,
+                    "Buy_Volume": cv,       # Call flow proxy
+                    "Sell_Volume": pv,      # Put flow proxy
+                    "Neutral_Volume": 0,
+                    "source": "archive_options_volume",
+                }
+
+        if total <= 0:
+            try:
+                _cached_volume_analysis.clear()
+            except Exception:
+                pass
+            err = (data or {}).get("error")
+            msg = "No intraday volume data available for this ticker right now."
+            if err:
+                msg += f" ({err})"
+            st.caption(msg)
             return
 
         avg_px = float(data.get("Average_Price") or 0)
@@ -1340,26 +1446,51 @@ def _render_volume_analysis(ticker: str, *, compact: bool = False) -> None:
         sell   = int(data.get("Sell_Volume") or 0)
         neut   = int(data.get("Neutral_Volume") or 0)
 
-        if compact:
-            st.caption(
-                f"Avg \\${avg_px:,.2f} · Count {_fmt_compact_shares(count)} · "
-                f"Vol {_fmt_compact_shares(total)}"
-            )
+        if mode == "options":
+            labels = ["Call Volume", "Put Volume"]
+            values = [buy, sell]
+            colors = ["#00C853", "#FF1744"]
+            title = "Call vs Put Volume"
+            if compact:
+                st.caption(
+                    f"Options flow · Vol {_fmt_compact_shares(total)} "
+                    f"(Yahoo stock bars unavailable)"
+                )
+            else:
+                st.caption("Showing options call/put volume from latest scan (stock bars unavailable).")
         else:
-            h1, h2, h3 = st.columns(3)
-            h1.metric("Average Price", f"${avg_px:,.2f}")
-            h2.metric("Total Count", _fmt_compact_shares(count))
-            h3.metric("Total Volume (Shares)", _fmt_compact_shares(total))
+            labels = ["Buy Volume", "Sell Volume", "Neutral Volume"]
+            values = [buy, sell, neut]
+            colors = ["#00C853", "#FF1744", "#B0BEC5"]
+            title = "Buy vs Sell Volume"
+            if compact:
+                st.caption(
+                    f"Avg ${avg_px:,.2f} · Count {_fmt_compact_shares(count)} · "
+                    f"Vol {_fmt_compact_shares(total)}"
+                )
+            else:
+                h1, h2, h3 = st.columns(3)
+                h1.metric("Average Price", f"${avg_px:,.2f}")
+                h2.metric("Total Count", _fmt_compact_shares(count))
+                h3.metric("Total Volume (Shares)", _fmt_compact_shares(total))
 
-        labels = ["Buy Volume", "Sell Volume", "Neutral Volume"]
-        values = [buy, sell, neut]
-        colors = ["#00C853", "#FF1744", "#B0BEC5"]
         plot_labels, plot_values, plot_colors = [], [], []
         for lab, val, col in zip(labels, values, colors):
             if val > 0:
                 plot_labels.append(lab)
                 plot_values.append(val)
                 plot_colors.append(col)
+
+        if not plot_values:
+            st.caption("Volume bars present but buy/sell split is empty.")
+            return
+
+        try:
+            base = (st.get_option("theme.base") or "light").lower()
+        except Exception:
+            base = "light"
+        center_color = "#eeeeee" if base == "dark" else "#212121"
+        title_color = "#e0e0e0" if base == "dark" else "#424242"
 
         fig = go.Figure(
             data=[
@@ -1369,7 +1500,7 @@ def _render_volume_analysis(ticker: str, *, compact: bool = False) -> None:
                     hole=0.7,
                     marker=dict(colors=plot_colors, line=dict(width=0)),
                     textinfo="none",
-                    hovertemplate="%{label}<br>%{value:,.0f} sh"
+                    hovertemplate="%{label}<br>%{value:,.0f}"
                                   "<br>%{percent}<extra></extra>",
                     sort=False,
                 )
@@ -1377,8 +1508,8 @@ def _render_volume_analysis(ticker: str, *, compact: bool = False) -> None:
         )
         fig.update_layout(
             title=dict(
-                text="Buy vs Sell Volume",
-                font=dict(size=13 if compact else 14, color="#e0e0e0"),
+                text=title,
+                font=dict(size=13 if compact else 14, color=title_color),
                 x=0.5,
                 xanchor="center",
             ),
@@ -1390,22 +1521,31 @@ def _render_volume_analysis(ticker: str, *, compact: bool = False) -> None:
             annotations=[
                 dict(
                     text=f"<b>{_fmt_compact_shares(total)}</b><br>"
-                         f"<span style='font-size:11px;color:#9e9e9e'>shares</span>",
+                         f"<span style='font-size:11px;opacity:0.7'>"
+                         f"{'contracts' if mode == 'options' else 'shares'}</span>",
                     x=0.5, y=0.5, showarrow=False,
-                    font=dict(size=14 if compact else 16, color="#eeeeee"),
+                    font=dict(size=14 if compact else 16, color=center_color),
                 )
             ],
         )
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-        buy_pct  = buy / total * 100 if total else 0
-        sell_pct = sell / total * 100 if total else 0
-        neut_pct = neut / total * 100 if total else 0
-        st.markdown(
-            f"🟢 **Buy** `{_fmt_compact_shares(buy)}` ({buy_pct:.0f}%) · "
-            f"🔴 **Sell** `{_fmt_compact_shares(sell)}` ({sell_pct:.0f}%) · "
-            f"⚪ **Neutral** `{_fmt_compact_shares(neut)}` ({neut_pct:.0f}%)"
-        )
+        if mode == "options":
+            buy_pct = buy / total * 100 if total else 0
+            sell_pct = sell / total * 100 if total else 0
+            st.markdown(
+                f"🟢 **Calls** `{_fmt_compact_shares(buy)}` ({buy_pct:.0f}%) · "
+                f"🔴 **Puts** `{_fmt_compact_shares(sell)}` ({sell_pct:.0f}%)"
+            )
+        else:
+            buy_pct  = buy / total * 100 if total else 0
+            sell_pct = sell / total * 100 if total else 0
+            neut_pct = neut / total * 100 if total else 0
+            st.markdown(
+                f"🟢 **Buy** `{_fmt_compact_shares(buy)}` ({buy_pct:.0f}%) · "
+                f"🔴 **Sell** `{_fmt_compact_shares(sell)}` ({sell_pct:.0f}%) · "
+                f"⚪ **Neutral** `{_fmt_compact_shares(neut)}` ({neut_pct:.0f}%)"
+            )
 
 
 def _build_best_value_df(
@@ -1453,23 +1593,79 @@ _RUNNER_VEL_THRESH = 0.20    # strong velocity → hold runner (with daily bias)
 _SCALE_PREMIUM_PCT = 0.25    # +25% off entry → scale 50%
 _STOP_LOSS_PCT = -0.15       # portfolio personal stop
 
-_PORTFOLIO_COLS = ["Ticker", "Side", "Strike", "Expiry", "Quantity", "Entry_Price"]
+_PORTFOLIO_COLS = list(portfolio_store.EDITOR_COLS)
+_PORTFOLIO_LEDGER_COLS = list(portfolio_store.LEDGER_COLS)
 
 
 def _ensure_portfolio_df() -> None:
-    """Initialize the portfolio ledger in session_state if missing."""
+    """Initialize / hydrate the portfolio ledger from disk into session_state."""
     if "portfolio_df" not in st.session_state:
-        st.session_state["portfolio_df"] = pd.DataFrame(columns=_PORTFOLIO_COLS)
+        st.session_state["portfolio_df"] = portfolio_store.load_portfolio()
     else:
-        # Guarantee required columns after older sessions / partial edits
         df = st.session_state["portfolio_df"]
         if not isinstance(df, pd.DataFrame):
-            st.session_state["portfolio_df"] = pd.DataFrame(columns=_PORTFOLIO_COLS)
+            st.session_state["portfolio_df"] = portfolio_store.load_portfolio()
             return
-        for col in _PORTFOLIO_COLS:
+        for col in _PORTFOLIO_LEDGER_COLS:
             if col not in df.columns:
                 df[col] = pd.NA
-        st.session_state["portfolio_df"] = df[_PORTFOLIO_COLS]
+        st.session_state["portfolio_df"] = df[
+            [c for c in _PORTFOLIO_LEDGER_COLS if c in df.columns]
+        ].copy()
+        for col in _PORTFOLIO_LEDGER_COLS:
+            if col not in st.session_state["portfolio_df"].columns:
+                st.session_state["portfolio_df"][col] = pd.NA
+        st.session_state["portfolio_df"] = st.session_state["portfolio_df"][
+            _PORTFOLIO_LEDGER_COLS
+        ]
+
+
+def _persist_portfolio_editor(edited: pd.DataFrame) -> None:
+    """Merge editor columns into the ledger and save to disk."""
+    _ensure_portfolio_df()
+    prev = st.session_state["portfolio_df"]
+    if not isinstance(edited, pd.DataFrame):
+        return
+    out = edited.copy()
+    for col in _PORTFOLIO_COLS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    # Preserve marks + entry timestamps for rows that still match
+    meta_map: dict[tuple, tuple] = {}
+    if isinstance(prev, pd.DataFrame) and not prev.empty:
+        for _, r in prev.iterrows():
+            k = (
+                str(r.get("Ticker") or "").upper(),
+                str(r.get("Side") or "").upper(),
+                round(float(r["Strike"]), 4) if pd.notna(r.get("Strike")) else None,
+                str(r.get("Expiry") or ""),
+            )
+            meta_map[k] = (
+                r.get("Mark_Price"),
+                r.get("Mark_Updated_At"),
+                r.get("Entry_At"),
+            )
+    marks, marked_at, entry_ats = [], [], []
+    for _, r in out.iterrows():
+        k = (
+            str(r.get("Ticker") or "").upper(),
+            str(r.get("Side") or "").upper(),
+            round(float(r["Strike"]), 4) if pd.notna(r.get("Strike")) else None,
+            str(r.get("Expiry") or ""),
+        )
+        mp, ma, ea = meta_map.get(k, (pd.NA, pd.NA, pd.NA))
+        marks.append(mp)
+        marked_at.append(ma)
+        entry_ats.append(ea)
+    out["Mark_Price"] = marks
+    out["Mark_Updated_At"] = marked_at
+    out["Entry_At"] = entry_ats
+    for col in _PORTFOLIO_LEDGER_COLS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out = out[_PORTFOLIO_LEDGER_COLS]
+    st.session_state["portfolio_df"] = out
+    portfolio_store.save_portfolio(out)
 
 
 def evaluate_portfolio(
@@ -1658,10 +1854,14 @@ def _render_portfolio_manager(
     st.markdown("#### 💼 My Open Positions" if compact else "### 💼 My Open Positions")
     if not compact:
         st.caption(
-            "Add contracts you own. Signals use **your Entry_Price** vs live scanner "
-            "quotes (+25% scale / −15% stop), then Score Velocity for momentum."
+            "Add from Best Value with **＋**, close with **−** (enter exit price). "
+            "Signals use **your Entry_Price** vs live scanner "
+            "(+25% scale / −15% stop). Marks refresh every scan."
         )
+    else:
+        st.caption("＋ adds · − closes (exit price) · marks refresh each scan")
 
+    editor_src = st.session_state["portfolio_df"][_PORTFOLIO_COLS].copy()
     _editor_kw: dict = dict(
         num_rows="dynamic",
         use_container_width=True,
@@ -1687,13 +1887,10 @@ def _render_portfolio_manager(
     )
     if compact:
         _editor_kw["height"] = 220
-    edited = st.data_editor(st.session_state["portfolio_df"], **_editor_kw)
-    # Persist edits across refreshes
+    edited = st.data_editor(editor_src, **_editor_kw)
+    # Persist edits across refreshes + disk
     if isinstance(edited, pd.DataFrame):
-        for col in _PORTFOLIO_COLS:
-            if col not in edited.columns:
-                edited[col] = pd.NA
-        st.session_state["portfolio_df"] = edited[_PORTFOLIO_COLS].copy()
+        _persist_portfolio_editor(edited)
 
     live = _build_live_scanner_df_for_portfolio(
         ticker, vol_curr, spot, vol_prev,
@@ -1701,10 +1898,57 @@ def _render_portfolio_manager(
         market_state=market_state,
         news_bias=news_bias,
     )
+    # Refresh Mark_Price from live quotes every run; EOD force when closed
+    marked = portfolio_store.apply_live_marks(
+        st.session_state["portfolio_df"],
+        live,
+        force_eod=_market_is_closed(),
+    )
+    st.session_state["portfolio_df"] = marked
+
     scored = evaluate_portfolio(st.session_state["portfolio_df"], live)
     if scored.empty:
-        st.caption("No open positions — add a row above.")
+        st.caption("No open positions — use ＋ on Best Value, or add a row above.")
+        if (
+            isinstance(st.session_state.get("portfolio_df"), pd.DataFrame)
+            and not st.session_state["portfolio_df"].empty
+        ):
+            _render_close_position_controls(
+                st.session_state["portfolio_df"],
+                scored,
+                compact=compact,
+            )
+        _render_closed_positions_summary(compact=compact)
         return
+
+    # Prefer live Current_Price; fall back to persisted Mark_Price
+    if (
+        not scored.empty
+        and "Mark_Price" in st.session_state["portfolio_df"].columns
+    ):
+        scored = scored.merge(
+            st.session_state["portfolio_df"][
+                ["Ticker", "Side", "Strike", "Expiry", "Mark_Price"]
+            ],
+            on=["Ticker", "Side", "Strike", "Expiry"],
+            how="left",
+            suffixes=("", "_dup"),
+        )
+        if "Mark_Price_dup" in scored.columns:
+            scored["Mark_Price"] = scored["Mark_Price"].fillna(scored["Mark_Price_dup"])
+            scored = scored.drop(columns=["Mark_Price_dup"], errors="ignore")
+        scored["Current_Price"] = scored["Current_Price"].fillna(scored["Mark_Price"])
+        scored["PnL_Percentage"] = scored.apply(
+            lambda r: (
+                (float(r["Current_Price"]) - float(r["Entry_Price"]))
+                / float(r["Entry_Price"])
+                if pd.notna(r.get("Current_Price"))
+                and pd.notna(r.get("Entry_Price"))
+                and float(r["Entry_Price"]) != 0
+                else float("nan")
+            ),
+            axis=1,
+        )
 
     # Net $ PnL across positions with live quotes
     net_pnl = 0.0
@@ -1718,6 +1962,8 @@ def _render_portfolio_manager(
             net_ok = True
     if net_ok:
         st.metric("Net P&L (est.)", f"${net_pnl:+,.0f}")
+    if _market_is_closed():
+        st.caption("Market closed — position marks snapshotted for EOD.")
 
     # Active exit signals summary
     hot = scored[
@@ -1777,8 +2023,167 @@ def _render_portfolio_manager(
     )
     _df_kw: dict = dict(use_container_width=True, hide_index=True)
     if compact:
-        _df_kw["height"] = 240
+        _df_kw["height"] = 180
     st.dataframe(styled, **_df_kw)
+
+    # − close controls (exit price required)
+    _render_close_position_controls(
+        st.session_state["portfolio_df"],
+        scored,
+        compact=compact,
+    )
+    _render_closed_positions_summary(compact=compact)
+
+
+def _render_close_position_controls(
+    portfolio_df: pd.DataFrame,
+    scored: pd.DataFrame,
+    *,
+    compact: bool = False,
+) -> None:
+    """− button per open row → ask exit price → move to closed ledger."""
+    if portfolio_df is None or portfolio_df.empty:
+        return
+
+    pdf = portfolio_df.reset_index(drop=True)
+    # Prefer live/current mark as default exit
+    mark_by_key: dict[tuple, float] = {}
+    if scored is not None and not scored.empty:
+        for _, r in scored.iterrows():
+            k = (
+                str(r.get("Ticker") or "").upper(),
+                str(r.get("Side") or "").upper(),
+                round(float(r["Strike"]), 4) if pd.notna(r.get("Strike")) else None,
+                str(r.get("Expiry") or ""),
+            )
+            px = r.get("Current_Price")
+            if pd.isna(px):
+                px = r.get("Mark_Price")
+            if pd.notna(px) and float(px) > 0:
+                mark_by_key[k] = float(px)
+
+    st.markdown("**Close position**" if not compact else "**− Close**")
+    for i, r in pdf.iterrows():
+        ticker = str(r.get("Ticker") or "").upper()
+        if not ticker or ticker == "NAN":
+            continue
+        side = str(r.get("Side") or "").upper()
+        strike = float(r["Strike"]) if pd.notna(r.get("Strike")) else 0.0
+        expiry = str(r.get("Expiry") or "")
+        entry = float(r["Entry_Price"]) if pd.notna(r.get("Entry_Price")) else 0.0
+        qty = int(float(r["Quantity"])) if pd.notna(r.get("Quantity")) else 1
+        k = (ticker, side, round(strike, 4), expiry)
+        default_px = mark_by_key.get(k)
+        if default_px is None and pd.notna(r.get("Mark_Price")):
+            default_px = float(r["Mark_Price"])
+        if default_px is None or default_px <= 0:
+            default_px = entry if entry > 0 else 0.01
+
+        c1, c2 = st.columns([0.35, 3.65] if compact else [0.25, 4.75])
+        with c1:
+            if st.button(
+                "−",
+                key=f"close_pos_{i}_{ticker}_{side}_{strike}_{expiry}",
+                help=f"Close {side} ${strike:.1f} — enter exit price",
+            ):
+                st.session_state["_pending_close_pos"] = {
+                    "index": int(i),
+                    "Ticker": ticker,
+                    "Side": side,
+                    "Strike": strike,
+                    "Expiry": expiry,
+                    "Quantity": qty,
+                    "Entry_Price": entry,
+                    "default_price": float(default_px),
+                }
+                st.rerun()
+        with c2:
+            st.caption(
+                f"{ticker} {side} ${strike:.1f} · {expiry} · "
+                f"qty {qty} · entry ${entry:.2f}"
+            )
+
+    pending = st.session_state.get("_pending_close_pos")
+    if not pending:
+        return
+
+    with st.form(key="close_pos_form"):
+        st.markdown(
+            f"Close **{pending['Side']} ${float(pending['Strike']):.1f}** "
+            f"exp `{pending['Expiry']}` · entry "
+            f"**${float(pending['Entry_Price']):.2f}**"
+        )
+        exit_px = st.number_input(
+            "Exit price ($)",
+            min_value=0.01,
+            value=max(0.01, float(pending.get("default_price") or 0.01)),
+            step=0.05,
+            format="%.2f",
+            help="The premium you came out at",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            ok = st.form_submit_button("Confirm close", type="primary")
+        with c2:
+            cancel = st.form_submit_button("Cancel")
+
+    if cancel:
+        st.session_state.pop("_pending_close_pos", None)
+        st.rerun()
+    if ok:
+        try:
+            open_df, closed = portfolio_store.close_position(
+                int(pending["index"]),
+                float(exit_px),
+                portfolio_df=st.session_state["portfolio_df"],
+            )
+            st.session_state["portfolio_df"] = open_df
+            st.session_state.pop("_pending_close_pos", None)
+            pnl_d = closed.get("PnL_Dollars")
+            pnl_p = closed.get("PnL_Pct")
+            pnl_txt = ""
+            if pnl_d is not None and pnl_p is not None:
+                pnl_txt = f" · realized ${pnl_d:+,.0f} ({pnl_p:+.1%})"
+            st.success(
+                f"Closed {closed['Side']} ${float(closed['Strike']):.1f} "
+                f"@ ${float(exit_px):.2f}{pnl_txt}"
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not close position: {exc}")
+
+
+def _render_closed_positions_summary(*, compact: bool = False) -> None:
+    """Recent closed trades with exit price."""
+    closed = portfolio_store.load_closed()
+    if closed is None or closed.empty:
+        return
+    with st.expander(
+        f"Closed trades ({len(closed)})",
+        expanded=False,
+    ):
+        show = closed.tail(15).iloc[::-1].copy()
+        show["Entry $"] = show["Entry_Price"].apply(
+            lambda x: f"${float(x):.2f}" if pd.notna(x) else "—"
+        )
+        show["Exit $"] = show["Exit_Price"].apply(
+            lambda x: f"${float(x):.2f}" if pd.notna(x) else "—"
+        )
+        show["PnL %"] = show["PnL_Pct"].apply(
+            lambda x: f"{float(x):+.1%}" if pd.notna(x) else "—"
+        )
+        show["PnL $"] = show["PnL_Dollars"].apply(
+            lambda x: f"${float(x):+,.0f}" if pd.notna(x) else "—"
+        )
+        cols = ["Ticker", "Side", "Strike", "Expiry", "Entry $", "Exit $", "PnL %", "PnL $"]
+        if compact:
+            cols = ["Ticker", "Side", "Strike", "Exit $", "PnL $"]
+        st.dataframe(
+            show[cols],
+            use_container_width=True,
+            hide_index=True,
+            height=160 if compact else 220,
+        )
 
 
 def _render_mtf_matrix(tfs: dict, prev_tfs: dict | None = None) -> None:
@@ -1843,6 +2248,7 @@ def _render_best_value_panel(
     lower_1sd: float | None = None,
     odte_info: dict | None = None,
     pov_info: dict | None = None,
+    top_n: int = 5,
 ) -> None:
     """
     Best Value Option Scanner — composite rank of all archive contracts.
@@ -1902,11 +2308,13 @@ def _render_best_value_panel(
                 f"(profited shares {float(profited_pct):.1f}%)"
             )
         note_s = ("  ·  " + "  ·  ".join(notes)) if notes else ""
+        show_n = int(max(1, min(30, top_n)))
         st.caption(
             "Ranks every contract by a composite score: "
             "**40% leverage efficiency** (delta × spot ÷ premium)  ·  "
             "**60% flow intensity** (VOL/OI × |ΔVol|).  "
             f"Filters: Volume ≥ {min_vol_input:,} · Price > $0.01  ·  "
+            f"Showing top **{show_n}** (sidebar Flow filters)  ·  "
             f"Velocity threshold ±{_SURGE_THRESH:.2f}"
             f"{note_s}"
         )
@@ -2096,7 +2504,7 @@ def _render_best_value_panel(
     }
     st.session_state[entry_state_key] = entry_px
 
-    # ── Build display DataFrame (top 5 by Value_Score only) ───────────────────
+    # ── Build display DataFrame (top N by Value_Score) ────────────────────────
     keep = ["side", "strike", "expiry", "dte", "last", "volume", "openInterest"]
     if has_dvol:
         keep.append("dVol")
@@ -2104,10 +2512,11 @@ def _render_best_value_panel(
         "iv", "Value_Score", "Score_Velocity",
         "Action_Signal", "Target_Status", "Status",
     ]
+    show_n = int(max(1, min(30, top_n)))
     top5 = (
         df[keep]
         .sort_values("Value_Score", ascending=False)
-        .head(5)
+        .head(show_n)
         .copy()
     )
 
@@ -2200,71 +2609,16 @@ def _render_best_value_panel(
     if "Optimal Strategy" not in disp.columns:
         disp["Optimal Strategy"] = "—"
 
-    # ── Styling ───────────────────────────────────────────────────────────────
-    def _best_row_style(row):
-        """Dark green for BEST VALUE / Times_Flagged ≥ 3 persistence."""
-        status = str(row.get("Status") or "")
-        if "BEST VALUE" in status:
-            return ["background-color:#1e4620;color:#ffffff;font-weight:bold"] * len(row)
-        try:
-            if int(row.get("Times_Flagged") or 0) >= 3:
-                return ["background-color:#1b5e20;color:#e8f5e9"] * len(row)
-        except Exception:
-            pass
-        return [""] * len(row)
-
-    def _signal_style(val: str) -> str:
-        """Cell-level colour for the Signal column — overrides row text colour."""
-        s = str(val)
-        if "Boosted by" in s or "0DTE Gamma" in s or "INSTITUTIONAL URGENCY" in s:
-            return "color:#00e5ff;font-weight:bold"
-        if "Strike Outside 1SD" in s or "Premium Penalty" in s or "Penalized by" in s:
-            return "color:#ffab00;font-weight:bold"
-        if "SNIPER ENTRY" in s:
-            return "color:#00e5ff;font-weight:bold"
-        if "SURGE BUT EXTENDED" in s:
-            return "color:#ffab00;font-weight:bold"
-        if "BUYING SURGE" in s:
-            return "color:#00e676;font-weight:bold"
-        if "EXIT" in s or "STOP-LOSS" in s:
-            return "color:#ff1744;font-weight:bold"
-        return "color:#9e9e9e"
-
-    def _target_style(val: str) -> str:
-        s = str(val)
-        if "HOLD FOR RUNNER" in s:
-            return "color:#00e676;font-weight:bold"
-        if "SCALE 50%" in s:
-            return "color:#ffd600;font-weight:bold"
-        if "CLOSE ENTIRE" in s:
-            return "color:#ff1744;font-weight:bold"
-        return "color:#9e9e9e"
-
-    def _velocity_style(val: str) -> str:
-        """Colour-code the Velocity column positive/negative."""
-        s = str(val)
-        if s.startswith("+"):
-            return "color:#00c853"
-        if s.startswith("-"):
-            return "color:#d50000"
-        return "color:#9e9e9e"
-
-    styled_df = (
-        disp.style
-        .apply(_best_row_style, axis=1)          # row: BEST VALUE dark-green bg
-        .map(_signal_style,   subset=["Signal"]) # cell: signal colour
-        .map(_target_style,   subset=["Target"])
-        .map(_velocity_style, subset=["Velocity"])
-        .map(strategy_cell_style, subset=["Optimal Strategy"])
-    )
-
-    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+    # Interactive table: ＋ column in-row (st.dataframe cannot host buttons)
+    _render_best_value_table_with_plus(ticker, top5, disp, has_dvol=has_dvol)
     st.caption(
         "Target: **CLOSE** if Velocity ≤ −0.15 · "
         "**SCALE 50%** if premium ≥ +25% vs tracked entry "
         "(prior archive / first-seen) · "
-        "**HOLD FOR RUNNER** if Velocity > +0.20 and Daily Bias is HEAVY BULLISH."
+        "**HOLD FOR RUNNER** if Velocity > +0.20 and Daily Bias is HEAVY BULLISH.  "
+        "Click **＋** in a row to add that contract to My Open Positions."
     )
+    _render_add_position_form(ticker)
 
     # ── Summary callout ───────────────────────────────────────────────────────
     best = df[df["Status"].astype(str).str.contains("BEST VALUE", na=False)]
@@ -2292,6 +2646,135 @@ def _render_best_value_panel(
             f"{sky_part}",
             icon="⭐",
         )
+
+
+def _render_best_value_table_with_plus(
+    ticker: str,
+    top5: pd.DataFrame,
+    disp: pd.DataFrame,
+    *,
+    has_dvol: bool,
+) -> None:
+    """Best Value table with a ＋ column on each row (opens add-position form)."""
+    if top5 is None or top5.empty or disp is None or disp.empty:
+        return
+
+    show_cols = [
+        "Side", "Strike", "Expiry", "DTE", "Price", "Volume", "OI",
+    ]
+    if has_dvol and "ΔVol" in disp.columns:
+        show_cols.append("ΔVol")
+    show_cols += [
+        "IV", "Value_Score", "Velocity", "Signal", "Target", "Optimal Strategy",
+    ]
+    show_cols = [c for c in show_cols if c in disp.columns]
+
+    # Narrow ＋ + proportional data columns
+    weights = [0.4] + [1.0] * len(show_cols)
+    header = st.columns(weights)
+    with header[0]:
+        st.markdown(
+            "<div style='font-size:0.75rem;font-weight:700;color:#666;padding-top:0.35rem'>＋</div>",
+            unsafe_allow_html=True,
+        )
+    for j, name in enumerate(show_cols):
+        with header[j + 1]:
+            st.markdown(
+                f"<div style='font-size:0.75rem;font-weight:700;color:#666;"
+                f"padding-top:0.35rem;white-space:nowrap'>{name}</div>",
+                unsafe_allow_html=True,
+            )
+
+    top5_r = top5.reset_index(drop=True)
+    disp_r = disp.reset_index(drop=True)
+    for i in range(len(disp_r)):
+        raw = top5_r.iloc[i]
+        drow = disp_r.iloc[i]
+        is_best = "BEST VALUE" in str(raw.get("Status") or "")
+        bg = "#1e4620" if is_best else ("#f7f7f7" if i % 2 else "#ffffff")
+        fg = "#ffffff" if is_best else "#222222"
+        row = st.columns(weights)
+        with row[0]:
+            if st.button(
+                "＋",
+                key=f"bv_row_add_{ticker}_{i}",
+                help=(
+                    f"Add {raw['side']} ${float(raw['strike']):.1f} "
+                    f"{raw['expiry']} to Open Positions"
+                ),
+            ):
+                st.session_state["_pending_add_pos"] = {
+                    "Ticker": ticker.upper(),
+                    "Side": str(raw["side"]).upper(),
+                    "Strike": float(raw["strike"]),
+                    "Expiry": str(raw["expiry"]),
+                    "default_price": float(raw["last"]),
+                }
+                st.rerun()
+        for j, name in enumerate(show_cols):
+            val = drow.get(name, "—")
+            if pd.isna(val):
+                val = "—"
+            with row[j + 1]:
+                st.markdown(
+                    f"<div style='background:{bg};color:{fg};font-size:0.78rem;"
+                    f"padding:0.35rem 0.25rem;border-radius:3px;"
+                    f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>"
+                    f"{val}</div>",
+                    unsafe_allow_html=True,
+                )
+
+
+def _render_add_position_form(ticker: str) -> None:
+    """Price/qty form after clicking ＋ on a Best Value row."""
+    pending = st.session_state.get("_pending_add_pos")
+    if not pending or str(pending.get("Ticker") or "").upper() != ticker.upper():
+        return
+
+    with st.form(key=f"add_pos_form_{ticker}"):
+        st.markdown(
+            f"Add **{pending['Side']} ${float(pending['Strike']):.1f}** "
+            f"exp `{pending['Expiry']}` to **My Open Positions**"
+        )
+        price = st.number_input(
+            "Entry price ($)",
+            min_value=0.01,
+            value=max(0.01, float(pending.get("default_price") or 0.01)),
+            step=0.05,
+            format="%.2f",
+        )
+        qty = st.number_input(
+            "Quantity (contracts)",
+            min_value=1,
+            value=1,
+            step=1,
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            ok = st.form_submit_button("Add to Open Positions", type="primary")
+        with c2:
+            cancel = st.form_submit_button("Cancel")
+
+    if cancel:
+        st.session_state.pop("_pending_add_pos", None)
+        st.rerun()
+    if ok:
+        df = portfolio_store.append_position(
+            ticker=pending["Ticker"],
+            side=pending["Side"],
+            strike=float(pending["Strike"]),
+            expiry=str(pending["Expiry"]),
+            quantity=int(qty),
+            entry_price=float(price),
+            mark_price=float(price),
+        )
+        st.session_state["portfolio_df"] = df
+        st.session_state.pop("_pending_add_pos", None)
+        st.success(
+            f"Added {pending['Side']} ${float(pending['Strike']):.1f} "
+            f"×{int(qty)} @ ${float(price):.2f} to Open Positions"
+        )
+        st.rerun()
 
 
 def _render_cost_distribution_panel(
@@ -2736,7 +3219,7 @@ def _render_tab1(cfg: dict):
     # Same row: Volume Analysis | Multi-Timeframe | My Open Positions
     sub_c1, sub_c2, sub_c3 = st.columns(3)
     with sub_c1:
-        _render_volume_analysis(ticker, compact=True)
+        _render_volume_analysis(ticker, compact=True, vol_curr=vol)
     with sub_c2:
         _render_mtf_matrix(tfs, prev_tfs)
     with sub_c3:
@@ -2801,6 +3284,7 @@ def _render_tab1(cfg: dict):
         lower_1sd=em_range.get("Lower_1SD"),
         odte_info=odte_info,
         pov_info=pov_info,
+        top_n=top_n,
     )
 
     # 0DTE reflexivity — top strikes MM exposure
@@ -4565,6 +5049,237 @@ def _render_tab5(cfg: dict) -> None:
         )
 
 
+def _fmt_journal_money(x) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return "—"
+    try:
+        return f"${float(x):+,.0f}"
+    except Exception:
+        return "—"
+
+
+def _fmt_journal_pct(x) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return "—"
+    try:
+        return f"{float(x):+.1%}"
+    except Exception:
+        return "—"
+
+
+def _fmt_journal_ts(x) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)) or str(x).strip() in ("", "nan", "None"):
+        return "—"
+    s = str(x).strip()
+    if "T" in s:
+        return s.replace("T", " ")[:16]
+    return s[:16]
+
+
+def _render_tab_journal() -> None:
+    """Trade journal — bought / sold options with performance tracking."""
+    st.markdown("### Trade Journal")
+    st.caption(
+        "Tracks options you **buy** (＋ on Best Value) and **sell** (− close). "
+        "Each day is saved to `data/journal/YYYY-MM-DD.json`."
+    )
+
+    # Ensure existing ledger trades exist as daily files (idempotent)
+    try:
+        portfolio_store.backfill_daily_journal_from_ledgers()
+    except Exception:
+        pass
+
+    open_df = st.session_state.get("portfolio_df")
+    if open_df is None:
+        open_df = portfolio_store.load_portfolio()
+        st.session_state["portfolio_df"] = open_df
+
+    journal = portfolio_store.journal_dataframe(open_df=open_df)
+    stats = portfolio_store.journal_performance(journal)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Closed trades", stats["n_closed"])
+    m2.metric(
+        "Win rate",
+        "—" if stats["win_rate"] is None else f"{stats['win_rate']:.0%}",
+        help=f"{stats['wins']} wins / {stats['losses']} losses",
+    )
+    m3.metric(
+        "Realized PnL",
+        f"${stats['total_realized_pnl']:+,.0f}",
+    )
+    m4.metric(
+        "Avg PnL %",
+        "—" if stats["avg_pnl_pct"] is None else f"{stats['avg_pnl_pct']:+.1%}",
+    )
+    m5.metric(
+        "Open / unrealized",
+        f"{stats['n_open']} · ${stats['unrealized_pnl']:+,.0f}",
+    )
+
+    st.markdown("#### Daily record")
+    days = portfolio_store.list_journal_days()
+    today = portfolio_store.today_et()
+    day_options = days if days else [today]
+    if today not in day_options:
+        day_options = [today] + day_options
+
+    d1, d2 = st.columns([2, 3])
+    with d1:
+        selected_day = st.selectbox(
+            "Day",
+            day_options,
+            index=0,
+            key="journal_day_filter",
+            help="One JSON file per ET calendar day",
+        )
+    day_stats = portfolio_store.day_performance(selected_day)
+    with d2:
+        st.caption(
+            f"File: `{os.path.relpath(day_stats['file'], os.path.dirname(os.path.abspath(__file__)))}` "
+            f"· buys {day_stats['n_buys']} · sells {day_stats['n_sells']} · "
+            f"day PnL ${day_stats['realized_pnl']:+,.0f}"
+        )
+
+    day_df = portfolio_store.load_journal_day(selected_day)
+    if day_df.empty:
+        st.info(f"No buy/sell events saved for {selected_day} yet.")
+    else:
+        day_show = day_df.copy()
+        day_show["When"] = day_show["At"].map(_fmt_journal_ts)
+        day_show["Price $"] = day_show["Price"].map(
+            lambda x: f"${float(x):.2f}" if pd.notna(x) else "—"
+        )
+        day_show["Strike"] = day_show["Strike"].map(
+            lambda x: f"${float(x):.1f}" if pd.notna(x) else "—"
+        )
+        day_show["Qty"] = day_show["Quantity"].map(
+            lambda x: f"{float(x):.0f}" if pd.notna(x) else "—"
+        )
+        day_show["PnL %"] = day_show["PnL_Pct"].map(_fmt_journal_pct)
+        day_show["PnL $"] = day_show["PnL_Dollars"].map(_fmt_journal_money)
+        st.dataframe(
+            day_show[
+                ["Action", "Ticker", "Side", "Strike", "Expiry", "Qty",
+                 "When", "Price $", "PnL %", "PnL $"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            height=min(280, 48 + 36 * len(day_show)),
+        )
+        st.download_button(
+            f"Download {selected_day} JSON",
+            data=json.dumps(
+                day_df.drop(columns=["Day"], errors="ignore").to_dict(orient="records"),
+                indent=2,
+            ),
+            file_name=f"journal_{selected_day}.json",
+            mime="application/json",
+            key="journal_day_json_dl",
+        )
+
+    st.markdown("#### All positions (open + closed)")
+    tickers = sorted(
+        {t for t in journal["Ticker"].astype(str).tolist() if t and t != "nan"}
+    ) if not journal.empty else []
+    f1, f2 = st.columns(2)
+    with f1:
+        status_filter = st.selectbox(
+            "Status",
+            ["All", "OPEN", "CLOSED"],
+            index=0,
+            key="journal_status_filter",
+        )
+    with f2:
+        ticker_filter = st.selectbox(
+            "Ticker",
+            ["All"] + tickers,
+            index=0,
+            key="journal_ticker_filter",
+        )
+
+    view = journal.copy()
+    if status_filter != "All" and not view.empty:
+        view = view[view["Status"] == status_filter]
+    if ticker_filter != "All" and not view.empty:
+        view = view[view["Ticker"] == ticker_filter]
+
+    if view.empty:
+        st.info(
+            "No journal entries yet. Use **＋** on a Best Value row to log a buy, "
+            "then **−** on My Open Positions to log the sell."
+        )
+        return
+
+    show = view.copy()
+    show["Bought"] = show["Bought_At"].map(_fmt_journal_ts)
+    show["Bought $"] = show["Bought_Price"].map(
+        lambda x: f"${float(x):.2f}" if pd.notna(x) else "—"
+    )
+    show["Sold"] = show["Sold_At"].map(_fmt_journal_ts)
+    show["Sold $"] = show["Sold_Price"].map(
+        lambda x: f"${float(x):.2f}" if pd.notna(x) else "—"
+    )
+    show["PnL %"] = show.apply(
+        lambda r: _fmt_journal_pct(
+            r["PnL_Pct"] if r["Status"] == "CLOSED" else r["Unrealized_Pct"]
+        ),
+        axis=1,
+    )
+    show["PnL $"] = show.apply(
+        lambda r: _fmt_journal_money(
+            r["PnL_Dollars"] if r["Status"] == "CLOSED" else r["Unrealized_Dollars"]
+        ),
+        axis=1,
+    )
+    show["Strike"] = show["Strike"].map(
+        lambda x: f"${float(x):.1f}" if pd.notna(x) else "—"
+    )
+    show["Qty"] = show["Quantity"].map(
+        lambda x: f"{float(x):.0f}" if pd.notna(x) else "—"
+    )
+
+    cols = [
+        "Status", "Ticker", "Side", "Strike", "Expiry", "Qty",
+        "Bought", "Bought $", "Sold", "Sold $", "PnL %", "PnL $",
+    ]
+    st.dataframe(
+        show[cols],
+        use_container_width=True,
+        hide_index=True,
+        height=min(480, 48 + 36 * len(show)),
+    )
+
+    closed_only = view[view["Status"] == "CLOSED"]
+    if not closed_only.empty:
+        st.markdown("#### By ticker (closed)")
+        grp = (
+            closed_only.groupby("Ticker", dropna=False)
+            .agg(
+                Trades=("Ticker", "count"),
+                Realized_PnL=("PnL_Dollars", "sum"),
+                Avg_Pct=("PnL_Pct", "mean"),
+            )
+            .reset_index()
+            .sort_values("Realized_PnL", ascending=False)
+        )
+        grp["Realized_PnL"] = grp["Realized_PnL"].map(
+            lambda x: f"${float(x):+,.0f}" if pd.notna(x) else "—"
+        )
+        grp["Avg_Pct"] = grp["Avg_Pct"].map(_fmt_journal_pct)
+        st.dataframe(grp, use_container_width=True, hide_index=True, height=200)
+
+    csv_bytes = view.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download journal CSV",
+        data=csv_bytes,
+        file_name="options_journal.csv",
+        mime="text/csv",
+        key="journal_csv_dl",
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4575,7 +5290,7 @@ def main():
     # Service-down alerts sit above tabs so they're visible on every page
     _services_alert()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(_main_tab_labels())
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(_main_tab_labels())
 
     with tab1:
         _market_banner()
@@ -4594,6 +5309,9 @@ def main():
 
     with tab5:
         _render_tab5(cfg)
+
+    with tab6:
+        _render_tab_journal()
 
 
 if __name__ == "__main__" or True:

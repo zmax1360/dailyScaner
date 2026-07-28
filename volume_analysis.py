@@ -95,25 +95,64 @@ def get_stock_volume_analysis(ticker: str) -> dict[str, Any]:
     except ImportError:
         return _empty_result(ticker)
 
-    try:
-        hist = yf.Ticker(ticker).history(period="1d", interval="1m")
-        if hist is None or hist.empty:
-            # Fallback: coarser bars still better than nothing
-            hist = yf.Ticker(ticker).history(period="5d", interval="5m")
-            if hist is None or hist.empty:
-                return _empty_result(ticker)
-            # Keep only the latest session day
-            hist = hist.copy()
-            hist["_day"] = hist.index.tz_convert("America/New_York").date
-            last_day = hist["_day"].iloc[-1]
-            hist = hist[hist["_day"] == last_day].drop(columns=["_day"])
+    # Prefer fine bars; fall back to coarser intervals when 1m is empty / rate-limited.
+    attempts: list[tuple[str, str]] = [
+        ("1d", "1m"),
+        ("5d", "5m"),
+        ("5d", "15m"),
+        ("10d", "60m"),
+        ("1mo", "1h"),
+    ]
 
-        classified = _classify_tick_rule(hist)
-        classified["ticker"] = ticker
-        classified["source"] = "yfinance_1m_tick_rule"
-        return classified
-    except Exception:
-        return _empty_result(ticker)
+    last_err: Exception | None = None
+    for period, interval in attempts:
+        try:
+            hist = yf.Ticker(ticker).history(period=period, interval=interval)
+            if hist is None or hist.empty:
+                continue
+            hist = hist.copy()
+            # Keep only the latest ET session when we pulled multi-day bars
+            try:
+                idx = hist.index
+                if getattr(idx, "tz", None) is not None:
+                    days = idx.tz_convert("America/New_York").date
+                else:
+                    days = pd.DatetimeIndex(idx).tz_localize("UTC").tz_convert(
+                        "America/New_York"
+                    ).date
+                hist["_day"] = list(days)
+                last_day = hist["_day"].iloc[-1]
+                hist = hist[hist["_day"] == last_day].drop(columns=["_day"])
+            except Exception:
+                pass
+            if hist.empty or "Volume" not in hist.columns:
+                continue
+            classified = _classify_tick_rule(hist)
+            if int(classified.get("Total_Volume") or 0) <= 0:
+                continue
+            classified["ticker"] = ticker
+            classified["source"] = f"yfinance_{interval}"
+            return classified
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    # Last resort: reuse the same 5m series the VWAP chart uses
+    try:
+        chart = fetch_intraday_vwap_df(ticker, timeframe="5M")
+        if chart is not None and not chart.empty and "Volume" in chart.columns:
+            classified = _classify_tick_rule(chart)
+            if int(classified.get("Total_Volume") or 0) > 0:
+                classified["ticker"] = ticker
+                classified["source"] = "vwap_chart_5m_fallback"
+                return classified
+    except Exception as exc:
+        last_err = exc
+
+    out = _empty_result(ticker)
+    if last_err is not None:
+        out["error"] = f"{type(last_err).__name__}: {last_err}"
+    return out
 
 
 def _empty_vwap(ticker: str) -> dict[str, Any]:
