@@ -347,6 +347,34 @@ def opening_range(df5m, df15m, spot, now_et=None):
     return result
 
 # ?? FETCH ?????????????????????????????????????????????????????????????????????
+def _yf_retry(fn, *, label: str, attempts: int = 5, base_sleep: float = 3.0):
+    """Call Yahoo via yfinance with backoff on rate limits / transient errors."""
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            name = type(e).__name__
+            rate_limited = (
+                name == "YFRateLimitError"
+                or "Too Many Requests" in str(e)
+                or "Rate limited" in str(e)
+            )
+            if attempt >= attempts:
+                break
+            wait = base_sleep * (2 ** (attempt - 1))
+            if rate_limited:
+                wait = max(wait, 15.0 * attempt)
+            print(
+                f"  Yahoo {label} retry {attempt}/{attempts} "
+                f"after {wait:.0f}s ({name})",
+                flush=True,
+            )
+            time.sleep(wait)
+    raise last_err
+
+
 def fetch_data():
     t = yf.Ticker(TICKER)
 
@@ -358,7 +386,12 @@ def fetch_data():
             df.index = df.index.tz_localize(None) if df.index.tz else df.index
         return df
 
-    df5m  = clean(t.history(period="5d",  interval="5m"))
+    df5m = clean(
+        _yf_retry(
+            lambda: t.history(period="5d", interval="5m"),
+            label="5m history",
+        )
+    )
 
     # Early exit: if 5-minute data is empty the ticker is an index or delisted
     if df5m.empty:
@@ -369,32 +402,42 @@ def fetch_data():
         )
 
     df10m = clean(df5m.resample("10min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
-    df15m = clean(t.history(period="5d",  interval="15m"))
+    df15m = clean(
+        _yf_retry(
+            lambda: t.history(period="5d", interval="15m"),
+            label="15m history",
+        )
+    )
     df45m = clean(df5m.resample("45min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
-    df1h  = clean(t.history(period="30d", interval="1h"))
-    df4h  = clean(df1h.resample("4h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
-    dfd   = clean(t.history(period="6mo", interval="1d"))
+    df1h = clean(
+        _yf_retry(
+            lambda: t.history(period="30d", interval="1h"),
+            label="1h history",
+        )
+    )
+    df4h = clean(df1h.resample("4h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
+    dfd = clean(
+        _yf_retry(
+            lambda: t.history(period="6mo", interval="1d"),
+            label="1d history",
+        )
+    )
 
     frames = {"5M": df5m, "10M": df10m, "15M": df15m, "45M": df45m, "1H": df1h, "4H": df4h, "1D": dfd}
     spot   = round(float(dfd["Close"].iloc[-1]), 2)
 
     # ALL expiries - no filter
-    # Yahoo sometimes returns HTML/rate-limit pages instead of JSON ? orjson.JSONDecodeError
-    expiries = None
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            expiries = list(t.options or [])
-            break
-        except Exception as e:
-            last_err = e
-            time.sleep(1.5 * attempt)
-    if expiries is None:
+    # Yahoo sometimes returns HTML/rate-limit pages instead of JSON / YFRateLimitError
+    try:
+        expiries = list(
+            _yf_retry(lambda: t.options or [], label="options list") or []
+        )
+    except Exception as last_err:
         raise ValueError(
             f"{TICKER} options list unavailable from Yahoo "
             f"({type(last_err).__name__}: {last_err}). "
             "Usually a temporary rate-limit or empty response - wait ~30s and retry."
-        )
+        ) from last_err
     if not expiries:
         raise ValueError(
             f"{TICKER} has no listed option expiries. "
@@ -404,7 +447,12 @@ def fetch_data():
     all_calls, all_puts = [], []
     for expiry in expiries:
         try:
-            chain = t.option_chain(expiry)
+            chain = _yf_retry(
+                lambda e=expiry: t.option_chain(e),
+                label=f"chain {expiry}",
+                attempts=3,
+                base_sleep=2.0,
+            )
         except Exception:
             continue
         for df, lst in [(chain.calls, all_calls), (chain.puts, all_puts)]:
@@ -865,7 +913,7 @@ def run():
             max_attempts = int(_ecfg.get("eod_convergence_max_attempts", max_attempts))
         except Exception:
             pass
-        print(f"\n{C.CYAN}EOD mode — converging settlement volumes for {TICKER}...{C.RESET}")
+        print(f"\n{C.CYAN}EOD mode â€” converging settlement volumes for {TICKER}...{C.RESET}")
         last_pack = {}
 
         def _read_vols():
