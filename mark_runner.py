@@ -21,6 +21,8 @@ from attribution import (
     default_db_path,
     due_for_marking,
     fetch_option_mid,
+    note_stale_horizon,
+    now_et,
     write_mark,
 )
 
@@ -31,6 +33,12 @@ ENV_FILE = os.path.join(BASE_DIR, ".env")
 # Single source of truth for the t1h/t1d mark window (also used by health_check).
 MARK_WINDOW_START = dtime(9, 30)
 MARK_WINDOW_END = dtime(16, 15)
+# Full weekday mark window length (09:30–16:15) — t1d ceiling = one session.
+_SESSION_LEN = datetime.combine(datetime(2000, 1, 1).date(), MARK_WINDOW_END) - datetime.combine(
+    datetime(2000, 1, 1).date(), MARK_WINDOW_START
+)
+SESSION_LEN_HOURS = _SESSION_LEN.total_seconds() / 3600.0  # 6.75
+T1H_STALE_MARKET_HOURS = 4.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,6 +102,75 @@ def first_markable_at(due: datetime) -> datetime:
     return candidate
 
 
+def market_hours_between(start: datetime, end: datetime) -> float:
+    """
+    Hours of mark-window (market) time in [start, end).
+    Weekends and overnight gaps contribute 0.
+    """
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=ET)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=ET)
+    start = start.astimezone(ET)
+    end = end.astimezone(ET)
+    if end <= start:
+        return 0.0
+    total = 0.0
+    day = start.date()
+    last = end.date()
+    while day <= last:
+        if day.weekday() < 5:
+            ws = datetime.combine(day, MARK_WINDOW_START, tzinfo=ET)
+            we = datetime.combine(day, MARK_WINDOW_END, tzinfo=ET)
+            lo = max(start, ws)
+            hi = min(end, we)
+            if hi > lo:
+                total += (hi - lo).total_seconds() / 3600.0
+        day = day + timedelta(days=1)
+    return total
+
+
+def due_datetime(ts_et: datetime | str, horizon: str) -> datetime:
+    if isinstance(ts_et, str):
+        ts = datetime.fromisoformat(ts_et)
+    else:
+        ts = ts_et
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ET)
+    ts = ts.astimezone(ET)
+    if horizon == "t1h":
+        return ts + timedelta(hours=1)
+    if horizon == "t1d":
+        return ts + timedelta(days=1)
+    raise ValueError(f"due_datetime only for t1h/t1d, got {horizon}")
+
+
+def is_past_staleness_ceiling(
+    horizon: str,
+    ts_et: datetime | str,
+    as_of: datetime,
+) -> bool:
+    """
+    True when too much *market* time has elapsed since first_markable_at(due).
+
+    t1h: > 4 market hours
+    t1d: > one full mark session (09:30–16:15)
+    expiry: never stale under this rule
+    """
+    if horizon == "expiry":
+        return False
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=ET)
+    as_of = as_of.astimezone(ET)
+    first = first_markable_at(due_datetime(ts_et, horizon))
+    elapsed = market_hours_between(first, as_of)
+    if horizon == "t1h":
+        return elapsed > T1H_STALE_MARKET_HOURS
+    if horizon == "t1d":
+        return elapsed > SESSION_LEN_HOURS
+    return False
+
+
 def is_t1h_overdue(ts_et: datetime | str, as_of: datetime, *, marked: bool = False) -> bool:
     """
     True only when mark_t1h is still null AND the due time (ts+1h) became
@@ -119,22 +196,63 @@ def is_t1h_overdue(ts_et: datetime | str, as_of: datetime, *, marked: bool = Fal
 def count_overdue_t1h(conn, as_of: datetime | None = None) -> int:
     """Count unmarked t1h flags that are overdue under the window-aware rule."""
     as_of = as_of or datetime.now(ET)
-    rows = conn.execute(
-        "SELECT ts_et FROM flags WHERE mark_t1h IS NULL"
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            SELECT ts_et, notes FROM flags
+            WHERE mark_t1h IS NULL
+              AND (notes IS NULL OR notes NOT LIKE '%stale:t1h%')
+            """
+        ).fetchall()
+    except Exception:
+        # Minimal test schemas may lack notes
+        rows = conn.execute(
+            "SELECT ts_et FROM flags WHERE mark_t1h IS NULL"
+        ).fetchall()
     n = 0
     for r in rows:
-        ts = r["ts_et"] if hasattr(r, "keys") else r[0]
+        if hasattr(r, "keys"):
+            ts = r["ts_et"]
+            notes = r["notes"] if "notes" in r.keys() else None
+        else:
+            ts = r[0]
+            notes = r[1] if len(r) > 1 else None
+        if notes is not None and "stale:t1h" in str(notes):
+            continue
         if is_t1h_overdue(ts, as_of):
             n += 1
     return n
 
 
-def _mark_horizon(horizon: str, *, dry_run: bool) -> tuple[int, int]:
-    rows = due_for_marking(horizon)  # type: ignore[arg-type]
+def _mark_horizon(
+    horizon: str,
+    *,
+    dry_run: bool,
+    as_of: datetime | None = None,
+    db_path: str | None = None,
+) -> tuple[int, int]:
+    as_of = as_of or now_et()
+    rows = due_for_marking(horizon, db_path=db_path, as_of=as_of)  # type: ignore[arg-type]
     attempted = 0
     written = 0
     for r in rows:
+        fid = int(r["flag_id"])
+        if horizon in ("t1h", "t1d") and is_past_staleness_ceiling(
+            horizon, r["ts_et"], as_of
+        ):
+            if dry_run:
+                log.info(
+                    "dry-run stale %s flag_id=%s — would note, no mark",
+                    horizon, fid,
+                )
+            else:
+                noted = note_stale_horizon(fid, horizon, db_path=db_path)  # type: ignore[arg-type]
+                log.info(
+                    "stale %s flag_id=%s — %s, no mark written",
+                    horizon, fid, "noted" if noted else "already noted",
+                )
+            continue
+
         attempted += 1
         mid = fetch_option_mid(
             r["ticker"], r["side"], float(r["strike"]), str(r["expiry"]),
@@ -142,23 +260,23 @@ def _mark_horizon(horizon: str, *, dry_run: bool) -> tuple[int, int]:
         if mid is None:
             log.info(
                 "skip %s flag_id=%s %s %s %s — no mid",
-                horizon, r["flag_id"], r["ticker"], r["side"], r["strike"],
+                horizon, fid, r["ticker"], r["side"], r["strike"],
             )
             continue
         if dry_run:
             log.info(
                 "dry-run %s flag_id=%s → mid=%.4f",
-                horizon, r["flag_id"], mid,
+                horizon, fid, mid,
             )
             continue
-        ok = write_mark(int(r["flag_id"]), horizon, mid)  # type: ignore[arg-type]
+        ok = write_mark(fid, horizon, mid, db_path=db_path)  # type: ignore[arg-type]
         if ok:
             written += 1
-            log.info("marked %s flag_id=%s mid=%.4f", horizon, r["flag_id"], mid)
+            log.info("marked %s flag_id=%s mid=%.4f", horizon, fid, mid)
         else:
             log.info(
                 "unchanged %s flag_id=%s (already set or refused)",
-                horizon, r["flag_id"],
+                horizon, fid,
             )
     return attempted, written
 

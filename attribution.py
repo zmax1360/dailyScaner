@@ -641,7 +641,7 @@ def due_for_marking(
         if horizon == "expiry":
             rows = conn.execute(
                 f"""
-                SELECT flag_id, ticker, side, strike, expiry, mid, ts_et
+                SELECT flag_id, ticker, side, strike, expiry, mid, ts_et, notes
                 FROM flags
                 WHERE {col} IS NULL
                   AND expiry < ?
@@ -649,16 +649,57 @@ def due_for_marking(
                 (today,),
             ).fetchall()
         else:
+            stale_tag = f"stale:{horizon}"
             rows = conn.execute(
                 f"""
-                SELECT flag_id, ticker, side, strike, expiry, mid, ts_et
+                SELECT flag_id, ticker, side, strike, expiry, mid, ts_et, notes
                 FROM flags
                 WHERE {col} IS NULL
                   AND ts_et <= ?
+                  AND (notes IS NULL OR notes NOT LIKE ?)
                 """,
-                (cutoff_iso,),
+                (cutoff_iso, f"%{stale_tag}%"),
             ).fetchall()
     return list(rows)
+
+
+def note_stale_horizon(
+    flag_id: int,
+    horizon: Horizon,
+    *,
+    db_path: str | None = None,
+) -> bool:
+    """
+    Write-once 'stale:t1h' / 'stale:t1d' into flags.notes.
+    Does not write a mark value. Returns True if the note was newly written.
+    """
+    if horizon not in ("t1h", "t1d"):
+        raise ValueError(f"staleness notes only apply to t1h/t1d, got {horizon}")
+    tag = f"stale:{horizon}"
+    with _db(db_path) as conn:
+        row = conn.execute(
+            "SELECT notes FROM flags WHERE flag_id = ?",
+            (int(flag_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        notes = row["notes"]
+        if notes is not None and tag in str(notes):
+            return False
+        if notes is None or not str(notes).strip():
+            new_notes = tag
+        else:
+            new_notes = f"{str(notes).rstrip()};{tag}"
+        cur = conn.execute(
+            """
+            UPDATE flags
+            SET notes = ?
+            WHERE flag_id = ?
+              AND (notes IS NULL OR notes NOT LIKE ?)
+            """,
+            (new_notes, int(flag_id), f"%{tag}%"),
+        )
+        return cur.rowcount == 1
 
 
 def write_mark(

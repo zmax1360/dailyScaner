@@ -35,6 +35,7 @@ from best_value_archive import (
     clear_todays_log,
     archive_csv_bytes,
 )
+from best_value_ui import pending_add_pos_payload, style_best_value_rows
 from volume_analysis import (
     get_stock_volume_analysis,
     get_intraday_vwap_state,
@@ -2611,12 +2612,15 @@ def _render_best_value_panel(
 
     # Interactive table: ＋ column in-row (st.dataframe cannot host buttons)
     _render_best_value_table_with_plus(ticker, top5, disp, has_dvol=has_dvol)
+    # Caption: Velocity/Target columns removed from the table. Score_Velocity is
+    # computed as 0.0 for first-seen contracts this session (by design, not a
+    # formatting bug); later refreshes can produce non-zero velocity that still
+    # feeds Action_Signal. Dropped the Velocity-named exit clauses so the caption
+    # does not document a column that is no longer shown.
     st.caption(
-        "Target: **CLOSE** if Velocity ≤ −0.15 · "
         "**SCALE 50%** if premium ≥ +25% vs tracked entry "
-        "(prior archive / first-seen) · "
-        "**HOLD FOR RUNNER** if Velocity > +0.20 and Daily Bias is HEAVY BULLISH.  "
-        "Click **＋** in a row to add that contract to My Open Positions."
+        "(prior archive / first-seen).  "
+        "Select a row, then use **＋ Add … to Open Positions** below the table."
     )
     _render_add_position_form(ticker)
 
@@ -2655,74 +2659,91 @@ def _render_best_value_table_with_plus(
     *,
     has_dvol: bool,
 ) -> None:
-    """Best Value table with a ＋ column on each row (opens add-position form)."""
+    """Best Value table with native single-row selection + Add button below."""
     if top5 is None or top5.empty or disp is None or disp.empty:
         return
+
+    top5_r = top5.reset_index(drop=True)
+    disp_r = disp.reset_index(drop=True)
 
     show_cols = [
         "Side", "Strike", "Expiry", "DTE", "Price", "Volume", "OI",
     ]
-    if has_dvol and "ΔVol" in disp.columns:
+    if has_dvol and "ΔVol" in disp_r.columns:
         show_cols.append("ΔVol")
+    # Velocity / Target dropped — typically uniform zeros/"—" and steal width
+    # from Optimal Strategy. Score_Velocity still drives Action_Signal upstream.
     show_cols += [
-        "IV", "Value_Score", "Velocity", "Signal", "Target", "Optimal Strategy",
+        "IV", "Value_Score", "Signal", "Optimal Strategy",
     ]
-    show_cols = [c for c in show_cols if c in disp.columns]
+    show_cols = [c for c in show_cols if c in disp_r.columns]
+    view = disp_r[show_cols].copy()
 
-    # Narrow ＋ + proportional data columns
-    weights = [0.4] + [1.0] * len(show_cols)
-    header = st.columns(weights)
-    with header[0]:
-        st.markdown(
-            "<div style='font-size:0.75rem;font-weight:700;color:#666;padding-top:0.35rem'>＋</div>",
-            unsafe_allow_html=True,
+    col_cfg: dict = {
+        "Side": st.column_config.TextColumn("Side", width="small"),
+        "Strike": st.column_config.TextColumn("Strike", width="small"),
+        "Expiry": st.column_config.TextColumn("Expiry", width="medium"),
+        "DTE": st.column_config.TextColumn("DTE", width="small"),
+        "Price": st.column_config.TextColumn("Price", width="small"),
+        "Volume": st.column_config.TextColumn("Volume", width="small"),
+        "OI": st.column_config.TextColumn("OI", width="small"),
+        "ΔVol": st.column_config.TextColumn("ΔVol", width="small"),
+        "IV": st.column_config.TextColumn("IV", width="small"),
+        "Value_Score": st.column_config.TextColumn("Value_Score", width="small"),
+        "Signal": st.column_config.TextColumn("Signal", width="medium"),
+        "Optimal Strategy": st.column_config.TextColumn(
+            "Optimal Strategy", width="large",
+        ),
+    }
+    col_cfg = {k: v for k, v in col_cfg.items() if k in view.columns}
+
+    styled = style_best_value_rows(view, top5_r)
+    table_key = f"bv_select_{str(ticker).upper()}"
+
+    sel: list[int] = []
+    try:
+        event = st.dataframe(
+            styled,
+            on_select="rerun",
+            selection_mode="single-row",
+            use_container_width=True,
+            hide_index=True,
+            column_config=col_cfg,
+            key=table_key,
         )
-    for j, name in enumerate(show_cols):
-        with header[j + 1]:
-            st.markdown(
-                f"<div style='font-size:0.75rem;font-weight:700;color:#666;"
-                f"padding-top:0.35rem;white-space:nowrap'>{name}</div>",
-                unsafe_allow_html=True,
-            )
+        if event is not None and getattr(event, "selection", None) is not None:
+            sel = list(event.selection.rows or [])
+    except TypeError:
+        # Older Streamlit: no on_select / column_config combo — fallback picker
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            hide_index=True,
+            key=f"{table_key}_fallback_df",
+        )
+        labels = [
+            f"{r['side']} ${float(r['strike']):.1f} · {r['expiry']}"
+            for _, r in top5_r.iterrows()
+        ]
+        pick = st.selectbox(
+            "Contract to add",
+            options=["—"] + labels,
+            key=f"{table_key}_fallback_pick",
+        )
+        if pick and pick != "—":
+            sel = [labels.index(pick)]
 
-    top5_r = top5.reset_index(drop=True)
-    disp_r = disp.reset_index(drop=True)
-    for i in range(len(disp_r)):
-        raw = top5_r.iloc[i]
-        drow = disp_r.iloc[i]
-        is_best = "BEST VALUE" in str(raw.get("Status") or "")
-        bg = "#1e4620" if is_best else ("#f7f7f7" if i % 2 else "#ffffff")
-        fg = "#ffffff" if is_best else "#222222"
-        row = st.columns(weights)
-        with row[0]:
-            if st.button(
-                "＋",
-                key=f"bv_row_add_{ticker}_{i}",
-                help=(
-                    f"Add {raw['side']} ${float(raw['strike']):.1f} "
-                    f"{raw['expiry']} to Open Positions"
-                ),
-            ):
-                st.session_state["_pending_add_pos"] = {
-                    "Ticker": ticker.upper(),
-                    "Side": str(raw["side"]).upper(),
-                    "Strike": float(raw["strike"]),
-                    "Expiry": str(raw["expiry"]),
-                    "default_price": float(raw["last"]),
-                }
-                st.rerun()
-        for j, name in enumerate(show_cols):
-            val = drow.get(name, "—")
-            if pd.isna(val):
-                val = "—"
-            with row[j + 1]:
-                st.markdown(
-                    f"<div style='background:{bg};color:{fg};font-size:0.78rem;"
-                    f"padding:0.35rem 0.25rem;border-radius:3px;"
-                    f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>"
-                    f"{val}</div>",
-                    unsafe_allow_html=True,
-                )
+    payload = pending_add_pos_payload(ticker, top5_r, sel)
+    if payload is None:
+        st.caption("Select a row to add it to Open Positions.")
+    else:
+        label = (
+            f"＋  Add {payload['Side']} ${float(payload['Strike']):.1f} · "
+            f"{payload['Expiry']} to Open Positions"
+        )
+        if st.button(label, type="primary", key=f"bv_add_selected_{ticker}"):
+            st.session_state["_pending_add_pos"] = payload
+            st.rerun()
 
 
 def _render_add_position_form(ticker: str) -> None:

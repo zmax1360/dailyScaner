@@ -146,7 +146,7 @@ python -m pytest tests/ -q -k overdue
 
 ## Task 4 — Land the defect tests
 
-- [ ] `tests/test_best_value_engine.py` present, green, 8 xfail
+- [x] `tests/test_best_value_engine.py` present, green, 8 xfail
 
 ```
 I have a file test_best_value_engine.py (I will paste/attach it). Add it to tests/.
