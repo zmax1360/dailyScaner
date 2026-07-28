@@ -14,7 +14,7 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 from attribution import (
@@ -27,6 +27,10 @@ from attribution import (
 ET = ZoneInfo("America/New_York")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
+
+# Single source of truth for the t1h/t1d mark window (also used by health_check).
+MARK_WINDOW_START = dtime(9, 30)
+MARK_WINDOW_END = dtime(16, 15)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,12 +56,78 @@ def _load_env() -> None:
         pass
 
 
-def _in_mark_window(now: datetime | None = None) -> bool:
+def in_mark_window(now: datetime | None = None) -> bool:
     """Weekdays 09:30–16:15 ET (buffer for delayed quotes after the close)."""
     now = now or datetime.now(ET)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ET)
+    now = now.astimezone(ET)
     if now.weekday() >= 5:
         return False
-    return dtime(9, 30) <= now.time() < dtime(16, 15)
+    return MARK_WINDOW_START <= now.time() < MARK_WINDOW_END
+
+
+def _in_mark_window(now: datetime | None = None) -> bool:
+    """Backward-compatible alias."""
+    return in_mark_window(now)
+
+
+def first_markable_at(due: datetime) -> datetime:
+    """
+    Earliest ET instant >= `due` that falls inside a weekday mark window.
+    Used so overdue checks ignore flags whose due time fell outside hours.
+    """
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=ET)
+    due = due.astimezone(ET)
+    candidate = due
+    for _ in range(14):  # enough to clear a long weekend
+        if candidate.weekday() < 5:
+            start = datetime.combine(candidate.date(), MARK_WINDOW_START, tzinfo=ET)
+            end = datetime.combine(candidate.date(), MARK_WINDOW_END, tzinfo=ET)
+            if candidate < start:
+                return start
+            if candidate < end:
+                return candidate
+        next_day = candidate.date() + timedelta(days=1)
+        candidate = datetime.combine(next_day, MARK_WINDOW_START, tzinfo=ET)
+    return candidate
+
+
+def is_t1h_overdue(ts_et: datetime | str, as_of: datetime, *, marked: bool = False) -> bool:
+    """
+    True only when mark_t1h is still null AND the due time (ts+1h) became
+    markable inside a window and as_of is strictly after that first chance.
+    """
+    if marked:
+        return False
+    if isinstance(ts_et, str):
+        ts = datetime.fromisoformat(ts_et)
+    else:
+        ts = ts_et
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ET)
+    ts = ts.astimezone(ET)
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=ET)
+    as_of = as_of.astimezone(ET)
+    due = ts + timedelta(hours=1)
+    first = first_markable_at(due)
+    return as_of > first
+
+
+def count_overdue_t1h(conn, as_of: datetime | None = None) -> int:
+    """Count unmarked t1h flags that are overdue under the window-aware rule."""
+    as_of = as_of or datetime.now(ET)
+    rows = conn.execute(
+        "SELECT ts_et FROM flags WHERE mark_t1h IS NULL"
+    ).fetchall()
+    n = 0
+    for r in rows:
+        ts = r["ts_et"] if hasattr(r, "keys") else r[0]
+        if is_t1h_overdue(ts, as_of):
+            n += 1
+    return n
 
 
 def _mark_horizon(horizon: str, *, dry_run: bool) -> tuple[int, int]:

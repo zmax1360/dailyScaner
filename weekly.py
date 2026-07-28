@@ -11,6 +11,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import json, os, sys, warnings
 import anthropic
+from attribution import now_et
 from spread_gate import evaluate_spread_gate
 
 warnings.filterwarnings("ignore")
@@ -451,11 +452,11 @@ EARNINGS: {earnings_date} ({earnings_days} days away)
 # ── ARCHIVE ───────────────────────────────────────────────────────────────────
 def save_archive(ticker, ticker_data, macro, oi, checklist_score, thesis, earnings_date, earnings_days):
     os.makedirs("archive_weekly", exist_ok=True)
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts   = now_et().strftime("%Y%m%d_%H%M%S")
     base = f"archive_weekly/{ticker}_{ts}"
 
     payload = {
-        "timestamp":      datetime.now().isoformat(),
+        "timestamp":      now_et().isoformat(timespec="seconds"),
         "ticker":         ticker,
         "checklist_score":checklist_score,
         "earnings_date":  earnings_date,
@@ -479,7 +480,7 @@ def save_archive(ticker, ticker_data, macro, oi, checklist_score, thesis, earnin
 
 # ── REPORT ────────────────────────────────────────────────────────────────────
 def print_report(ticker, ticker_data, macro, oi, score, checks, thesis, earnings_date, earnings_days):
-    now  = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now  = now_et().strftime("%Y-%m-%d %H:%M")
     daily  = ticker_data["daily"]
     weekly = ticker_data["weekly"]
     vix    = macro.get("^VIX", {})

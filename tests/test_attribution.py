@@ -404,3 +404,68 @@ def test_hours_elapsed_computed(tmp_path, monkeypatch):
         ).fetchone()[0]
     assert hours == pytest.approx(3.0, abs=0.05)
     assert unmarked is None
+
+
+def test_flag_state_columns_populated(tmp_path):
+    db = str(tmp_path / "state.db")
+    chain = _sample_chain()
+    scored = calculate_best_value(chain, spot_price=250.0, now_et=NOW)
+    ctrl = build_control_rows(chain, spot=250.0, expiry="2026-08-21")
+    log_run(
+        ticker="TEST", scored_df=scored, cfg=SCORING, spot=250.0,
+        control_rows=ctrl, db_path=db, ts_et=NOW,
+    )
+    with _db(db) as c:
+        row = c.execute(
+            """
+            SELECT dte, volume, open_interest, iv
+            FROM flags WHERE is_control=0 LIMIT 1
+            """
+        ).fetchone()
+    assert row["dte"] == 32
+    assert row["volume"] == 800
+    assert row["open_interest"] == 1000
+    assert row["iv"] == pytest.approx(0.35)
+
+
+def test_missing_source_column_writes_null(tmp_path):
+    db = str(tmp_path / "missing_iv.db")
+    chain = _sample_chain().drop(columns=["iv"])
+    scored = calculate_best_value(chain, spot_price=250.0, now_et=NOW)
+    # Ensure iv really absent on scored frame too
+    if "iv" in scored.columns:
+        scored = scored.drop(columns=["iv"])
+    log_run(
+        ticker="TEST", scored_df=scored, cfg=SCORING, spot=250.0,
+        control_rows=None, db_path=db, ts_et=NOW,
+    )
+    with _db(db) as c:
+        row = c.execute(
+            "SELECT iv FROM flags WHERE is_control=0 LIMIT 1"
+        ).fetchone()
+    assert row["iv"] is None
+    assert row["iv"] != 0.0
+
+
+def test_control_rows_also_carry_state(tmp_path):
+    db = str(tmp_path / "ctrl_state.db")
+    chain = _sample_chain()
+    scored = calculate_best_value(chain, spot_price=250.0, now_et=NOW)
+    ctrl = build_control_rows(chain, spot=250.0, expiry="2026-08-21")
+    log_run(
+        ticker="TEST", scored_df=scored, cfg=SCORING, spot=250.0,
+        control_rows=ctrl, db_path=db, ts_et=NOW,
+    )
+    with _db(db) as c:
+        rows = c.execute(
+            """
+            SELECT dte, volume, open_interest, iv
+            FROM flags WHERE is_control=1
+            """
+        ).fetchall()
+    assert len(rows) >= 1
+    for row in rows:
+        assert row["dte"] == 32
+        assert row["volume"] == 800
+        assert row["open_interest"] == 1000
+        assert row["iv"] == pytest.approx(0.35)

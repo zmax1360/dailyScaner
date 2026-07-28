@@ -13,6 +13,7 @@ import os
 import sys
 
 from attribution import _db, default_db_path, now_et
+from mark_runner import count_overdue_t1h
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
@@ -44,15 +45,7 @@ def _checks(conn) -> list[tuple[str, bool, str]]:
         WHERE multipliers = '{}' OR multipliers IS NULL
         """
     ).fetchone()[0]
-    cutoff = now_et().isoformat(timespec="seconds")
-    overdue = conn.execute(
-        """
-        SELECT COUNT(*) FROM flags
-        WHERE mark_t1h IS NULL
-          AND ts_et < datetime(?, '-4 hours')
-        """,
-        (cutoff,),
-    ).fetchone()[0]
+    overdue = count_overdue_t1h(conn, as_of=now_et())
     hashes = conn.execute(
         """
         SELECT COUNT(DISTINCT config_hash) FROM runs
@@ -97,7 +90,7 @@ def _checks(conn) -> list[tuple[str, bool, str]]:
             f"{rows_today} (expect >0 on trading day)",
         ),
         ("empty_mults", empty_mults == 0, str(empty_mults)),
-        ("overdue_t1h_4h", overdue == 0, str(overdue)),
+        ("overdue_t1h_window", overdue == 0, str(overdue)),
         (
             "config_hash_7d",
             hashes <= 1,

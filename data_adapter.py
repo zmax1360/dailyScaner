@@ -8,10 +8,12 @@ in dailyScaner.py.
 """
 
 import math
-from datetime import date, datetime
+from datetime import datetime
 
 import pandas as pd
 import yfinance as yf
+
+from attribution import now_et
 
 
 def _safe_int(v, default: int = 0) -> int:
@@ -54,7 +56,7 @@ def fetch_full_chain(ticker: str = "AAPL") -> pd.DataFrame:
     they want to keep.  Returns an empty DataFrame (correct columns) on
     any fetch failure so the caller can display a graceful error.
     """
-    today = date.today()
+    today = now_et().date()
     rows: list[dict] = []
 
     try:

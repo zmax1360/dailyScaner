@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS flags (
     marked_t1h_at TEXT,
     marked_t1d_at TEXT,
     marked_exp_at TEXT,
+    dte           INTEGER,
+    volume        INTEGER,
+    open_interest INTEGER,
+    iv            REAL,
     notes       TEXT,
     CHECK (is_control IN (0, 1))
 );
@@ -87,6 +91,7 @@ SELECT
     f.side,
     f.strike,
     f.expiry,
+    f.dte,
     f.score,
     f.rank,
     f.nlev,
@@ -150,6 +155,10 @@ _FLAG_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
     ("marked_t1h_at", "TEXT"),
     ("marked_t1d_at", "TEXT"),
     ("marked_exp_at", "TEXT"),
+    ("dte", "INTEGER"),
+    ("volume", "INTEGER"),
+    ("open_interest", "INTEGER"),
+    ("iv", "REAL"),
 )
 
 _MARK_AT_COL = {
@@ -300,7 +309,10 @@ def build_control_rows(
     Nearest-to-ATM strike at `expiry`, both CALL and PUT.
     Selected by rule from the chain — never from scored ranks.
     """
-    cols = ["side", "strike", "expiry", "last", "bid", "ask", "volume", "openInterest"]
+    cols = [
+        "side", "strike", "expiry", "last", "bid", "ask",
+        "volume", "openInterest", "dte", "iv",
+    ]
     empty = pd.DataFrame(columns=cols)
     if chain_df is None or getattr(chain_df, "empty", True) or spot <= 0 or not expiry:
         return empty
@@ -319,6 +331,8 @@ def build_control_rows(
         ("Volume", "volume"),
         ("openInterest", "openInterest"),
         ("OpenInterest", "openInterest"),
+        ("DTE", "dte"),
+        ("IV", "iv"),
     ]:
         if src in df.columns and dst not in df.columns:
             rename[src] = dst
@@ -352,6 +366,8 @@ def build_control_rows(
                 "ask": float("nan"),
                 "volume": 0,
                 "openInterest": 0,
+                "dte": None,
+                "iv": None,
             })
             continue
         r = hit.iloc[0]
@@ -367,6 +383,12 @@ def build_control_rows(
             "ask": float(r["ask"]) if "ask" in r.index and pd.notna(r["ask"]) else float("nan"),
             "volume": int(r["volume"]) if "volume" in r.index and pd.notna(r["volume"]) else 0,
             "openInterest": int(r["openInterest"]) if "openInterest" in r.index and pd.notna(r.get("openInterest")) else 0,
+            "dte": (
+                int(r["dte"]) if "dte" in r.index and pd.notna(r.get("dte")) else None
+            ),
+            "iv": (
+                float(r["iv"]) if "iv" in r.index and pd.notna(r.get("iv")) else None
+            ),
         })
     return pd.DataFrame(rows)
 
@@ -382,6 +404,46 @@ def modal_flagged_expiry(scored: pd.DataFrame) -> str | None:
     if mode.empty:
         return None
     return str(mode.iloc[0])
+
+
+def _nullable_int(r: pd.Series, *names: str) -> int | None:
+    """Read first present column as int. Missing column → None (never invent 0)."""
+    for name in names:
+        if name not in r.index:
+            continue
+        v = r.get(name)
+        if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _nullable_float(r: pd.Series, *names: str) -> float | None:
+    """Read first present column as float. Missing column → None (never invent 0.0)."""
+    for name in names:
+        if name not in r.index:
+            continue
+        v = r.get(name)
+        if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _flag_state_from_row(r: pd.Series) -> tuple[int | None, int | None, int | None, float | None]:
+    """Frozen-at-flag-time fields: dte, volume, open_interest, iv."""
+    return (
+        _nullable_int(r, "dte", "DTE"),
+        _nullable_int(r, "volume", "Volume"),
+        _nullable_int(r, "openInterest", "open_interest", "OpenInterest"),
+        _nullable_float(r, "iv", "IV"),
+    )
 
 
 def _mid_from_row(r: pd.Series) -> float | None:
@@ -494,11 +556,14 @@ def log_run(
             if nlev_f is not None and nflow_f is not None:
                 base_f = float(nlev_f) * w_lev + float(nflow_f) * w_flow
 
+            dte_i, vol_i, oi_i, iv_f = _flag_state_from_row(r)
+
             flag_rows.append((
                 run_id, ts_iso, ticker.upper(), side, strike, expiry,
                 float(r["Value_Score"]), int(r["_rank"]),
                 nlev_f, nflow_f, base_f, mult_json,
                 mid, bid_f, ask_f, float(spot) if spot else None, 0, None,
+                dte_i, vol_i, oi_i, iv_f,
             ))
 
         ctrl = control_rows if control_rows is not None else pd.DataFrame()
@@ -514,6 +579,7 @@ def log_run(
                 ask_f = float(ask) if ask is not None and pd.notna(ask) else None
             except (TypeError, ValueError):
                 ask_f = None
+            dte_i, vol_i, oi_i, iv_f = _flag_state_from_row(r)
             flag_rows.append((
                 run_id, ts_iso, ticker.upper(),
                 str(r.get("side", "")).upper(),
@@ -526,6 +592,7 @@ def log_run(
                 None,  # base_score
                 json.dumps({"control": 1.0}),
                 mid, bid_f, ask_f, float(spot) if spot else None, 1, None,
+                dte_i, vol_i, oi_i, iv_f,
             ))
 
         conn.executemany(
@@ -533,8 +600,9 @@ def log_run(
             INSERT INTO flags (
                 run_id, ts_et, ticker, side, strike, expiry,
                 score, rank, nlev, nflow, base_score, multipliers,
-                mid, bid, ask, spot, is_control, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mid, bid, ask, spot, is_control, notes,
+                dte, volume, open_interest, iv
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             flag_rows,
         )

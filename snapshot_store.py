@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from attribution import now_et
+
 SNAPSHOT_FILE   = "flow_snapshot.json"
 GATE_HISTORY_FILE = "gate_history.json"
 ET = ZoneInfo("America/New_York")
@@ -56,7 +58,7 @@ def save_snapshot(df: pd.DataFrame) -> None:
     """
     keep = [c for c in _CHAIN_COLS if c in df.columns]
     payload = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": now_et().isoformat(timespec="seconds"),
         "rows":      df[keep].to_dict(orient="records"),
     }
     with open(SNAPSHOT_FILE, "w") as f:
@@ -96,7 +98,7 @@ def compute_deltas(
         prev_date = datetime.fromisoformat(prev_ts).date()
     except Exception:
         prev_date = date.min
-    stale_day = prev_date < date.today()
+    stale_day = prev_date < now_et().date()
 
     # Build lookup maps from the previous snapshot
     prev = prev.copy()
