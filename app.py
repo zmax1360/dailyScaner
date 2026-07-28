@@ -35,7 +35,13 @@ from best_value_archive import (
     clear_todays_log,
     archive_csv_bytes,
 )
-from best_value_ui import pending_add_pos_payload, style_best_value_rows
+from best_value_ui import (
+    CONTRACT_KEY_COL,
+    STAR_COL,
+    attach_contract_keys,
+    best_value_star,
+    pending_add_pos_payload,
+)
 from volume_analysis import (
     get_stock_volume_analysis,
     get_intraday_vwap_state,
@@ -2667,7 +2673,7 @@ def _render_best_value_table_with_plus(
     disp_r = disp.reset_index(drop=True)
 
     show_cols = [
-        "Side", "Strike", "Expiry", "DTE", "Price", "Volume", "OI",
+        STAR_COL, "Side", "Strike", "Expiry", "DTE", "Price", "Volume", "OI",
     ]
     if has_dvol and "ΔVol" in disp_r.columns:
         show_cols.append("ΔVol")
@@ -2676,10 +2682,28 @@ def _render_best_value_table_with_plus(
     show_cols += [
         "IV", "Value_Score", "Signal", "Optimal Strategy",
     ]
-    show_cols = [c for c in show_cols if c in disp_r.columns]
-    view = disp_r[show_cols].copy()
 
+    # ★ marker replaces pandas Styler highlight (see note below on Streamlit 1.37.1).
+    view = disp_r.copy()
+    if "Status" in top5_r.columns:
+        view[STAR_COL] = [best_value_star(s) for s in top5_r["Status"]]
+    else:
+        view[STAR_COL] = ""
+    # Hidden identity column — selection resolves by key, not display position,
+    # so client-side column sorts cannot attach the wrong contract.
+    view[CONTRACT_KEY_COL] = attach_contract_keys(top5_r).to_numpy()
+    show_cols = [c for c in show_cols if c in view.columns or c == STAR_COL]
+    # Ensure ★ is present even if not in disp_r originally
+    ordered = [c for c in show_cols if c in view.columns]
+    view = view[ordered + [CONTRACT_KEY_COL]].copy()
+
+    # Streamlit 1.37.1 (verified via arrow.py marshall path): both Styler CSS and
+    # column_config are written into the Arrow proto. Styler CSS is row-index
+    # tied (#T_…rowN_colM), so after a header sort the green highlight paints the
+    # wrong visual row (or sorting feels broken). Widths matter more for Optimal
+    # Strategy truncation — keep column_config, drop Styler, use ★ instead.
     col_cfg: dict = {
+        STAR_COL: st.column_config.TextColumn(STAR_COL, width="small"),
         "Side": st.column_config.TextColumn("Side", width="small"),
         "Strike": st.column_config.TextColumn("Strike", width="small"),
         "Expiry": st.column_config.TextColumn("Expiry", width="medium"),
@@ -2694,16 +2718,17 @@ def _render_best_value_table_with_plus(
         "Optimal Strategy": st.column_config.TextColumn(
             "Optimal Strategy", width="large",
         ),
+        # Hidden: None → ColumnConfig(hidden=True) in process_config_mapping
+        CONTRACT_KEY_COL: None,
     }
     col_cfg = {k: v for k, v in col_cfg.items() if k in view.columns}
 
-    styled = style_best_value_rows(view, top5_r)
     table_key = f"bv_select_{str(ticker).upper()}"
 
     sel: list[int] = []
     try:
         event = st.dataframe(
-            styled,
+            view,
             on_select="rerun",
             selection_mode="single-row",
             use_container_width=True,
@@ -2716,7 +2741,7 @@ def _render_best_value_table_with_plus(
     except TypeError:
         # Older Streamlit: no on_select / column_config combo — fallback picker
         st.dataframe(
-            styled,
+            view.drop(columns=[CONTRACT_KEY_COL], errors="ignore"),
             use_container_width=True,
             hide_index=True,
             key=f"{table_key}_fallback_df",
@@ -2733,7 +2758,9 @@ def _render_best_value_table_with_plus(
         if pick and pick != "—":
             sel = [labels.index(pick)]
 
-    payload = pending_add_pos_payload(ticker, top5_r, sel)
+    payload = pending_add_pos_payload(
+        ticker, top5_r, sel, display=view,
+    )
     if payload is None:
         st.caption("Select a row to add it to Open Positions.")
     else:
