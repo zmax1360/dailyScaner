@@ -194,21 +194,38 @@ def is_t1h_overdue(ts_et: datetime | str, as_of: datetime, *, marked: bool = Fal
 
 
 def count_overdue_t1h(conn, as_of: datetime | None = None) -> int:
-    """Count unmarked t1h flags that are overdue under the window-aware rule."""
+    """Count unmarked t1h flags that are overdue under the window-aware rule.
+
+    Excludes stale-noted rows and flags belonging to EOD runs (run_kind='eod').
+    """
     as_of = as_of or datetime.now(ET)
     try:
         rows = conn.execute(
             """
-            SELECT ts_et, notes FROM flags
-            WHERE mark_t1h IS NULL
-              AND (notes IS NULL OR notes NOT LIKE '%stale:t1h%')
+            SELECT f.ts_et AS ts_et, f.notes AS notes
+            FROM flags f
+            LEFT JOIN runs r ON r.run_id = f.run_id
+            WHERE f.mark_t1h IS NULL
+              AND (f.notes IS NULL OR f.notes NOT LIKE '%stale:t1h%')
+              AND (f.notes IS NULL OR f.notes NOT LIKE '%n/a:eod%')
+              AND (r.run_kind IS NULL OR r.run_kind != 'eod')
             """
         ).fetchall()
     except Exception:
-        # Minimal test schemas may lack notes
-        rows = conn.execute(
-            "SELECT ts_et FROM flags WHERE mark_t1h IS NULL"
-        ).fetchall()
+        # Minimal test schemas may lack notes / runs.join
+        try:
+            rows = conn.execute(
+                """
+                SELECT ts_et FROM flags
+                WHERE mark_t1h IS NULL
+                  AND (notes IS NULL OR notes NOT LIKE '%stale:t1h%')
+                  AND (notes IS NULL OR notes NOT LIKE '%n/a:eod%')
+                """
+            ).fetchall()
+        except Exception:
+            rows = conn.execute(
+                "SELECT ts_et FROM flags WHERE mark_t1h IS NULL"
+            ).fetchall()
     n = 0
     for r in rows:
         if hasattr(r, "keys"):
@@ -217,7 +234,9 @@ def count_overdue_t1h(conn, as_of: datetime | None = None) -> int:
         else:
             ts = r[0]
             notes = r[1] if len(r) > 1 else None
-        if notes is not None and "stale:t1h" in str(notes):
+        if notes is not None and (
+            "stale:t1h" in str(notes) or "n/a:eod" in str(notes)
+        ):
             continue
         if is_t1h_overdue(ts, as_of):
             n += 1

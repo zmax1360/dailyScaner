@@ -19,13 +19,18 @@ from config import SCORING
 
 def _parse_ticker() -> str:
     """Read ticker from argv[1], ignoring pytest/script paths (must be 1-5 alpha chars)."""
-    if len(sys.argv) > 1:
-        candidate = sys.argv[1]
+    for candidate in sys.argv[1:]:
+        if candidate.startswith("-"):
+            continue
         if candidate.isalpha() and 1 <= len(candidate) <= 5:
             return candidate.upper()
     return "AAPL"
 
+def _parse_is_eod() -> bool:
+    return "--eod" in sys.argv
+
 TICKER = _parse_ticker()
+IS_EOD = _parse_is_eod()
 
 # Minimum open interest for a contract to be eligible as a magnet / signal.
 # Below this, vol/OI "conviction" is a division-by-noise artifact.
@@ -41,6 +46,7 @@ def _log_scan_attribution(
     vol_curr: dict,
     vol_prev: dict | None,
     session: dict | None,
+    run_kind: str = "intraday",
 ) -> None:
     """
     Score + append attribution rows. Fail-soft: never abort a scan.
@@ -101,12 +107,19 @@ def _log_scan_attribution(
             news_bias=news_bias,
             control_rows=ctrl,
             engine_sha_val=engine_sha(),
+            run_kind=run_kind,
         )
-        n = int(bv_df["Value_Score"].notna().sum()) if not bv_df.empty else 0
-        print(
-            f"{C.GRAY}  Attribution ? run_id={run_id[:8]}â€¦ "
-            f"scored={n} ctrl={len(ctrl)}{C.RESET}"
-        )
+        if (run_kind or "").lower() == "eod":
+            print(
+                f"{C.GRAY}  Attribution - run_id={run_id[:8]}... "
+                f"run_kind=eod (flags skipped){C.RESET}"
+            )
+        else:
+            n = int(bv_df["Value_Score"].notna().sum()) if not bv_df.empty else 0
+            print(
+                f"{C.GRAY}  Attribution - run_id={run_id[:8]}... "
+                f"scored={n} ctrl={len(ctrl)}{C.RESET}"
+            )
     except Exception as exc:
         print(f"{C.YELLOW}  Attribution log failed (scan continues): {exc}{C.RESET}")
         try:
@@ -780,7 +793,7 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
     print(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
 
 # ?? ARCHIVE ???????????????????????????????????????????????????????????????????
-def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None):
+def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None, *, is_eod=False, settlement_converged=None):
     os.makedirs("archive", exist_ok=True)
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -790,6 +803,10 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
 
     payload = {
         "timestamp": ts_aware.isoformat(),
+        "is_eod": bool(is_eod),
+        "settlement_converged": (
+            None if settlement_converged is None else bool(settlement_converged)
+        ),
         "spot": spot,
         "or_data": or_data,        # dashboard: OR band + breakout state per run
         "direction": direction,    # dashboard: scanner's direction verdict per run
@@ -837,9 +854,55 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
 
 # ?? MAIN ??????????????????????????????????????????????????????????????????????
 def run():
-    print(f"\n{C.CYAN}Fetching {TICKER} data...{C.RESET}", end="", flush=True)
-    frames, spot, calls_all, puts_all = fetch_data()
-    print(f"  spot=${spot}")
+    settlement_converged = None
+    if IS_EOD:
+        from eod_settlement import VolumeSnapshot, await_volume_convergence
+        gap_sec, max_attempts = 600.0, 3
+        try:
+            with open("scheduler_config.json") as _cfg_fh:
+                _ecfg = json.load(_cfg_fh)
+            gap_sec = float(_ecfg.get("eod_convergence_gap_sec", gap_sec))
+            max_attempts = int(_ecfg.get("eod_convergence_max_attempts", max_attempts))
+        except Exception:
+            pass
+        print(f"\n{C.CYAN}EOD mode — converging settlement volumes for {TICKER}...{C.RESET}")
+        last_pack = {}
+
+        def _read_vols():
+            frames, spot, calls_all, puts_all = fetch_data()
+            snap = VolumeSnapshot(
+                total_call_vol=int(calls_all["volume"].sum()),
+                total_put_vol=int(puts_all["volume"].sum()),
+            )
+            last_pack["frames"] = frames
+            last_pack["spot"] = spot
+            last_pack["calls_all"] = calls_all
+            last_pack["puts_all"] = puts_all
+            last_pack["snap"] = snap
+            print(
+                f"{C.GRAY}  vol snapshot CALL={snap.total_call_vol:,} "
+                f"PUT={snap.total_put_vol:,}{C.RESET}"
+            )
+            return snap
+
+        converged, _last, _snaps = await_volume_convergence(
+            _read_vols,
+            gap_sec=gap_sec,
+            max_attempts=max_attempts,
+        )
+        settlement_converged = bool(converged)
+        frames = last_pack["frames"]
+        spot = last_pack["spot"]
+        calls_all = last_pack["calls_all"]
+        puts_all = last_pack["puts_all"]
+        print(
+            f"{C.CYAN}EOD settlement_converged={settlement_converged} "
+            f"spot=${spot}{C.RESET}\n"
+        )
+    else:
+        print(f"\n{C.CYAN}Fetching {TICKER} data...{C.RESET}", end="", flush=True)
+        frames, spot, calls_all, puts_all = fetch_data()
+        print(f"  spot=${spot}")
     print(f"{C.CYAN}Analyzing...{C.RESET}\n")
     tf_data = analyze_tf(frames)
     or_data  = opening_range(frames.get("5M", pd.DataFrame()), frames.get("15M", pd.DataFrame()), spot)
@@ -908,9 +971,13 @@ def run():
         session = None
     # ------------------------------------------------------------------------
 
-    fname_json, fname_txt = save_archive(spot, tf_data, calls_all, puts_all,
-                                         or_data=or_data, direction=direction0,
-                                         session=session)
+    fname_json, fname_txt = save_archive(
+        spot, tf_data, calls_all, puts_all,
+        or_data=or_data, direction=direction0,
+        session=session,
+        is_eod=IS_EOD,
+        settlement_converged=settlement_converged if IS_EOD else None,
+    )
 
     # Attribution: every scored contract + ATM controls (fail-soft)
     vol_curr = {
@@ -934,6 +1001,7 @@ def run():
         vol_curr=vol_curr,
         vol_prev=vol_prev_bv,
         session=session,
+        run_kind="eod" if IS_EOD else "intraday",
     )
 
     # capture report as plain text

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS runs (
     news_bias   TEXT,
     spot        REAL,
     vwap_state  TEXT,
+    run_kind    TEXT NOT NULL DEFAULT 'intraday',
     notes       TEXT
 );
 
@@ -161,6 +162,10 @@ _FLAG_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
     ("iv", "REAL"),
 )
 
+_RUN_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
+    ("run_kind", "TEXT"),
+)
+
 _MARK_AT_COL = {
     "t1h": "marked_t1h_at",
     "t1d": "marked_t1d_at",
@@ -174,6 +179,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for col, sql_type in _FLAG_MIGRATE_COLS:
         if col not in cols:
             conn.execute(f"ALTER TABLE flags ADD COLUMN {col} {sql_type}")
+    run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+    for col, sql_type in _RUN_MIGRATE_COLS:
+        if col not in run_cols:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {sql_type}")
+            conn.execute(
+                "UPDATE runs SET run_kind = 'intraday' WHERE run_kind IS NULL"
+            )
     conn.executescript(_VIEW_SQL)
 
 
@@ -476,11 +488,22 @@ def log_run(
     engine_sha_val: str | None = None,
     db_path: str | None = None,
     ts_et: datetime | None = None,
+    run_kind: str = "intraday",
 ) -> str:
     """
     Append one run + every scored contract + control rows.
     Returns run_id. Raises on DB errors (callers should fail-soft).
+
+    run_kind: 'intraday' | 'eod'
+      EOD recommendation: insert the run row for audit, but skip flag rows.
+      A 16:20 flag can never receive a valid T+1h mark (mark window ends 16:15;
+      4h market-time staleness). Logging flags would create permanently
+      unmarkable overdue noise. EOD rankings live in the archive JSON instead.
     """
+    kind = (run_kind or "intraday").strip().lower()
+    if kind not in ("intraday", "eod"):
+        raise ValueError(f"run_kind must be 'intraday' or 'eod', got {run_kind!r}")
+
     ts = ts_et or now_et()
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=ET)
@@ -504,15 +527,20 @@ def log_run(
             """
             INSERT INTO runs (
                 run_id, ts_et, ticker, n_scored, config_hash, engine_sha,
-                daily_bias, market_state, news_bias, spot, vwap_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                daily_bias, market_state, news_bias, spot, vwap_state, run_kind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id, ts_iso, ticker.upper(), n_scored, ch, sha,
-                daily_bias, market_state, news_bias, float(spot) if spot else None,
-                vwap_state,
+                daily_bias, market_state, news_bias,
+                float(spot) if spot else None,
+                vwap_state, kind,
             ),
         )
+
+        # EOD: run audit row only — no t1h-eligible flags
+        if kind == "eod":
+            return run_id
 
         w_lev = float(cfg.get("w_lev", 0.4))
         w_flow = float(cfg.get("w_flow", 0.6))
@@ -652,11 +680,15 @@ def due_for_marking(
             stale_tag = f"stale:{horizon}"
             rows = conn.execute(
                 f"""
-                SELECT flag_id, ticker, side, strike, expiry, mid, ts_et, notes
-                FROM flags
-                WHERE {col} IS NULL
-                  AND ts_et <= ?
-                  AND (notes IS NULL OR notes NOT LIKE ?)
+                SELECT f.flag_id, f.ticker, f.side, f.strike, f.expiry,
+                       f.mid, f.ts_et, f.notes
+                FROM flags f
+                LEFT JOIN runs r ON r.run_id = f.run_id
+                WHERE f.{col} IS NULL
+                  AND f.ts_et <= ?
+                  AND (f.notes IS NULL OR f.notes NOT LIKE ?)
+                  AND (f.notes IS NULL OR f.notes NOT LIKE '%n/a:eod%')
+                  AND (r.run_kind IS NULL OR r.run_kind != 'eod')
                 """,
                 (cutoff_iso, f"%{stale_tag}%"),
             ).fetchall()

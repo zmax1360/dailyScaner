@@ -11,12 +11,37 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime, time as dtime
 
 from attribution import _db, default_db_path, now_et
 from mark_runner import count_overdue_t1h
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
+
+
+def within_et_window(
+    target_hhmm: str,
+    *,
+    window_min: int = 20,
+    now: datetime | None = None,
+) -> bool:
+    """
+    True when America/New_York clock is within ±window_min of target HH:MM.
+
+    launchd StartCalendarInterval uses the *machine* local timezone (F-23).
+    Gate scheduled jobs on ET so a Pacific-hosted Mac or DST edge does not
+    shift when the health check actually runs.
+    """
+    now = now or now_et()
+    parts = target_hhmm.strip().split(":")
+    target = dtime(int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    target_min = target.hour * 60 + target.minute
+    now_min = now.hour * 60 + now.minute
+    # Circular distance on a 24h clock (minutes)
+    delta = abs(now_min - target_min)
+    delta = min(delta, 24 * 60 - delta)
+    return delta <= int(window_min)
 
 
 def _load_env() -> None:
@@ -131,11 +156,36 @@ def _telegram_alert(text: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--alert-on-fail", action="store_true")
+    p.add_argument(
+        "--require-et",
+        metavar="HH:MM",
+        default=None,
+        help=(
+            "Exit 0 without checking unless now (America/New_York) is within "
+            "--et-window-min of this time. Use for launchd (F-23)."
+        ),
+    )
+    p.add_argument(
+        "--et-window-min",
+        type=int,
+        default=20,
+        help="Half-width minutes for --require-et (default 20).",
+    )
     args = p.parse_args(argv)
 
     _load_env()
+    as_of = now_et()
+    if args.require_et and not within_et_window(
+        args.require_et, window_min=args.et_window_min, now=as_of
+    ):
+        print(
+            f"SKIP: ET {as_of.strftime('%H:%M')} outside "
+            f"{args.require_et} ±{args.et_window_min}m window (F-23)"
+        )
+        return 0
+
     db = default_db_path()
-    print(f"db={db}  as_of={now_et().isoformat(timespec='seconds')}")
+    print(f"db={db}  as_of={as_of.isoformat(timespec='seconds')}")
     if not os.path.exists(db):
         print("FAIL: attribution db missing")
         if args.alert_on_fail:
