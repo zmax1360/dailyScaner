@@ -105,10 +105,16 @@ def calculate_best_value(
     from cost_distribution import BLUE_SKY_TAG, is_blue_sky_breakout
     from strategy_engine import (
         calculate_expected_move,
+        is_straddle_strategy,
+        is_unknown_strategy,
         recommend_strategy,
+        strategy_outlook,
     )
     from zero_dte_gex import apply_0dte_boost_mask
     from pov_leakage import URGENCY_TAG
+
+    import logging
+    _log = logging.getLogger("best_value")
 
     cfg = SCORING
     w_lev = float(cfg["w_lev"])
@@ -124,6 +130,10 @@ def calculate_best_value(
     m_p2 = float(cfg["mult_plus2_boost"])
     m_p1_otm = float(cfg["mult_plus1_otm"])
     m_p1_itm = float(cfg["mult_plus1_itm"])
+    m_m2 = float(cfg["mult_minus2_boost"])
+    m_m1_otm = float(cfg["mult_minus1_otm"])
+    m_m1_itm = float(cfg["mult_minus1_itm"])
+    m_straddle = float(cfg.get("mult_straddle_atm", 1.3))
     m_zero = float(cfg["mult_zero_outlook"])
     m_0dte = float(cfg["mult_0dte_boost"])
     m_pov = float(cfg["mult_pov_urgency"])
@@ -319,6 +329,11 @@ def calculate_best_value(
                 ctx_iv = float(usable.median())
 
     if not optimal_strategy:
+        if daily_bias is None or not str(daily_bias).strip():
+            _log.warning(
+                "daily_bias unavailable — strategy multipliers skipped "
+                "(not treating as NEUTRAL / iron condor)"
+            )
         optimal_strategy = recommend_strategy(
             daily_bias,
             ctx_iv,
@@ -356,12 +371,15 @@ def calculate_best_value(
 
     work["Optimal_Strategy"] = optimal_strategy or ""
     work["Strategy_Tag"] = ""
+    bias_unknown = is_unknown_strategy(optimal_strategy)
+    work["_bias_unknown"] = bool(bias_unknown)
 
     # ── Strategy Engine multipliers (alter ranking) ───────────────────────────
     tags: dict[Any, list[str]] = {idx: [] for idx in work.index}
 
     if side_col is not None and strike_col is not None and spot_price > 0:
         strat = str(optimal_strategy or "")
+        outlook = strategy_outlook(strat)
 
         # 1) Dynamic strike filter vs 1SD range
         if u1_f is not None:
@@ -375,8 +393,11 @@ def calculate_best_value(
             for idx in work.index[put_lottery]:
                 tags[idx].append("⚠️ Strike Outside 1SD")
 
-        # 2) Strategy-based multipliers
-        if "(+2)" in strat:
+        # 2) Strategy-based multipliers — branch on integer outlook (F-04)
+        if bias_unknown:
+            for idx in work.index:
+                tags[idx].append("⚠️ bias unavailable")
+        elif outlook == 2:
             # Slightly OTM calls inside the 1SD upside band
             if u1_f is not None:
                 boost_mask = (
@@ -387,7 +408,7 @@ def calculate_best_value(
                 _apply(boost_mask, "plus2_boost", m_p2)
                 for idx in work.index[boost_mask]:
                     tags[idx].append("🎯 Boosted by +2 Outlook")
-        elif "(+1)" in strat:
+        elif outlook == 1:
             otm_calls = (side_col == "CALL") & (strike_col > spot_price)
             itm_atm = (side_col == "CALL") & (strike_col <= spot_price)
             _apply(otm_calls, "plus1_otm", m_p1_otm)
@@ -396,11 +417,41 @@ def calculate_best_value(
                 tags[idx].append("⚠️ Penalized by +1 Outlook")
             for idx in work.index[itm_atm]:
                 tags[idx].append("🎯 Boosted by +1 Outlook")
-        elif "(0)" in strat:
+        elif outlook == 0:
             directional = (side_col == "CALL") | (side_col == "PUT")
             _apply(directional, "zero_outlook", m_zero)
             for idx in work.index[directional]:
                 tags[idx].append("⚠️ (0) Outlook — Premium Penalty")
+        elif outlook == -2:
+            # Mirror of +2: slightly OTM puts inside the 1SD downside band
+            if l1_f is not None:
+                boost_mask = (
+                    (side_col == "PUT")
+                    & (strike_col < spot_price)
+                    & (strike_col >= l1_f)
+                )
+                _apply(boost_mask, "minus2_boost", m_m2)
+                for idx in work.index[boost_mask]:
+                    tags[idx].append("🎯 Boosted by -2 Outlook")
+        elif outlook == -1:
+            otm_puts = (side_col == "PUT") & (strike_col < spot_price)
+            itm_atm_puts = (side_col == "PUT") & (strike_col >= spot_price)
+            _apply(otm_puts, "minus1_otm", m_m1_otm)
+            _apply(itm_atm_puts, "minus1_itm", m_m1_itm)
+            for idx in work.index[otm_puts]:
+                tags[idx].append("⚠️ Penalized by -1 Outlook")
+            for idx in work.index[itm_atm_puts]:
+                tags[idx].append("🎯 Boosted by -1 Outlook")
+        elif is_straddle_strategy(strat):
+            # Vol expansion: boost near-ATM on BOTH sides (explicit, not fall-through)
+            if u1_f is not None and l1_f is not None:
+                atm_mask = (strike_col >= l1_f) & (strike_col <= u1_f)
+            else:
+                atm_mask = (strike_col - spot_price).abs() / max(spot_price, 1e-9) <= 0.03
+            _apply(atm_mask, "straddle_atm", m_straddle)
+            for idx in work.index[atm_mask]:
+                tags[idx].append("🎯 Boosted by Straddle (near-ATM)")
+        # else: unrecognised label with outlook None — no strategy multiplier
 
     # 3) 0DTE Gamma reflexivity boost (ATM on squeeze/cascade side)
     boost_side = (odte_info or {}).get("boost_side")
@@ -455,6 +506,8 @@ def calculate_best_value(
     df.loc[work.index, "_nflow"] = work["_nflow"]
     df.loc[work.index, "_multipliers"] = work["_multipliers"]
     df.loc[work.index, "delta"] = work["delta"]
+    if "_bias_unknown" in work.columns:
+        df.loc[work.index, "_bias_unknown"] = work["_bias_unknown"]
     if "dvol_suspect" in work.columns:
         df.loc[work.index, "dvol_suspect"] = work["dvol_suspect"]
     return df
@@ -599,7 +652,13 @@ def resolve_biases_for_ticker(
                 market_state = "BULLISH TAILWIND"
             else:
                 market_state = "NEUTRAL"
-    except Exception:
-        pass
+    except Exception as exc:
+        log = __import__("logging").getLogger("best_value")
+        log.warning(
+            "resolve_biases_for_ticker(%s) failed: %s: %s",
+            ticker,
+            type(exc).__name__,
+            exc,
+        )
 
     return daily_bias, market_state

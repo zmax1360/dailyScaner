@@ -10,10 +10,14 @@ Expected Move (68% / 1σ):
 
 from __future__ import annotations
 
+import logging
 import math
+import re
 from typing import Any
 
 import pandas as pd
+
+log = logging.getLogger("strategy_engine")
 
 # Strategy label constants (stable for styling / Telegram)
 STRAT_LONG_CALL = "🚀 LONG CALL (+2) - Explosive Upside"
@@ -23,6 +27,122 @@ STRAT_STRADDLE = "💥 STRADDLE/STRANGLE - Volatility Expansion"
 STRAT_BEAR_PUT_SPREAD = "📉 BEAR PUT SPREAD (-1) - High Probability Down"
 STRAT_LONG_PUT = "🩸 LONG PUT (-2) - Explosive Downside"
 STRAT_UNKNOWN = "—"
+
+# Explicit outlook tokens — never re-derive from emoji/prose in hot paths.
+# None = STRADDLE (vol expansion) or UNKNOWN bias (no strategy multiplier).
+_OUTLOOK_BY_LABEL: dict[str, int | None] = {
+    STRAT_LONG_CALL: 2,
+    STRAT_BULL_CALL_SPREAD: 1,
+    STRAT_IRON_CONDOR: 0,
+    STRAT_STRADDLE: None,
+    STRAT_BEAR_PUT_SPREAD: -1,
+    STRAT_LONG_PUT: -2,
+    STRAT_UNKNOWN: None,
+}
+
+_ALL_STRATS: tuple[str, ...] = (
+    STRAT_LONG_CALL,
+    STRAT_BULL_CALL_SPREAD,
+    STRAT_IRON_CONDOR,
+    STRAT_STRADDLE,
+    STRAT_BEAR_PUT_SPREAD,
+    STRAT_LONG_PUT,
+    STRAT_UNKNOWN,
+)
+
+
+def strategy_outlook(strat: str | None) -> int | None:
+    """
+    Integer outlook for the strategy-multiplier block.
+
+    Returns +2, +1, 0, -1, -2 for directional/neutral labels.
+    Returns None for STRADDLE (vol expansion), STRAT_UNKNOWN, or unrecognised.
+    Callers must treat STRADDLE vs UNKNOWN via is_straddle_strategy().
+    """
+    if strat is None:
+        return None
+    s = str(strat).strip()
+    if not s or s == STRAT_UNKNOWN:
+        return None
+    if s in _OUTLOOK_BY_LABEL:
+        return _OUTLOOK_BY_LABEL[s]
+    # Abbreviated / test labels like "(+1) BULL" — parse the token only
+    m = re.search(r"\(([+-]?\d+)\)", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def is_straddle_strategy(strat: str | None) -> bool:
+    """True for the volatility-expansion outlook (explicit branch, not fall-through)."""
+    if strat is None:
+        return False
+    s = str(strat).strip()
+    return s == STRAT_STRADDLE or s.startswith("💥")
+
+
+def is_unknown_strategy(strat: str | None) -> bool:
+    """True when bias was unavailable — no strategy multiplier should apply."""
+    if strat is None:
+        return True
+    s = str(strat).strip()
+    return s == STRAT_UNKNOWN or s == "" or s == "—"
+
+
+def recommend_strategy(
+    daily_bias: str | None,
+    iv: float | None,
+    profited_shares_pct: float | None,
+    has_catalyst: bool,
+    *,
+    spot_below_support: bool = False,
+) -> str:
+    """
+    5 Directions strategy matrix. Returns a display label (unchanged strings).
+
+    Outlook priority:
+      +2  HEAVY BULLISH + Blue Sky (profited ≥ 95%)
+      +1  HEAVY BULLISH (otherwise)
+      -2  HEAVY BEARISH + spot below VWAP/cost support
+      -1  HEAVY BEARISH (otherwise)
+      V   NEUTRAL + catalyst — STRADDLE
+      0   NEUTRAL, no catalyst — IRON CONDOR
+      ?   daily_bias is None / blank — STRAT_UNKNOWN (not NEUTRAL)
+    """
+    # Distinguish unknown bias from genuine NEUTRAL (F-04)
+    if daily_bias is None or not str(daily_bias).strip():
+        return STRAT_UNKNOWN
+
+    bias = str(daily_bias).strip().upper()
+    try:
+        prof = float(profited_shares_pct) if profited_shares_pct is not None else None
+    except (TypeError, ValueError):
+        prof = None
+
+    # Optional IV context (normalized) — reserved for future filters / logging
+    _ = iv
+
+    if bias == "HEAVY BULLISH":
+        if prof is not None and prof >= 95.0:
+            return STRAT_LONG_CALL
+        return STRAT_BULL_CALL_SPREAD
+
+    if bias == "HEAVY BEARISH":
+        if spot_below_support:
+            return STRAT_LONG_PUT
+        return STRAT_BEAR_PUT_SPREAD
+
+    if bias == "NEUTRAL":
+        if has_catalyst:
+            return STRAT_STRADDLE
+        return STRAT_IRON_CONDOR
+
+    # Unrecognised bias string — treat as unknown, not iron condor
+    log.warning("recommend_strategy: unrecognised daily_bias=%r → STRAT_UNKNOWN", daily_bias)
+    return STRAT_UNKNOWN
 
 
 def calculate_expected_move(
@@ -76,50 +196,6 @@ def calculate_expected_move(
         "IV": round(iv, 6),
         "DTE": dte_f,
     }
-
-
-def recommend_strategy(
-    daily_bias: str | None,
-    iv: float | None,
-    profited_shares_pct: float | None,
-    has_catalyst: bool,
-    *,
-    spot_below_support: bool = False,
-) -> str:
-    """
-    5 Directions strategy matrix.
-
-    Outlook priority:
-      +2  HEAVY BULLISH + Blue Sky (profited ≥ 95%)
-      +1  HEAVY BULLISH (otherwise)
-      -2  HEAVY BEARISH + spot below VWAP/cost support
-      -1  HEAVY BEARISH (otherwise)
-      V   NEUTRAL + catalyst (earnings / news) — IV available for context
-      0   NEUTRAL, no catalyst
-    """
-    bias = (daily_bias or "NEUTRAL").strip().upper()
-    try:
-        prof = float(profited_shares_pct) if profited_shares_pct is not None else None
-    except (TypeError, ValueError):
-        prof = None
-
-    # Optional IV context (normalized) — reserved for future filters / logging
-    _ = iv
-
-    if bias == "HEAVY BULLISH":
-        if prof is not None and prof >= 95.0:
-            return STRAT_LONG_CALL
-        return STRAT_BULL_CALL_SPREAD
-
-    if bias == "HEAVY BEARISH":
-        if spot_below_support:
-            return STRAT_LONG_PUT
-        return STRAT_BEAR_PUT_SPREAD
-
-    # NEUTRAL / other
-    if has_catalyst:
-        return STRAT_STRADDLE
-    return STRAT_IRON_CONDOR
 
 
 def resolve_has_catalyst(

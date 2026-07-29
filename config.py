@@ -34,6 +34,12 @@ SCORING: dict[str, float | int] = {
     "mult_plus1_otm": 0.5,
     "mult_plus1_itm": 1.3,
     "mult_zero_outlook": 0.3,
+    # Bearish mirrors of plus2 / plus1 (F-04) — do not retune bullish values
+    "mult_minus2_boost": 1.5,
+    "mult_minus1_otm": 0.5,
+    "mult_minus1_itm": 1.3,
+    # Vol-expansion (straddle): boost near-ATM on both sides
+    "mult_straddle_atm": 1.3,
     # 0DTE gamma reflexivity
     "mult_0dte_boost": 1.20,
     # POV institutional urgency

@@ -200,11 +200,6 @@ def test_two_row_universe_produces_degenerate_scores():
 @pytest.mark.parametrize("bias,penalised", [
     ("HEAVY BEARISH", "CALL"), ("HEAVY BULLISH", "PUT"),
 ])
-@pytest.mark.xfail(strict=True, reason="DEFECT: daily_bias feeds recommend_strategy, "
-                                       "which swaps the strategy multiplier. "
-                                       "bias=None resolves to '(0)' and crushes ALL "
-                                       "directional contracts x0.3, so a HEAVY BEARISH "
-                                       "day scores CALLs HIGHER than an unknown-bias day.")
 def test_daily_bias_penalises_the_opposing_side(bias, penalised):
     rows = [contract(255, 3.0, side="CALL"), contract(245, 3.0, side="PUT")]
     neutral = score(rows)
@@ -213,15 +208,12 @@ def test_daily_bias_penalises_the_opposing_side(bias, penalised):
     assert biased[k] < neutral[k]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: the strategy-multiplier block only "
-                                       "branches on '(+2)', '(+1)' and '(0)'. "
-                                       "'(-1)' and '(-2)' have no branch, so bearish "
-                                       "regimes get no strategy adjustment at all.")
 def test_bearish_strategy_boosts_puts_the_way_bullish_boosts_calls():
-    rows = [contract(255, 3.0, side="CALL"), contract(245, 3.0, side="PUT")]
+    # ITM on each side so (+1)/(-1) apply the *boost* leg (1.3), not the OTM penalty
+    rows = [contract(245, 3.0, side="CALL"), contract(255, 3.0, side="PUT")]
     bull = score(rows, optimal_strategy="(+1) BULL")
     bear = score(rows, optimal_strategy="(-1) BEAR")
-    assert bear[245.0] > bull[245.0]
+    assert bear[255.0] > bull[255.0]
 
 
 def test_multipliers_compound_multiplicatively():
