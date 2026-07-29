@@ -47,6 +47,7 @@ def _log_scan_attribution(
     session: dict | None,
     run_kind: str = "intraday",
     eod_vol_lookup: dict | None = None,
+    volume_is_session_scoped: bool = False,
 ) -> None:
     """
     Score + append attribution rows. Fail-soft: never abort a scan.
@@ -79,6 +80,7 @@ def _log_scan_attribution(
             market_state=market_state,
             news_bias=news_bias,
             eod_vol_lookup=eod_vol_lookup,
+            volume_is_session_scoped=volume_is_session_scoped,
         )
 
         chain = pd.concat(
@@ -968,12 +970,19 @@ def run(source=None):
         find_prior_eod_archive,
         flag_stale_vs_eod,
         majority_stale_abort,
+        rollover_detectors_active,
         stale_check_active,
     )
     from zoneinfo import ZoneInfo as _ZI
     _ET_now = datetime.now(_ZI("America/New_York"))
     _today_et = _ET_now.date()
-    if prev_result:
+    _session_scoped = bool(getattr(source, "volume_is_session_scoped", False))
+    if not rollover_detectors_active(_session_scoped):
+        print(
+            f"{C.GRAY}  Rollover/stale-volume detectors DORMANT "
+            f"(source={getattr(source, 'name', '?')} is session-scoped).{C.RESET}"
+        )
+    if prev_result and rollover_detectors_active(_session_scoped):
         _prev_data, _prev_file = prev_result
         _prev_day = archive_session_date(_prev_data)
         if _prev_day == _today_et:
@@ -1018,7 +1027,10 @@ def run(source=None):
 
     # ?? Stale volume vs prior EOD (CURSOR_STALE_VOLUME_FIX) ????????????????
     _eod_lookup = None
-    _eod_arch, _eod_reason = find_prior_eod_archive(TICKER, "archive", now_et=_ET_now)
+    if not rollover_detectors_active(_session_scoped):
+        _eod_arch, _eod_reason = None, "dormant_session_scoped"
+    else:
+        _eod_arch, _eod_reason = find_prior_eod_archive(TICKER, "archive", now_et=_ET_now)
     if _eod_arch is None:
         print(
             f"{C.YELLOW}WARN: EOD volume reference unavailable ({_eod_reason}); "
@@ -1126,6 +1138,7 @@ def run(source=None):
         session=session,
         run_kind="eod" if IS_EOD else "intraday",
         eod_vol_lookup=_eod_lookup,
+        volume_is_session_scoped=_session_scoped,
     )
 
     # capture report as plain text

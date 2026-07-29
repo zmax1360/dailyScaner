@@ -164,6 +164,14 @@ def chain_volume_rolled_over(
         return False
 
 
+def rollover_detectors_active(volume_is_session_scoped: bool) -> bool:
+    """
+    When the feed's volume resets each session (Massive), Yahoo-style
+    rollover / EOD-stale detectors are DORMANT — not deleted.
+    """
+    return not bool(volume_is_session_scoped)
+
+
 def archive_session_date(archive: Mapping[str, Any] | None) -> date | None:
     """ET calendar date of an archive payload (from timestamp)."""
     if not archive:

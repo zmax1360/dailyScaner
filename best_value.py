@@ -33,6 +33,7 @@ def attach_dvol(
     eod_vol_lookup: dict | None = None,
     now_et: datetime | None = None,
     cfg: dict | None = None,
+    volume_is_session_scoped: bool = False,
 ) -> pd.DataFrame:
     """
     Attach ΔVol vs previous archive top-30 snapshot.
@@ -45,10 +46,14 @@ def attach_dvol(
       1. Decrease vs prior scan — contract already rolled (Task A)
       2. EOD-match — volume still >= ratio * prior-day EOD (not yet rolled)
 
+    When ``volume_is_session_scoped`` is True (e.g. Massive), both detectors
+    are dormant — session volume is already clean.
+
     stale_volume=True only for detector (2). Counts logged via attrs on the frame.
     """
     from chain_quality import (
         is_volume_stale_vs_eod,
+        rollover_detectors_active,
         stale_check_active,
     )
     from config import SCORING
@@ -59,6 +64,14 @@ def attach_dvol(
         df["dvol_suspect"] = False
     if "stale_volume" not in df.columns:
         df["stale_volume"] = False
+
+    if not rollover_detectors_active(volume_is_session_scoped):
+        if "dVol" not in df.columns:
+            df["dVol"] = float("nan")
+        df.attrs["n_decrease_suspect"] = 0
+        df.attrs["n_eod_stale"] = 0
+        df.attrs["rollover_detectors"] = "dormant_session_scoped"
+        return df
 
     if not vol_prev and not eod_vol_lookup:
         return df
@@ -572,6 +585,7 @@ def build_best_value_df(
     profited_shares_pct: float | None = None,
     *,
     eod_vol_lookup: dict | None = None,
+    volume_is_session_scoped: bool = False,
     upper_1sd: float | None = None,
     lower_1sd: float | None = None,
     optimal_strategy: str | None = None,
@@ -617,6 +631,7 @@ def build_best_value_df(
         vol_prev,
         eod_vol_lookup=eod_vol_lookup,
         now_et=now_et,
+        volume_is_session_scoped=volume_is_session_scoped,
     )
     return calculate_best_value(
         df,
