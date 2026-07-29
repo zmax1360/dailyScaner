@@ -33,8 +33,14 @@ def attach_dvol(df: pd.DataFrame, vol_prev: dict | None) -> pd.DataFrame:
     Contracts missing from the previous top-30 get dVol = NaN (unknown),
     NOT volume - 0. Treating absence as prev=0 made new entrants look like
     full-volume surges and systematically win BEST VALUE (phantom ΔVol).
+
+    Contract-level session rollover (Task A): if current volume < prior volume
+    for the same (side, strike, expiry), set dVol = NaN and dvol_suspect=True.
+    Never take abs() of a negative dVol — that is handled at the flow leg.
     """
     df = df.copy()
+    if "dvol_suspect" not in df.columns:
+        df["dvol_suspect"] = False
     if not vol_prev:
         return df
 
@@ -44,13 +50,26 @@ def attach_dvol(df: pd.DataFrame, vol_prev: dict | None) -> pd.DataFrame:
             k = (side, float(c.get("strike") or 0), c.get("expiry", ""))
             prev_lookup[k] = int(c.get("volume") or 0)
 
-    def _delta(r: pd.Series) -> float:
+    dvols: list[float] = []
+    suspects: list[bool] = []
+    for _, r in df.iterrows():
         k = (r["side"], float(r["strike"]), r["expiry"])
         if k not in prev_lookup:
-            return float("nan")
-        return float(r["volume"]) - float(prev_lookup[k])
+            dvols.append(float("nan"))
+            suspects.append(False)
+            continue
+        prev_v = float(prev_lookup[k])
+        curr_v = float(r["volume"])
+        if curr_v < prev_v:
+            # Yahoo rolled prior-session cumulative volume off this contract
+            dvols.append(float("nan"))
+            suspects.append(True)
+        else:
+            dvols.append(curr_v - prev_v)
+            suspects.append(False)
 
-    df["dVol"] = df.apply(_delta, axis=1)
+    df["dVol"] = dvols
+    df["dvol_suspect"] = suspects
     return df
 
 
@@ -155,18 +174,67 @@ def calculate_best_value(
     if work.empty:
         return df
 
-    if "delta" in work.columns:
-        delta_col = work["delta"].fillna(0.5)
-    else:
-        delta_col = 0.5
-    lev = (delta_col * spot_price) / work["last"].replace(0, float("nan"))
-    work["_lev"] = lev.fillna(0.0)
+    from chain_quality import iv_degraded_for_1sd
+    from greeks import bs_delta
+
+    # Emit / refresh delta via Black-Scholes (never default to 0.5)
+    r_free = float(cfg.get("risk_free_rate", 0.045))
+    close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    def _t_days(r: pd.Series) -> float:
+        """Year-fraction input for BS. dte>0 as calendar days; live 0DTE uses
+        time-to-16:00 ET so T>0 (bs_delta rejects dte<=0)."""
+        dte = r.get("dte") if "dte" in r.index else r.get("DTE")
+        try:
+            d = float(dte) if dte is not None else float("nan")
+        except (TypeError, ValueError):
+            d = float("nan")
+        if d == d and d > 0:
+            return d
+        exp = r.get("expiry") if "expiry" in r.index else r.get("Expiry")
+        try:
+            exp_d = pd.Timestamp(exp).date() if exp else None
+        except Exception:
+            exp_d = None
+        if exp_d == today_et and not after_close:
+            secs = max((close_et - now_et).total_seconds(), 60.0)
+            return secs / (365.25 * 24.0 * 3600.0)
+        return 0.0
+
+    deltas: list[float] = []
+    for _, r in work.iterrows():
+        side = r.get("side") or r.get("Side") or ""
+        strike = r.get("strike") if "strike" in r.index else r.get("Strike")
+        iv = r.get("iv") if "iv" in r.index else r.get("impliedVolatility")
+        try:
+            d = bs_delta(
+                str(side),
+                float(spot_price),
+                float(strike or 0),
+                _t_days(r),
+                float(iv if iv is not None else 0),
+                r=r_free,
+            )
+        except (TypeError, ValueError):
+            d = None
+        deltas.append(float("nan") if d is None else float(d))
+    work["delta"] = deltas
+
+    # Leverage: exclude null-delta rows from the leg; renormalise over survivors.
+    # Do NOT substitute 0.5 / median / any default (F-01).
+    work["_lev"] = float("nan")
+    has_delta = work["delta"].notna()
+    if has_delta.any():
+        lev = (
+            work.loc[has_delta, "delta"] * spot_price
+        ) / work.loc[has_delta, "last"].replace(0, float("nan"))
+        work.loc[has_delta, "_lev"] = lev
 
     voi_raw = work["volume"] / work["openInterest"].clip(lower=1)
     if "dVol" in work.columns:
-        # Known ΔVol → |ΔVol|; new top-30 entrants (NaN) → neutral ×1
-        # so they are not rewarded with phantom full-volume surges.
-        d_vol = work["dVol"].abs().fillna(1.0)
+        # Direction of flow is signal — do NOT abs(). New entrants (NaN) → ×1
+        # (F-05 fillna(1.0) left unchanged by Task A).
+        d_vol = work["dVol"].fillna(1.0)
     else:
         d_vol = work["volume"]
     work["_flow"] = (voi_raw * d_vol).fillna(0.0).clip(lower=0)
@@ -177,9 +245,16 @@ def calculate_best_value(
             return pd.Series(0.5, index=s.index)
         return (s - mn) / (mx - mn)
 
-    work["_nlev"] = _minmax(work["_lev"])
+    work["_nlev"] = float("nan")
     work["_nflow"] = _minmax(work["_flow"])
-    work["Value_Score"] = work["_nlev"] * w_lev + work["_nflow"] * w_flow
+    if has_delta.any():
+        work.loc[has_delta, "_nlev"] = _minmax(work.loc[has_delta, "_lev"].astype(float))
+    # Only rows with a real delta participate in Value_Score
+    work["Value_Score"] = float("nan")
+    work.loc[has_delta, "Value_Score"] = (
+        work.loc[has_delta, "_nlev"] * w_lev
+        + work.loc[has_delta, "_nflow"] * w_flow
+    )
 
     # Per-row multiplier breakdown (product must reproduce Value_Score)
     mults: dict[Any, dict[str, float]] = {
@@ -234,10 +309,14 @@ def calculate_best_value(
 
     # ── Resolve Optimal Strategy + 1SD bounds ─────────────────────────────────
     ctx_iv = None
+    iv_degraded = True
     if "iv" in work.columns:
-        ivs = pd.to_numeric(work["iv"], errors="coerce").dropna()
-        if not ivs.empty:
-            ctx_iv = float(ivs.median())
+        ivs = pd.to_numeric(work["iv"], errors="coerce")
+        iv_degraded = iv_degraded_for_1sd(ivs.tolist())
+        if not iv_degraded:
+            usable = ivs[ivs >= float(cfg.get("min_iv_usable", 0.01))]
+            if not usable.empty:
+                ctx_iv = float(usable.median())
 
     if not optimal_strategy:
         optimal_strategy = recommend_strategy(
@@ -250,7 +329,10 @@ def calculate_best_value(
 
     u1 = upper_1sd
     l1 = lower_1sd
-    if (u1 is None or l1 is None) and ctx_iv is not None and spot_price > 0:
+    # Task B: when IV is degraded chain-wide, do not compute 1SD bands at all
+    if iv_degraded:
+        u1, l1 = None, None
+    elif (u1 is None or l1 is None) and ctx_iv is not None and spot_price > 0:
         dte_med = None
         if "dte" in work.columns:
             dtes = pd.to_numeric(work["dte"], errors="coerce").dropna()
@@ -357,11 +439,13 @@ def calculate_best_value(
 
     work["Value_Score"] = work["Value_Score"].round(4)
     work["Status"] = ""
-    best_idx = work["Value_Score"].idxmax()
-    status = "⭐ BEST VALUE"
-    if is_blue_sky_breakout(profited_shares_pct, daily_bias):
-        status = f"{status} · {BLUE_SKY_TAG}"
-    work.at[best_idx, "Status"] = status
+    scored = work["Value_Score"].dropna()
+    if not scored.empty:
+        best_idx = scored.idxmax()
+        status = "⭐ BEST VALUE"
+        if is_blue_sky_breakout(profited_shares_pct, daily_bias):
+            status = f"{status} · {BLUE_SKY_TAG}"
+        work.at[best_idx, "Status"] = status
 
     df.loc[work.index, "Value_Score"] = work["Value_Score"]
     df.loc[work.index, "Status"] = work["Status"]
@@ -370,6 +454,9 @@ def calculate_best_value(
     df.loc[work.index, "_nlev"] = work["_nlev"]
     df.loc[work.index, "_nflow"] = work["_nflow"]
     df.loc[work.index, "_multipliers"] = work["_multipliers"]
+    df.loc[work.index, "delta"] = work["delta"]
+    if "dvol_suspect" in work.columns:
+        df.loc[work.index, "dvol_suspect"] = work["dvol_suspect"]
     return df
 
 
@@ -394,20 +481,30 @@ def build_best_value_df(
     pov_info: dict | None = None,
 ) -> pd.DataFrame:
     """Build flat contracts DF from archive volume blocks, then score."""
+    from greeks import bs_delta
+
     rows: list[dict[str, Any]] = []
+    r_free = float(SCORING.get("risk_free_rate", 0.045))
     for side, key in [("CALL", "top_calls"), ("PUT", "top_puts")]:
         for c in (vol_curr.get(key) or []):
             vol_i = int(c.get("volume") or 0)
             oi_i = max(int(c.get("openInterest") or 0), 1)
+            dte_i = int(c.get("dte") or 0)
+            iv_f = float(c.get("impliedVolatility") or 0)
+            strike_f = float(c.get("strike") or 0)
+            d = bs_delta(side, float(spot), strike_f, dte_i, iv_f, r=r_free)
             rows.append({
                 "side": side,
-                "strike": float(c.get("strike") or 0),
+                "strike": strike_f,
                 "expiry": c.get("expiry", ""),
-                "dte": int(c.get("dte") or 0),
+                "dte": dte_i,
                 "last": _contract_price(c),
+                "bid": float(c.get("bid") or 0),
+                "ask": float(c.get("ask") or 0),
                 "volume": vol_i,
                 "openInterest": oi_i,
-                "iv": float(c.get("impliedVolatility") or 0),
+                "iv": iv_f,
+                "delta": float("nan") if d is None else float(d),
             })
 
     if not rows:

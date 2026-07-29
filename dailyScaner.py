@@ -979,6 +979,58 @@ def run():
     pc0 = round(total_pv0 / total_cv0, 3) if total_cv0 > 0 else 0
     direction0, _, _ = direction_score(tf_data, pc0)
 
+    # ── Task A: chain-level session rollover guard ───────────────────────────
+    from chain_quality import (
+        archive_session_date,
+        chain_fails_quality_gate,
+        chain_volume_rolled_over,
+    )
+    from zoneinfo import ZoneInfo as _ZI
+    _today_et = datetime.now(_ZI("America/New_York")).date()
+    if prev_result:
+        _prev_data, _prev_file = prev_result
+        _prev_day = archive_session_date(_prev_data)
+        if _prev_day == _today_et:
+            _pv = (_prev_data or {}).get("volume") or {}
+            _pc = int(_pv.get("total_call_vol") or 0)
+            _pp = int(_pv.get("total_put_vol") or 0)
+            if chain_volume_rolled_over(_pc, _pp, total_cv0, total_pv0):
+                print(
+                    f"{C.YELLOW}ABORT: chain volume rollover detected "
+                    f"(same ET session {_today_et}). "
+                    f"prev call/put={_pc:,}/{_pp:,}  "
+                    f"curr call/put={total_cv0:,}/{total_pv0:,}. "
+                    f"No archive, no attribution.{C.RESET}"
+                )
+                return
+
+    # Build a provisional volume block for the quality gate (top-30 shape)
+    _vol_gate = {
+        "top_calls": calls_all[calls_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+        "top_puts": puts_all[puts_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+        "total_call_vol": total_cv0,
+        "total_put_vol": total_pv0,
+    }
+    _q_fail, _q_detail = chain_fails_quality_gate(_vol_gate)
+    if _q_fail:
+        _cs = _q_detail.get("calls") or {}
+        print(
+            f"{C.YELLOW}ABORT: chain quality gate failed "
+            f"(unusable {_cs.get('unusable', 0)}/{_cs.get('total', 0)} "
+            f"top calls, frac={_q_detail.get('frac_unusable', 0):.0%}; "
+            f"zero_bid_ask={_cs.get('zero_bid_ask', 0)}, "
+            f"low_iv={_cs.get('low_iv', 0)}). "
+            f"No archive, no attribution.{C.RESET}"
+        )
+        return
+
+
     # -- Session block: open, prev_close, day_high, day_low ------------------
     # Derived from frames["1D"] - already fetched, no extra network call.
     session = None

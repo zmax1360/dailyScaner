@@ -100,10 +100,16 @@ def test_golden_master_matches_expected():
     assert not diffs, "golden divergence:\n" + "\n".join(diffs[:40])
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="engine v2 (CURSOR_DELTA_TASKS C): BS delta changes ranking vs "
+           "pre-config commit 6a113f8 — intentional, do not revert",
+)
 def test_pre_refactor_engine_matches_current(tmp_path):
     """
     Load best_value.py from pre-config commit 6a113f8 and compare scores.
-    If they differ, this test fails with the field-level report (finding).
+    Engine v2 (real delta) is expected to diverge; xfail until a new baseline
+    commit is chosen for regression pinning.
     """
     import subprocess
 

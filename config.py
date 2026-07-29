@@ -7,7 +7,10 @@ config_hash(SCORING) so attribution runs stay segmentable.
 
 from __future__ import annotations
 
-# Fingerprint of "engine v1" — hashed into every attribution run.
+
+# Fingerprint of the scoring engine — hashed into every attribution run.
+# Pre-delta / pre-quality-gate logs are engine v1; runs after this dict
+# changes are engine v2 and must not be pooled in analysis.
 SCORING: dict[str, float | int] = {
     # Base blend
     "w_lev": 0.4,
@@ -35,4 +38,11 @@ SCORING: dict[str, float | int] = {
     "mult_0dte_boost": 1.20,
     # POV institutional urgency
     "mult_pov_urgency": 1.25,
+    # Risk-free rate for Black-Scholes delta (do not fetch per-scan).
+    # Delta is insensitive to r at the short maturities we score.
+    "risk_free_rate": 0.045,
+    # Per-contract quality gate (Task B) — covered by config_hash
+    "min_iv_usable": 0.01,
+    "quality_top_n": 30,
+    "max_unusable_frac": 0.20,
 }

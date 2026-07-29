@@ -430,9 +430,9 @@ def test_flag_state_columns_populated(tmp_path):
 
 def test_missing_source_column_writes_null(tmp_path):
     db = str(tmp_path / "missing_iv.db")
-    chain = _sample_chain().drop(columns=["iv"])
+    chain = _sample_chain()
     scored = calculate_best_value(chain, spot_price=250.0, now_et=NOW)
-    # Ensure iv really absent on scored frame too
+    # Drop iv after scoring so log_run cannot read it (null write path)
     if "iv" in scored.columns:
         scored = scored.drop(columns=["iv"])
     log_run(
@@ -443,6 +443,7 @@ def test_missing_source_column_writes_null(tmp_path):
         row = c.execute(
             "SELECT iv FROM flags WHERE is_control=0 LIMIT 1"
         ).fetchone()
+    assert row is not None
     assert row["iv"] is None
     assert row["iv"] != 0.0
 

@@ -84,36 +84,30 @@ def test_expired_contracts_always_dropped():
     assert pd.isna(s[250.0])
 
 
-# ── 2. The leverage term is dead code ────────────────────────────────────────
+# ── 2. The leverage term (Black-Scholes delta) ───────────────────────────────
 
-def test_delta_column_is_never_produced_by_the_pipeline():
-    """
-    DEFECT (Critical): no module in the repo computes an option delta.
-    build_best_value_df emits side/strike/expiry/dte/last/volume/openInterest/iv.
-    calculate_best_value therefore always falls through to delta = 0.5,
-    and 40% of Value_Score collapses to `0.5 * spot / price` — i.e. pure
-    inverse price. "Leverage" is a cheapness proxy, not a greek.
-    """
+def test_delta_column_is_produced_by_the_pipeline():
+    """Task C: build_best_value_df emits a real BS delta (never hardcoded 0.5)."""
     df = build_best_value_df(
         {"top_calls": [{"strike": 250, "lastPrice": 5.0, "volume": 5000,
                         "openInterest": 5000, "expiry": "2026-08-21",
-                        "dte": 28, "impliedVolatility": 0.3}],
+                        "dte": 28, "impliedVolatility": 0.3,
+                        "bid": 4.9, "ask": 5.1}],
          "top_puts": []},
         spot=SPOT, vol_prev=None, now_et=NOW,
     )
-    assert "delta" not in df.columns, "delta now exists — re-enable the greek path"
+    assert "delta" in df.columns
+    assert pd.notna(df["delta"].iloc[0])
+    assert 0.0 < float(df["delta"].iloc[0]) < 1.0
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: leverage term = 1/price, so the "
-                                       "cheapest contract always wins that leg")
 def test_leverage_leg_should_not_be_monotonic_in_price_alone():
     """
-    Two CALLs, identical flow, both inside the expected-move band. The 0.60
-    contract is 5x further OTM but scores higher purely because it is cheap.
-    A real leverage term (delta * spot / price) would narrow this gap.
+    Two CALLs, identical flow. Far-OTM cheap contract used to beat near-ATM
+    under delta=0.5 (pure 1/price). With BS delta the near-ATM must not lose.
     """
-    s = score([contract(252.5, 3.00), contract(262.5, 0.60)])
-    assert s[252.5] >= s[262.5]
+    s = score([contract(252.5, 3.00), contract(280.0, 0.60)])
+    assert s[252.5] >= s[280.0]
 
 
 # ── 3. ΔVol: the phantom-flow fix over-corrected ─────────────────────────────
@@ -145,9 +139,6 @@ def test_new_entrant_is_not_systematically_penalised():
     assert s[255.0] >= s[250.0]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: dVol.abs() scores a 5,000-lot "
-                                       "liquidation identically to a 5,000-lot "
-                                       "accumulation")
 def test_volume_collapse_scores_lower_than_volume_surge():
     """Identical volume and OI; only the SIGN of dVol differs."""
     df = pd.DataFrame([contract(250, 5.0, vol=5000), contract(255, 5.0, vol=5000)])
@@ -155,7 +146,13 @@ def test_volume_collapse_scores_lower_than_volume_surge():
         {"strike": 250.0, "expiry": "2026-08-21", "volume": 1000},   # +4000 build
         {"strike": 255.0, "expiry": "2026-08-21", "volume": 9000},   # -4000 unwind
     ], "top_puts": []}
-    out = calculate_best_value(attach_dvol(df, prev), spot_price=SPOT, now_et=NOW)
+    # Task A: curr < prev is treated as rollover (dVol=NaN), not signed unwind.
+    # Inject signed dVol after attach to pin the no-abs() scoring behaviour.
+    attached = attach_dvol(df, prev)
+    attached.loc[attached["strike"] == 250.0, "dVol"] = 4000.0
+    attached.loc[attached["strike"] == 255.0, "dVol"] = -4000.0
+    attached["dvol_suspect"] = False
+    out = calculate_best_value(attached, spot_price=SPOT, now_et=NOW)
     s = out.set_index("strike")["Value_Score"]
     assert s[250.0] > s[255.0]
 
