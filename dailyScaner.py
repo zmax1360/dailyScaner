@@ -4,7 +4,6 @@ AAPL Options Scanner - Volume-First Framework
 Ali's trading system | June 2026
 """
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, time as dtime
@@ -91,7 +90,7 @@ def _log_scan_attribution(
         )
         exp = modal_flagged_expiry(bv_df)
         if not exp and "expiry" in chain.columns and not chain.empty:
-            # No scored rows — still log ATM control on nearest chain expiry
+            # No scored rows  still log ATM control on nearest chain expiry
             exp = str(chain["expiry"].astype(str).mode().iloc[0])
         ctrl = (
             build_control_rows(chain, spot, exp)
@@ -349,50 +348,56 @@ def opening_range(df5m, df15m, spot, now_et=None):
     return result
 
 # ?? FETCH ?????????????????????????????????????????????????????????????????????
-def _yf_retry(fn, *, label: str, attempts: int = 5, base_sleep: float = 3.0):
-    """Call Yahoo via yfinance with backoff on rate limits / transient errors."""
-    last_err = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return fn()
-        except Exception as e:
-            last_err = e
-            name = type(e).__name__
-            rate_limited = (
-                name == "YFRateLimitError"
-                or "Too Many Requests" in str(e)
-                or "Rate limited" in str(e)
-            )
-            if attempt >= attempts:
-                break
-            wait = base_sleep * (2 ** (attempt - 1))
-            if rate_limited:
-                wait = max(wait, 15.0 * attempt)
-            print(
-                f"  Yahoo {label} retry {attempt}/{attempts} "
-                f"after {wait:.0f}s ({name})",
-                flush=True,
-            )
-            time.sleep(wait)
-    raise last_err
+def _clean_history(df):
+    # Guard: empty DataFrame has RangeIndex, not DatetimeIndex
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    if hasattr(df.index, "tz"):
+        df = df.copy()
+        df.index = df.index.tz_localize(None) if df.index.tz else df.index
+    return df
 
 
-def fetch_data():
-    t = yf.Ticker(TICKER)
-
-    def clean(df):
-        # Guard: empty DataFrame has RangeIndex, not DatetimeIndex
-        if df is None or df.empty:
-            return df if df is not None else pd.DataFrame()
-        if hasattr(df.index, "tz"):
-            df.index = df.index.tz_localize(None) if df.index.tz else df.index
-        return df
-
-    df5m = clean(
-        _yf_retry(
-            lambda: t.history(period="5d", interval="5m"),
-            label="5m history",
+def _legacy_option_leg(chain: pd.DataFrame, side: str) -> pd.DataFrame:
+    """Map CHAIN_COLUMNS rows back to the scanner's legacy Yahoo-shaped leg."""
+    sub = chain.loc[chain["side"] == side].copy()
+    if sub.empty:
+        return pd.DataFrame(
+            columns=[
+                "strike", "lastPrice", "volume", "openInterest",
+                "impliedVolatility", "bid", "ask", "expiry", "dte",
+            ]
         )
+    out = pd.DataFrame({
+        "strike": sub["strike"].astype(float),
+        "lastPrice": sub["last"].astype(float),
+        "volume": sub["volume"].fillna(0).astype(float),
+        "openInterest": sub["openInterest"].fillna(0).astype(float),
+        "impliedVolatility": sub["iv"],
+        "bid": sub["bid"].fillna(0).astype(float),
+        "ask": sub["ask"].fillna(0).astype(float),
+        "expiry": sub["expiry"].astype(str),
+        "dte": sub["dte"],
+    })
+    return out.sort_values("volume", ascending=False).reset_index(drop=True)
+
+
+def fetch_data(source=None):
+    """
+    Fetch history + chain via MarketDataSource.
+
+    ``source`` is constructed at the run() entry point when omitted  never at
+    import time.
+    """
+    from sources import MarketDataSource, get_source
+
+    if source is None:
+        source = get_source(str(SCORING.get("market_data_source", "yahoo")))
+    if not isinstance(source, MarketDataSource):
+        raise TypeError(f"source must implement MarketDataSource, got {type(source)!r}")
+
+    df5m = _clean_history(
+        source.fetch_history(TICKER, interval="5m", period="5d")
     )
 
     # Early exit: if 5-minute data is empty the ticker is an index or delisted
@@ -403,88 +408,56 @@ def fetch_data():
             "supported - the scanner requires a standard options chain."
         )
 
-    df10m = clean(df5m.resample("10min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
-    df15m = clean(
-        _yf_retry(
-            lambda: t.history(period="5d", interval="15m"),
-            label="15m history",
-        )
+    df10m = _clean_history(
+        df5m.resample("10min")
+        .agg({"Open": "first", "High": "max", "Low": "min",
+              "Close": "last", "Volume": "sum"})
+        .dropna()
     )
-    df45m = clean(df5m.resample("45min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
-    df1h = clean(
-        _yf_retry(
-            lambda: t.history(period="30d", interval="1h"),
-            label="1h history",
-        )
+    df15m = _clean_history(
+        source.fetch_history(TICKER, interval="15m", period="5d")
     )
-    df4h = clean(df1h.resample("4h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
-    dfd = clean(
-        _yf_retry(
-            lambda: t.history(period="6mo", interval="1d"),
-            label="1d history",
-        )
+    df45m = _clean_history(
+        df5m.resample("45min")
+        .agg({"Open": "first", "High": "max", "Low": "min",
+              "Close": "last", "Volume": "sum"})
+        .dropna()
+    )
+    df1h = _clean_history(
+        source.fetch_history(TICKER, interval="1h", period="30d")
+    )
+    df4h = _clean_history(
+        df1h.resample("4h")
+        .agg({"Open": "first", "High": "max", "Low": "min",
+              "Close": "last", "Volume": "sum"})
+        .dropna()
+    )
+    dfd = _clean_history(
+        source.fetch_history(TICKER, interval="1d", period="6mo")
     )
 
-    frames = {"5M": df5m, "10M": df10m, "15M": df15m, "45M": df45m, "1H": df1h, "4H": df4h, "1D": dfd}
-    spot   = round(float(dfd["Close"].iloc[-1]), 2)
+    frames = {
+        "5M": df5m, "10M": df10m, "15M": df15m, "45M": df45m,
+        "1H": df1h, "4H": df4h, "1D": dfd,
+    }
+    spot = source.fetch_spot(TICKER)
+    if spot is None or spot <= 0:
+        if dfd.empty or "Close" not in dfd.columns:
+            raise ValueError(f"{TICKER} returned no usable spot price.")
+        spot = round(float(dfd["Close"].iloc[-1]), 2)
+    else:
+        spot = round(float(spot), 2)
 
-    # ALL expiries - no filter
-    # Yahoo sometimes returns HTML/rate-limit pages instead of JSON / YFRateLimitError
-    try:
-        expiries = list(
-            _yf_retry(lambda: t.options or [], label="options list") or []
-        )
-    except Exception as last_err:
-        raise ValueError(
-            f"{TICKER} options list unavailable from Yahoo "
-            f"({type(last_err).__name__}: {last_err}). "
-            "Usually a temporary rate-limit or empty response - wait ~30s and retry."
-        ) from last_err
-    if not expiries:
-        raise ValueError(
-            f"{TICKER} has no listed option expiries. "
-            "Indices (^VIX, ^SPX) are not supported - use an equity/ETF with options."
-        )
-
-    all_calls, all_puts = [], []
-    for expiry in expiries:
-        try:
-            chain = _yf_retry(
-                lambda e=expiry: t.option_chain(e),
-                label=f"chain {expiry}",
-                attempts=3,
-                base_sleep=2.0,
-            )
-        except Exception:
-            continue
-        for df, lst in [(chain.calls, all_calls), (chain.puts, all_puts)]:
-            if df is None or not hasattr(df, "columns") or df.empty:
-                continue
-            cols = ["strike","lastPrice","volume","openInterest","impliedVolatility"]
-            for opt_col in ("bid", "ask"):
-                if opt_col in df.columns:
-                    cols.append(opt_col)
-            tmp = df[cols].copy()
-            for opt_col in ("bid", "ask"):
-                if opt_col not in tmp.columns:
-                    tmp[opt_col] = 0.0
-            tmp["bid"] = tmp["bid"].fillna(0)
-            tmp["ask"] = tmp["ask"].fillna(0)
-            tmp["volume"] = tmp["volume"].fillna(0)
-            tmp["openInterest"] = tmp["openInterest"].fillna(0)
-            tmp["expiry"] = expiry
-            tmp["dte"] = (datetime.strptime(expiry,"%Y-%m-%d").date() - datetime.today().date()).days
-            lst.append(tmp)
-
-    if not all_calls or not all_puts:
+    # Wide max_dte preserves prior "ALL expiries" behaviour until Step 6 caps.
+    chain = source.fetch_chain(TICKER, max_dte=3650)
+    calls_all = _legacy_option_leg(chain, "CALL")
+    puts_all = _legacy_option_leg(chain, "PUT")
+    if calls_all.empty or puts_all.empty:
         raise ValueError(
             f"{TICKER} has no options chain data. "
             "Indices (^VIX, ^SPX) are not supported - use an ETF with options "
             "instead (e.g. SPY, QQQ, UVXY for volatility exposure)."
         )
-
-    calls_all = pd.concat(all_calls).sort_values("volume", ascending=False).reset_index(drop=True)
-    puts_all  = pd.concat(all_puts).sort_values("volume", ascending=False).reset_index(drop=True)
 
     return frames, spot, calls_all, puts_all
 
@@ -903,7 +876,12 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
     return fname, fname.replace(".json", ".txt")
 
 # ?? MAIN ??????????????????????????????????????????????????????????????????????
-def run():
+def run(source=None):
+    from sources import get_source
+
+    if source is None:
+        source = get_source(str(SCORING.get("market_data_source", "yahoo")))
+
     settlement_converged = None
     if IS_EOD:
         from eod_settlement import VolumeSnapshot, await_volume_convergence
@@ -915,11 +893,11 @@ def run():
             max_attempts = int(_ecfg.get("eod_convergence_max_attempts", max_attempts))
         except Exception:
             pass
-        print(f"\n{C.CYAN}EOD mode — converging settlement volumes for {TICKER}...{C.RESET}")
+        print(f"\n{C.CYAN}EOD mode -- converging settlement volumes for {TICKER}...{C.RESET}")
         last_pack = {}
 
         def _read_vols():
-            frames, spot, calls_all, puts_all = fetch_data()
+            frames, spot, calls_all, puts_all = fetch_data(source)
             snap = VolumeSnapshot(
                 total_call_vol=int(calls_all["volume"].sum()),
                 total_put_vol=int(puts_all["volume"].sum()),
@@ -951,7 +929,7 @@ def run():
         )
     else:
         print(f"\n{C.CYAN}Fetching {TICKER} data...{C.RESET}", end="", flush=True)
-        frames, spot, calls_all, puts_all = fetch_data()
+        frames, spot, calls_all, puts_all = fetch_data(source)
         print(f"  spot=${spot}")
     print(f"{C.CYAN}Analyzing...{C.RESET}\n")
     tf_data = analyze_tf(frames)
@@ -981,7 +959,7 @@ def run():
     pc0 = round(total_pv0 / total_cv0, 3) if total_cv0 > 0 else 0
     direction0, _, _ = direction_score(tf_data, pc0)
 
-    # ── Task A: chain-level session rollover guard ───────────────────────────
+    # ?? Task A: chain-level session rollover guard ???????????????????????????
     from chain_quality import (
         archive_session_date,
         chain_fails_quality_gate,
@@ -1038,13 +1016,13 @@ def run():
         )
         return
 
-    # ── Stale volume vs prior EOD (CURSOR_STALE_VOLUME_FIX) ────────────────
+    # ?? Stale volume vs prior EOD (CURSOR_STALE_VOLUME_FIX) ????????????????
     _eod_lookup = None
     _eod_arch, _eod_reason = find_prior_eod_archive(TICKER, "archive", now_et=_ET_now)
     if _eod_arch is None:
         print(
             f"{C.YELLOW}WARN: EOD volume reference unavailable ({_eod_reason}); "
-            f"stale-volume check skipped — decrease detector only.{C.RESET}"
+            f"stale-volume check skipped  decrease detector only.{C.RESET}"
         )
     elif not stale_check_active(_ET_now):
         print(

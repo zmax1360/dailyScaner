@@ -191,10 +191,9 @@ APP = ROOT / "app.py"
 
 @pytest.mark.skipif(not APP.exists(), reason="app.py not yet written")
 def test_app_no_yfinance_import():
-    src = APP.read_text()
-    assert "yfinance" not in src, (
-        "app.py must not import yfinance directly — use data_adapter.fetch_full_chain()"
-    )
+    """Delegates to the import-graph allowlist (CURSOR_SOURCES_STEPS Step 4)."""
+    from tests.test_import_graph import test_app_does_not_import_yfinance_directly
+    test_app_does_not_import_yfinance_directly()
 
 
 @pytest.mark.skipif(not APP.exists(), reason="app.py not yet written")

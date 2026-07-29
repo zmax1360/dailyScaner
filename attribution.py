@@ -777,29 +777,21 @@ def fetch_option_mid(
     side: str,
     strike: float,
     expiry: str,
+    *,
+    source=None,
 ) -> float | None:
     """
     Best-effort live mid. Returns None on any failure — never 0.0, never raises.
+
+    ``source`` is a MarketDataSource constructed at the caller entry point when
+    omitted (never a module-level singleton).
     """
     try:
-        import yfinance as yf
-
-        t = yf.Ticker(ticker)
-        chain = t.option_chain(expiry)
-        book = chain.calls if str(side).upper() == "CALL" else chain.puts
-        row = book[abs(book["strike"] - float(strike)) < 1e-6]
-        if row.empty:
-            return None
-        r = row.iloc[0]
-        bid = float(r.get("bid") or 0)
-        ask = float(r.get("ask") or 0)
-        last = float(r.get("lastPrice") or 0)
-        if bid > 0 and ask > 0:
-            mid = (bid + ask) / 2.0
-            return mid if mid > 0 else None
-        if last > 0:
-            return last
-        return None
+        if source is None:
+            from config import SCORING
+            from sources import get_source
+            source = get_source(str(SCORING.get("market_data_source", "yahoo")))
+        return source.fetch_option_mid(ticker, side, strike, expiry)
     except Exception as exc:
         log.debug("fetch_option_mid failed: %s", exc)
         return None

@@ -11,7 +11,7 @@ from __future__ import annotations
 # Fingerprint of the scoring engine — hashed into every attribution run.
 # Pre-delta / pre-quality-gate logs are engine v1; runs after this dict
 # changes are engine v2 and must not be pooled in analysis.
-SCORING: dict[str, float | int] = {
+SCORING: dict[str, float | int | str] = {
     # Base blend
     "w_lev": 0.4,
     "w_flow": 0.6,
@@ -55,4 +55,6 @@ SCORING: dict[str, float | int] = {
     "stale_volume_ratio": 0.95,
     "stale_check_cutoff_et": "11:00",
     "stale_majority_abort_frac": 0.50,
+    # Market data adapter (CURSOR_SOURCES_STEPS) — does not change scoring math
+    "market_data_source": "yahoo",
 }

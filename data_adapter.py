@@ -1,19 +1,18 @@
 """
-data_adapter.py — thin yfinance adapter for the Streamlit dashboard.
+data_adapter.py — thin market-data adapter for the Streamlit dashboard.
 
-This is the ONLY file in the dashboard layer that imports yfinance.
-It performs no market analysis — it normalises raw chain data into a
-flat per-contract DataFrame and returns it. All analytical logic stays
-in dailyScaner.py.
+This is the ONLY file in the dashboard layer that talks to a MarketDataSource.
+It performs no market analysis — it normalises chain/OHLC data into the shapes
+the UI expects. All analytical logic stays in dailyScaner.py.
 """
 
+from __future__ import annotations
+
 import math
-from datetime import datetime
 
 import pandas as pd
-import yfinance as yf
 
-from attribution import now_et
+from sources.base import MarketDataSource
 
 
 def _safe_int(v, default: int = 0) -> int:
@@ -34,87 +33,79 @@ def _safe_float(v, default: float = 0.0) -> float:
         return default
 
 
-def fetch_full_chain(ticker: str = "AAPL") -> pd.DataFrame:
+def _resolve_source(source: MarketDataSource | None) -> MarketDataSource:
+    if source is not None:
+        return source
+    from config import SCORING
+    from sources import get_source
+    return get_source(str(SCORING.get("market_data_source", "yahoo")))
+
+
+def fetch_full_chain(
+    ticker: str = "AAPL",
+    *,
+    source: MarketDataSource | None = None,
+) -> pd.DataFrame:
     """
-    Fetch the full options chain across ALL expiries for *ticker*.
+    Fetch the full options chain across expiries for *ticker*.
 
     Returns a DataFrame with one row per contract and these columns:
 
         side            "call" or "put"
         strike          float
         expiry          "YYYY-MM-DD"
-        dte             int  (calendar days to expiry from today)
+        dte             int
         bid             float
         ask             float
-        mid             float  (bid+ask)/2; falls back to lastPrice if both zero
-        last            float  (lastPrice)
+        mid             float  (bid+ask)/2; falls back to last if both zero
+        last            float
         volume          int
         openInterest    int
         impliedVolatility float
-        delta             float | None  (Black-Scholes; None when IV/DTE unusable)
+        delta             float | None
 
-    The DataFrame is never filtered or sorted here — callers decide what
-    they want to keep.  Returns an empty DataFrame (correct columns) on
-    any fetch failure so the caller can display a graceful error.
+    Returns an empty DataFrame (correct columns) on any fetch failure.
     """
-    today = now_et().date()
-    rows: list[dict] = []
-
+    src = _resolve_source(source)
     try:
-        t = yf.Ticker(ticker)
-        expiries = t.options
+        chain = src.fetch_chain(ticker, max_dte=3650)
     except Exception:
         return _empty_frame()
+    if chain is None or chain.empty:
+        return _empty_frame()
 
-    for expiry in expiries:
-        dte = (datetime.strptime(expiry, "%Y-%m-%d").date() - today).days
-        try:
-            chain = t.option_chain(expiry)
-        except Exception:
-            continue
-
-        for side, df in [("call", chain.calls), ("put", chain.puts)]:
-            if df is None or df.empty:
-                continue
-            for _, row in df.iterrows():
-                bid  = _safe_float(row.get("bid"))
-                ask  = _safe_float(row.get("ask"))
-                last = _safe_float(row.get("lastPrice"))
-                mid  = (bid + ask) / 2 if (bid > 0 or ask > 0) else last
-                rows.append({
-                    "side":              side,
-                    "strike":            _safe_float(row.get("strike")),
-                    "expiry":            expiry,
-                    "dte":               dte,
-                    "bid":               bid,
-                    "ask":               ask,
-                    "mid":               round(mid, 4),
-                    "last":              last,
-                    "volume":            _safe_int(row.get("volume")),
-                    "openInterest":      _safe_int(row.get("openInterest")),
-                    "impliedVolatility": _safe_float(row.get("impliedVolatility")),
-                    "delta":             None,  # filled below
-                })
-
+    rows: list[dict] = []
+    for _, r in chain.iterrows():
+        bid = _safe_float(r.get("bid"))
+        ask = _safe_float(r.get("ask"))
+        last = _safe_float(r.get("last"))
+        mid = (bid + ask) / 2 if (bid > 0 or ask > 0) else last
+        rows.append({
+            "side": str(r.get("side", "")).lower(),
+            "strike": _safe_float(r.get("strike")),
+            "expiry": str(r.get("expiry") or "")[:10],
+            "dte": _safe_int(r.get("dte")),
+            "bid": bid,
+            "ask": ask,
+            "mid": round(mid, 4),
+            "last": last,
+            "volume": _safe_int(r.get("volume")),
+            "openInterest": _safe_int(r.get("openInterest")),
+            "impliedVolatility": _safe_float(r.get("iv")),
+            "delta": None,  # filled below via BS when possible
+        })
     if not rows:
         return _empty_frame()
 
     from greeks import bs_delta, effective_dte_days
     from config import SCORING
+    from attribution import now_et
 
-    # Spot for delta: prefer underlying last from first successful history
-    spot = None
-    try:
-        hist = t.history(period="1d")
-        if hist is not None and not hist.empty:
-            spot = _safe_float(hist["Close"].iloc[-1])
-    except Exception:
-        spot = None
+    spot = src.fetch_spot(ticker)
     r_free = float(SCORING.get("risk_free_rate", 0.045))
     asof = now_et()
     for row in rows:
         if spot and spot > 0:
-            # Pass DAYS via effective_dte_days (0DTE → fraction of a day to 16:00 ET)
             t_days = effective_dte_days(
                 row["dte"], expiry=row["expiry"], now_et=asof,
             )
@@ -128,7 +119,11 @@ def fetch_full_chain(ticker: str = "AAPL") -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fetch_daily_ohlc(ticker: str = "AAPL") -> dict | None:
+def fetch_daily_ohlc(
+    ticker: str = "AAPL",
+    *,
+    source: MarketDataSource | None = None,
+) -> dict | None:
     """
     Fetch today's daily Open / High / Low / Close for *ticker*.
 
@@ -137,9 +132,9 @@ def fetch_daily_ohlc(ticker: str = "AAPL") -> dict | None:
          "prev_close": float | None}
     or None on any failure. No analysis is performed here.
     """
+    src = _resolve_source(source)
     try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period="5d", interval="1d")
+        hist = src.fetch_history(ticker, interval="1d", period="5d")
         if hist is None or hist.empty:
             return None
         row = hist.iloc[-1]
@@ -162,21 +157,19 @@ def fetch_daily_ohlc(ticker: str = "AAPL") -> dict | None:
         return None
 
 
-def fetch_macro_snapshot() -> dict | None:
+def fetch_macro_snapshot(
+    *,
+    source: MarketDataSource | None = None,
+) -> dict | None:
     """
     Fetch SPY, QQQ, and ^VIX daily bars for macro gravity filtering.
 
-    Returns a dict:
-      {
-        "SPY":  {"open","high","low","close","prev_close"},
-        "QQQ":  {...},
-        "VIX":  {"open","high","low","close","prev_close"},
-      }
-    or None if any required ticker fails. No analysis performed here.
+    Returns a dict keyed by SPY/QQQ/VIX, or None if any required ticker fails.
     """
+    src = _resolve_source(source)
     out: dict = {}
     for key, symbol in [("SPY", "SPY"), ("QQQ", "QQQ"), ("VIX", "^VIX")]:
-        bar = fetch_daily_ohlc(symbol)
+        bar = fetch_daily_ohlc(symbol, source=src)
         if not bar:
             return None
         out[key] = bar
