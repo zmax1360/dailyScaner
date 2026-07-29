@@ -77,6 +77,8 @@ def calculate_cost_distribution(
     days: int = 180,
     n_bins: int = 50,
     spot: float | None = None,
+    *,
+    source=None,
 ) -> dict[str, Any]:
     """
     Fetch ~`days` of daily bars and build a volume-by-cost histogram.
@@ -90,14 +92,14 @@ def calculate_cost_distribution(
         return _empty_result("")
 
     try:
-        import yfinance as yf
-    except ImportError:
-        return _empty_result(ticker)
+        if source is None:
+            from config import SCORING
+            from sources import get_source
+            source = get_source(str(SCORING.get("market_data_source", "yahoo")))
 
-    try:
         # Prefer period string; fall back to start/end if needed
         period = "6mo" if days >= 150 else f"{max(int(days), 30)}d"
-        hist = yf.Ticker(ticker).history(period=period, interval="1d")
+        hist = source.fetch_history(ticker, interval="1d", period=period)
         if hist is None or hist.empty:
             return _empty_result(ticker)
 

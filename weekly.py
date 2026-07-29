@@ -5,7 +5,6 @@ Run every Monday morning before any weekly/biweekly options trade.
 Ali's trading system | June 2026
 """
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -66,53 +65,76 @@ def atr(high, low, close, period=14):
     return tr.rolling(period).mean()
 
 # ── DATA FETCHERS ─────────────────────────────────────────────────────────────
-def fetch_weekly_data(ticker):
+def _resolve_source(source=None):
+    if source is not None:
+        return source
+    from config import SCORING
+    from sources import get_source
+    return get_source(str(SCORING.get("market_data_source", "yahoo")))
+
+
+def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    if hasattr(out.index, "tz") and out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    return out
+
+
+def fetch_weekly_data(ticker, source=None):
     """Fetch daily + weekly OHLCV, compute key indicators."""
-    t = yf.Ticker(ticker)
-
-    # Daily — last 90 days for EMAs
-    daily = t.history(period="3mo", interval="1d")
-    daily.index = daily.index.tz_localize(None)
-
-    # Weekly — last 52 weeks
-    weekly = t.history(period="52wk", interval="1wk")
-    weekly.index = weekly.index.tz_localize(None)
-
+    src = _resolve_source(source)
+    daily = _strip_tz(src.fetch_history(ticker, interval="1d", period="3mo"))
+    weekly = _strip_tz(src.fetch_history(ticker, interval="1wk", period="52wk"))
     return daily, weekly
 
-def fetch_macro():
+
+def fetch_macro(source=None):
     """Fetch SPY, QQQ, VIX daily data."""
+    src = _resolve_source(source)
     results = {}
     for sym in ["SPY", "QQQ", "^VIX"]:
-        t = yf.Ticker(sym)
-        hist = t.history(period="3mo", interval="1d")
-        hist.index = hist.index.tz_localize(None)
+        hist = _strip_tz(src.fetch_history(sym, interval="1d", period="3mo"))
         results[sym] = hist
     return results
 
-def fetch_options_30dte(ticker):
+
+def fetch_options_30dte(ticker, source=None):
     """Fetch options chain closest to 30 DTE for OI structure analysis."""
-    t       = yf.Ticker(ticker)
-    exps    = t.options
-    today   = datetime.today()
-    target  = today + timedelta(days=30)
+    src = _resolve_source(source)
+    today = now_et().date()
+    chain = src.fetch_chain(ticker, max_dte=60)
+    if chain is None or chain.empty:
+        raise ValueError(f"{ticker}: empty options chain from {src.name}")
 
-    # Find expiry closest to 30 DTE
-    best    = min(exps, key=lambda d: abs((datetime.strptime(d, "%Y-%m-%d") - target).days))
-    chain   = t.option_chain(best)
-    calls   = chain.calls.copy()
-    puts    = chain.puts.copy()
+    # Prefer expiry closest to 30 DTE among rows present
+    expiries = sorted(set(str(e)[:10] for e in chain["expiry"].tolist()))
+    if not expiries:
+        raise ValueError(f"{ticker}: no expiries in chain")
+    target = today + timedelta(days=30)
+    best = min(
+        expiries,
+        key=lambda d: abs((datetime.strptime(d, "%Y-%m-%d").date() - target).days),
+    )
+    sub = chain[chain["expiry"].astype(str).str[:10] == best].copy()
+    dte = (datetime.strptime(best, "%Y-%m-%d").date() - today).days
 
-    for df in [calls, puts]:
-        df["expiry"] = best
-        df["dte"]    = (datetime.strptime(best, "%Y-%m-%d") - today).days
-        df.rename(columns={
-            "lastPrice":        "lastPrice",
-            "openInterest":     "openInterest",
-            "impliedVolatility":"impliedVolatility",
-        }, inplace=True)
+    def _leg(side: str) -> pd.DataFrame:
+        leg = sub[sub["side"] == side].copy()
+        return pd.DataFrame({
+            "strike": leg["strike"].astype(float),
+            "lastPrice": leg["last"].astype(float),
+            "openInterest": leg["openInterest"].fillna(0).astype(float),
+            "impliedVolatility": leg["iv"],
+            "volume": leg["volume"].fillna(0).astype(float),
+            "bid": leg["bid"].fillna(0).astype(float),
+            "ask": leg["ask"].fillna(0).astype(float),
+            "expiry": best,
+            "dte": dte,
+        })
 
-    return calls, puts, best
+    return _leg("CALL"), _leg("PUT"), best
 
 # ── ANALYSIS FUNCTIONS ────────────────────────────────────────────────────────
 def analyze_ticker(daily, weekly):
@@ -616,7 +638,7 @@ def print_report(ticker, ticker_data, macro, oi, score, checks, thesis, earnings
     print()
 
     print(f"{'─'*W}")
-    print(dim(f"  yfinance + Anthropic API  │  Not financial advice  │  {now}"))
+    print(dim(f"  market data + Anthropic API  |  Not financial advice  |  {now}"))
     print(f"{'─'*W}\n")
 
 # ── GATE HELPERS ──────────────────────────────────────────────────────────────
@@ -668,15 +690,16 @@ def _format_gate_block(gate, cand, exit_date, exp, spot) -> str:
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
-def run():
+def run(source=None):
+    src = _resolve_source(source)
     print(f"\n{C.CYAN}  Fetching {TICKER} weekly data...{C.RESET}")
-    daily, weekly     = fetch_weekly_data(TICKER)
+    daily, weekly     = fetch_weekly_data(TICKER, source=src)
 
     print(f"{C.CYAN}  Fetching macro data (SPY, QQQ, VIX)...{C.RESET}")
-    macro_raw         = fetch_macro()
+    macro_raw         = fetch_macro(source=src)
 
     print(f"{C.CYAN}  Fetching 30 DTE options chain...{C.RESET}")
-    calls, puts, exp  = fetch_options_30dte(TICKER)
+    calls, puts, exp  = fetch_options_30dte(TICKER, source=src)
 
     print(f"{C.CYAN}  Analyzing...{C.RESET}")
     ticker_data       = analyze_ticker(daily, weekly)

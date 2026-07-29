@@ -7,12 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Until CURSOR_SOURCES_STEPS Step 5, these modules may still import yfinance.
+# yfinance may only live in sources.yahoo (market data) and news_service
+# (news-text exemption — not MarketDataSource). Step-5 history callers are gone.
 _YF_ALLOWED = frozenset({
     "sources/yahoo.py",
-    "weekly.py",
-    "volume_analysis.py",
-    "cost_distribution.py",
     "news_service.py",
 })
 

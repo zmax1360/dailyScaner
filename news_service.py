@@ -211,10 +211,15 @@ def _yf_extract_url(content: dict) -> str:
 def _fetch_yfinance_articles(ticker: str) -> list[dict[str, Any]]:
     """
     Fallback via yfinance.Ticker(ticker).news.
+
+    EXEMPT from MarketDataSource (CURSOR_SOURCES_STEPS Step 5): this is news
+    text, not OHLCV/options market data. Kept on yfinance until a separate
+    NewsSource protocol exists. Do not fold this into MarketDataSource.
+
     Schema matches Finnhub-normalised articles.
     """
     try:
-        import yfinance as yf
+        import yfinance as yf  # news-only exemption — see docstring
     except ImportError:
         return []
 

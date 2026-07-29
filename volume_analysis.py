@@ -2,7 +2,7 @@
 """
 volume_analysis.py — Intraday buy / sell / neutral share-volume breakdown.
 
-Primary feed (yfinance) does not expose tick-level bid/ask prints, so we
+Primary feeds (via MarketDataSource) do not expose tick-level bid/ask prints, so we
 approximate order flow from 1-minute bars using the Tick Rule:
   close > prev_close → Buy
   close < prev_close → Sell
@@ -78,7 +78,15 @@ def _classify_tick_rule(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def get_stock_volume_analysis(ticker: str) -> dict[str, Any]:
+def _resolve_source(source=None):
+    if source is not None:
+        return source
+    from config import SCORING
+    from sources import get_source
+    return get_source(str(SCORING.get("market_data_source", "yahoo")))
+
+
+def get_stock_volume_analysis(ticker: str, *, source=None) -> dict[str, Any]:
     """
     Intraday volume analysis for *ticker*.
 
@@ -90,10 +98,7 @@ def get_stock_volume_analysis(ticker: str) -> dict[str, Any]:
     if not ticker:
         return _empty_result("")
 
-    try:
-        import yfinance as yf
-    except ImportError:
-        return _empty_result(ticker)
+    src = _resolve_source(source)
 
     # Prefer fine bars; fall back to coarser intervals when 1m is empty / rate-limited.
     attempts: list[tuple[str, str]] = [
@@ -107,7 +112,7 @@ def get_stock_volume_analysis(ticker: str) -> dict[str, Any]:
     last_err: Exception | None = None
     for period, interval in attempts:
         try:
-            hist = yf.Ticker(ticker).history(period=period, interval=interval)
+            hist = src.fetch_history(ticker, interval=interval, period=period)
             if hist is None or hist.empty:
                 continue
             hist = hist.copy()
@@ -131,7 +136,7 @@ def get_stock_volume_analysis(ticker: str) -> dict[str, Any]:
             if int(classified.get("Total_Volume") or 0) <= 0:
                 continue
             classified["ticker"] = ticker
-            classified["source"] = f"yfinance_{interval}"
+            classified["source"] = f"{src.name}_{interval}"
             return classified
         except Exception as exc:
             last_err = exc
@@ -139,7 +144,7 @@ def get_stock_volume_analysis(ticker: str) -> dict[str, Any]:
 
     # Last resort: reuse the same 5m series the VWAP chart uses
     try:
-        chart = fetch_intraday_vwap_df(ticker, timeframe="5M")
+        chart = fetch_intraday_vwap_df(ticker, timeframe="5M", source=src)
         if chart is not None and not chart.empty and "Volume" in chart.columns:
             classified = _classify_tick_rule(chart)
             if int(classified.get("Total_Volume") or 0) > 0:
@@ -209,7 +214,7 @@ def compute_intraday_vwap(df: pd.DataFrame, *, session_reset: bool = True) -> pd
     return cum_tp_vol / cum_vol
 
 
-# Chart timeframe → yfinance fetch + optional resample (mirrors dailyScaner)
+# Chart timeframe → history fetch + optional resample (mirrors dailyScaner)
 _CHART_TF_SPEC: dict[str, dict[str, Any]] = {
     "5M":  {"interval": "5m", "period": "5d",  "resample": None,    "last_session": True,  "vwap_reset": True},
     "10M": {"interval": "5m", "period": "5d",  "resample": "10min", "last_session": True,  "vwap_reset": True},
@@ -240,6 +245,8 @@ def fetch_intraday_vwap_df(
     ticker: str,
     last_session_only: bool | None = None,
     timeframe: str = "5M",
+    *,
+    source=None,
 ) -> pd.DataFrame:
     """
     Fetch OHLC for *ticker* at *timeframe* and attach a VWAP column.
@@ -261,14 +268,11 @@ def fetch_intraday_vwap_df(
         spec["last_session"] if last_session_only is None else bool(last_session_only)
     )
 
-    try:
-        import yfinance as yf
-    except ImportError:
-        return pd.DataFrame()
+    src = _resolve_source(source)
 
     try:
-        hist = yf.Ticker(ticker).history(
-            period=spec["period"], interval=spec["interval"],
+        hist = src.fetch_history(
+            ticker, interval=spec["interval"], period=spec["period"],
         )
         if hist is None or hist.empty:
             return pd.DataFrame()
