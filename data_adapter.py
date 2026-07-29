@@ -99,10 +99,10 @@ def fetch_full_chain(ticker: str = "AAPL") -> pd.DataFrame:
     if not rows:
         return _empty_frame()
 
-    from greeks import bs_delta
+    from greeks import bs_delta, effective_dte_days
     from config import SCORING
 
-    # Spot for delta: prefer underlying last from first successful history, else mid heuristic
+    # Spot for delta: prefer underlying last from first successful history
     spot = None
     try:
         hist = t.history(period="1d")
@@ -111,10 +111,15 @@ def fetch_full_chain(ticker: str = "AAPL") -> pd.DataFrame:
     except Exception:
         spot = None
     r_free = float(SCORING.get("risk_free_rate", 0.045))
+    asof = now_et()
     for row in rows:
         if spot and spot > 0:
+            # Pass DAYS via effective_dte_days (0DTE → fraction of a day to 16:00 ET)
+            t_days = effective_dte_days(
+                row["dte"], expiry=row["expiry"], now_et=asof,
+            )
             d = bs_delta(
-                row["side"], spot, row["strike"], row["dte"],
+                row["side"], spot, row["strike"], t_days,
                 row["impliedVolatility"], r=r_free,
             )
         else:

@@ -7,9 +7,13 @@ yfinance does not return greeks; delta must be computed (CURSOR_DELTA_TASKS C).
 from __future__ import annotations
 
 import math
+from datetime import date, datetime, time as dtime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from config import SCORING
+
+ET = ZoneInfo("America/New_York")
 
 
 def _norm_cdf(x: float) -> float:
@@ -29,6 +33,58 @@ def _as_float(v: Any) -> float | None:
         return None
 
 
+def effective_dte_days(
+    dte: Any,
+    *,
+    expiry: Any = None,
+    now_et: datetime | None = None,
+    session_close: dtime | None = None,
+) -> float:
+    """
+    Time to expiry in **calendar DAYS** for bs_delta (which divides by 365).
+
+    - dte > 0: return that value as days.
+    - Live 0DTE (expiry == today ET): return the fraction of a day remaining
+      until 16:00 ET (e.g. 6 hours → 0.25 days), floored at 60 seconds.
+      Never return a year-fraction here.
+    - Otherwise: 0.0 (bs_delta will return None).
+
+    Single shared helper — do not reimplement this conversion at call sites.
+    """
+    close_t = session_close or dtime(16, 0)
+    try:
+        d = float(dte) if dte is not None else float("nan")
+    except (TypeError, ValueError):
+        d = float("nan")
+    if d == d and d > 0:
+        return float(d)
+
+    now = now_et or datetime.now(ET)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ET)
+    now = now.astimezone(ET)
+
+    exp_d: date | None = None
+    if expiry is not None and str(expiry).strip():
+        try:
+            if isinstance(expiry, datetime):
+                exp_d = expiry.astimezone(ET).date() if expiry.tzinfo else expiry.date()
+            elif isinstance(expiry, date):
+                exp_d = expiry
+            else:
+                exp_d = date.fromisoformat(str(expiry)[:10])
+        except Exception:
+            exp_d = None
+
+    # Live same-day expiry: fraction of a day to 16:00 ET. Floor at 60s so the
+    # 16:00–16:15 window (still scored by best_value) stays usable for delta.
+    if exp_d == now.date():
+        close_et = datetime.combine(now.date(), close_t, tzinfo=ET)
+        secs = max((close_et - now).total_seconds(), 60.0)
+        return secs / 86400.0  # DAYS, not years
+    return 0.0
+
+
 def bs_delta(
     side: str,
     spot: float,
@@ -43,6 +99,7 @@ def bs_delta(
         d1 = (ln(S/K) + (r + iv^2/2) * T) / (iv * sqrt(T)),  T = dte/365
         call: N(d1)      put: N(d1) - 1
 
+    ``dte_days`` must be in calendar DAYS (use effective_dte_days for 0DTE).
     Returns None (never a default) when inputs are unusable:
     iv < min_iv_usable, dte <= 0, spot/strike <= 0, or any NaN.
     """

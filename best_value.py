@@ -234,43 +234,24 @@ def calculate_best_value(
         return df
 
     from chain_quality import iv_degraded_for_1sd
-    from greeks import bs_delta
+    from greeks import bs_delta, effective_dte_days
 
     # Emit / refresh delta via Black-Scholes (never default to 0.5)
     r_free = float(cfg.get("risk_free_rate", 0.045))
-    close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-
-    def _t_days(r: pd.Series) -> float:
-        """Year-fraction input for BS. dte>0 as calendar days; live 0DTE uses
-        time-to-16:00 ET so T>0 (bs_delta rejects dte<=0)."""
-        dte = r.get("dte") if "dte" in r.index else r.get("DTE")
-        try:
-            d = float(dte) if dte is not None else float("nan")
-        except (TypeError, ValueError):
-            d = float("nan")
-        if d == d and d > 0:
-            return d
-        exp = r.get("expiry") if "expiry" in r.index else r.get("Expiry")
-        try:
-            exp_d = pd.Timestamp(exp).date() if exp else None
-        except Exception:
-            exp_d = None
-        if exp_d == today_et and not after_close:
-            secs = max((close_et - now_et).total_seconds(), 60.0)
-            return secs / (365.25 * 24.0 * 3600.0)
-        return 0.0
 
     deltas: list[float] = []
     for _, r in work.iterrows():
         side = r.get("side") or r.get("Side") or ""
         strike = r.get("strike") if "strike" in r.index else r.get("Strike")
         iv = r.get("iv") if "iv" in r.index else r.get("impliedVolatility")
+        dte = r.get("dte") if "dte" in r.index else r.get("DTE")
+        exp = r.get("expiry") if "expiry" in r.index else r.get("Expiry")
         try:
             d = bs_delta(
                 str(side),
                 float(spot_price),
                 float(strike or 0),
-                _t_days(r),
+                effective_dte_days(dte, expiry=exp, now_et=now_et),
                 float(iv if iv is not None else 0),
                 r=r_free,
             )
@@ -600,7 +581,7 @@ def build_best_value_df(
     pov_info: dict | None = None,
 ) -> pd.DataFrame:
     """Build flat contracts DF from archive volume blocks, then score."""
-    from greeks import bs_delta
+    from greeks import bs_delta, effective_dte_days
 
     rows: list[dict[str, Any]] = []
     r_free = float(SCORING.get("risk_free_rate", 0.045))
@@ -611,11 +592,13 @@ def build_best_value_df(
             dte_i = int(c.get("dte") or 0)
             iv_f = float(c.get("impliedVolatility") or 0)
             strike_f = float(c.get("strike") or 0)
-            d = bs_delta(side, float(spot), strike_f, dte_i, iv_f, r=r_free)
+            exp = c.get("expiry", "")
+            t_days = effective_dte_days(dte_i, expiry=exp, now_et=now_et)
+            d = bs_delta(side, float(spot), strike_f, t_days, iv_f, r=r_free)
             rows.append({
                 "side": side,
                 "strike": strike_f,
-                "expiry": c.get("expiry", ""),
+                "expiry": exp,
                 "dte": dte_i,
                 "last": _contract_price(c),
                 "bid": float(c.get("bid") or 0),
