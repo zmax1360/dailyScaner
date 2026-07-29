@@ -15,19 +15,122 @@ import time
 import warnings
 warnings.filterwarnings("ignore")
 
+from config import SCORING
+
 def _parse_ticker() -> str:
     """Read ticker from argv[1], ignoring pytest/script paths (must be 1-5 alpha chars)."""
-    if len(sys.argv) > 1:
-        candidate = sys.argv[1]
+    for candidate in sys.argv[1:]:
+        if candidate.startswith("-"):
+            continue
         if candidate.isalpha() and 1 <= len(candidate) <= 5:
             return candidate.upper()
     return "AAPL"
 
+def _parse_is_eod() -> bool:
+    return "--eod" in sys.argv
+
 TICKER = _parse_ticker()
+IS_EOD = _parse_is_eod()
 
 # Minimum open interest for a contract to be eligible as a magnet / signal.
 # Below this, vol/OI "conviction" is a division-by-noise artifact.
-MIN_OI_FOR_MAGNET = 500
+MIN_OI_FOR_MAGNET = int(SCORING["min_oi_for_magnet"])
+
+
+def _log_scan_attribution(
+    *,
+    ticker: str,
+    spot: float,
+    calls_all: pd.DataFrame,
+    puts_all: pd.DataFrame,
+    vol_curr: dict,
+    vol_prev: dict | None,
+    session: dict | None,
+    run_kind: str = "intraday",
+    eod_vol_lookup: dict | None = None,
+) -> None:
+    """
+    Score + append attribution rows. Fail-soft: never abort a scan.
+    Lives on the scan path (not Streamlit) so scheduler runs are logged.
+    """
+    try:
+        from attribution import (
+            build_control_rows,
+            engine_sha,
+            log_run,
+            modal_flagged_expiry,
+        )
+        from best_value import build_best_value_df, resolve_biases_for_ticker
+
+        daily_bias, market_state = resolve_biases_for_ticker(
+            ticker, session or {}, spot,
+        )
+        news_bias = None
+        try:
+            from news_service import get_news_sentiment
+            news_bias = (get_news_sentiment(ticker) or {}).get("news_bias")
+        except Exception:
+            pass
+
+        bv_df = build_best_value_df(
+            vol_curr,
+            spot,
+            vol_prev,
+            daily_bias=daily_bias,
+            market_state=market_state,
+            news_bias=news_bias,
+            eod_vol_lookup=eod_vol_lookup,
+        )
+
+        chain = pd.concat(
+            [
+                calls_all.assign(side="CALL"),
+                puts_all.assign(side="PUT"),
+            ],
+            ignore_index=True,
+        )
+        exp = modal_flagged_expiry(bv_df)
+        if not exp and "expiry" in chain.columns and not chain.empty:
+            # No scored rows — still log ATM control on nearest chain expiry
+            exp = str(chain["expiry"].astype(str).mode().iloc[0])
+        ctrl = (
+            build_control_rows(chain, spot, exp)
+            if exp
+            else build_control_rows(pd.DataFrame(), spot, "")
+        )
+
+        run_id = log_run(
+            ticker=ticker,
+            scored_df=bv_df,
+            cfg=SCORING,
+            spot=spot,
+            daily_bias=daily_bias,
+            market_state=market_state,
+            news_bias=news_bias,
+            control_rows=ctrl,
+            engine_sha_val=engine_sha(),
+            run_kind=run_kind,
+        )
+        if (run_kind or "").lower() == "eod":
+            print(
+                f"{C.GRAY}  Attribution - run_id={run_id[:8]}... "
+                f"run_kind=eod (flags skipped){C.RESET}"
+            )
+        else:
+            n = int(bv_df["Value_Score"].notna().sum()) if not bv_df.empty else 0
+            print(
+                f"{C.GRAY}  Attribution - run_id={run_id[:8]}... "
+                f"scored={n} ctrl={len(ctrl)}{C.RESET}"
+            )
+    except Exception as exc:
+        print(f"{C.YELLOW}  Attribution log failed (scan continues): {exc}{C.RESET}")
+        try:
+            from attribution import alert_attribution_failure
+            alert_attribution_failure(
+                f"ticker={ticker} spot={spot}\n{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
 
 def strip_ansi(text):
     import re
@@ -246,6 +349,34 @@ def opening_range(df5m, df15m, spot, now_et=None):
     return result
 
 # ?? FETCH ?????????????????????????????????????????????????????????????????????
+def _yf_retry(fn, *, label: str, attempts: int = 5, base_sleep: float = 3.0):
+    """Call Yahoo via yfinance with backoff on rate limits / transient errors."""
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            name = type(e).__name__
+            rate_limited = (
+                name == "YFRateLimitError"
+                or "Too Many Requests" in str(e)
+                or "Rate limited" in str(e)
+            )
+            if attempt >= attempts:
+                break
+            wait = base_sleep * (2 ** (attempt - 1))
+            if rate_limited:
+                wait = max(wait, 15.0 * attempt)
+            print(
+                f"  Yahoo {label} retry {attempt}/{attempts} "
+                f"after {wait:.0f}s ({name})",
+                flush=True,
+            )
+            time.sleep(wait)
+    raise last_err
+
+
 def fetch_data():
     t = yf.Ticker(TICKER)
 
@@ -257,7 +388,12 @@ def fetch_data():
             df.index = df.index.tz_localize(None) if df.index.tz else df.index
         return df
 
-    df5m  = clean(t.history(period="5d",  interval="5m"))
+    df5m = clean(
+        _yf_retry(
+            lambda: t.history(period="5d", interval="5m"),
+            label="5m history",
+        )
+    )
 
     # Early exit: if 5-minute data is empty the ticker is an index or delisted
     if df5m.empty:
@@ -268,32 +404,42 @@ def fetch_data():
         )
 
     df10m = clean(df5m.resample("10min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
-    df15m = clean(t.history(period="5d",  interval="15m"))
+    df15m = clean(
+        _yf_retry(
+            lambda: t.history(period="5d", interval="15m"),
+            label="15m history",
+        )
+    )
     df45m = clean(df5m.resample("45min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
-    df1h  = clean(t.history(period="30d", interval="1h"))
-    df4h  = clean(df1h.resample("4h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
-    dfd   = clean(t.history(period="6mo", interval="1d"))
+    df1h = clean(
+        _yf_retry(
+            lambda: t.history(period="30d", interval="1h"),
+            label="1h history",
+        )
+    )
+    df4h = clean(df1h.resample("4h").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna())
+    dfd = clean(
+        _yf_retry(
+            lambda: t.history(period="6mo", interval="1d"),
+            label="1d history",
+        )
+    )
 
     frames = {"5M": df5m, "10M": df10m, "15M": df15m, "45M": df45m, "1H": df1h, "4H": df4h, "1D": dfd}
     spot   = round(float(dfd["Close"].iloc[-1]), 2)
 
     # ALL expiries - no filter
-    # Yahoo sometimes returns HTML/rate-limit pages instead of JSON ? orjson.JSONDecodeError
-    expiries = None
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            expiries = list(t.options or [])
-            break
-        except Exception as e:
-            last_err = e
-            time.sleep(1.5 * attempt)
-    if expiries is None:
+    # Yahoo sometimes returns HTML/rate-limit pages instead of JSON / YFRateLimitError
+    try:
+        expiries = list(
+            _yf_retry(lambda: t.options or [], label="options list") or []
+        )
+    except Exception as last_err:
         raise ValueError(
             f"{TICKER} options list unavailable from Yahoo "
             f"({type(last_err).__name__}: {last_err}). "
             "Usually a temporary rate-limit or empty response - wait ~30s and retry."
-        )
+        ) from last_err
     if not expiries:
         raise ValueError(
             f"{TICKER} has no listed option expiries. "
@@ -303,7 +449,12 @@ def fetch_data():
     all_calls, all_puts = [], []
     for expiry in expiries:
         try:
-            chain = t.option_chain(expiry)
+            chain = _yf_retry(
+                lambda e=expiry: t.option_chain(e),
+                label=f"chain {expiry}",
+                attempts=3,
+                base_sleep=2.0,
+            )
         except Exception:
             continue
         for df, lst in [(chain.calls, all_calls), (chain.puts, all_puts)]:
@@ -440,7 +591,7 @@ def vol_oi_lbl(volume, oi):
 # ?? REPORT ????????????????????????????????????????????????????????????????????
 def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None, prev_vol=None):
     W = 68
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = _now_et().strftime("%Y-%m-%d %H:%M")
 
     # totals - same rounding as save_archive / direction0 (3 dp) so
     # terminal direction matches the archived direction the dashboard shows.
@@ -692,7 +843,7 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
     print(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
 
 # ?? ARCHIVE ???????????????????????????????????????????????????????????????????
-def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None):
+def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None, *, is_eod=False, settlement_converged=None):
     os.makedirs("archive", exist_ok=True)
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -702,6 +853,10 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
 
     payload = {
         "timestamp": ts_aware.isoformat(),
+        "is_eod": bool(is_eod),
+        "settlement_converged": (
+            None if settlement_converged is None else bool(settlement_converged)
+        ),
         "spot": spot,
         "or_data": or_data,        # dashboard: OR band + breakout state per run
         "direction": direction,    # dashboard: scanner's direction verdict per run
@@ -749,9 +904,55 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
 
 # ?? MAIN ??????????????????????????????????????????????????????????????????????
 def run():
-    print(f"\n{C.CYAN}Fetching {TICKER} data...{C.RESET}", end="", flush=True)
-    frames, spot, calls_all, puts_all = fetch_data()
-    print(f"  spot=${spot}")
+    settlement_converged = None
+    if IS_EOD:
+        from eod_settlement import VolumeSnapshot, await_volume_convergence
+        gap_sec, max_attempts = 600.0, 3
+        try:
+            with open("scheduler_config.json") as _cfg_fh:
+                _ecfg = json.load(_cfg_fh)
+            gap_sec = float(_ecfg.get("eod_convergence_gap_sec", gap_sec))
+            max_attempts = int(_ecfg.get("eod_convergence_max_attempts", max_attempts))
+        except Exception:
+            pass
+        print(f"\n{C.CYAN}EOD mode — converging settlement volumes for {TICKER}...{C.RESET}")
+        last_pack = {}
+
+        def _read_vols():
+            frames, spot, calls_all, puts_all = fetch_data()
+            snap = VolumeSnapshot(
+                total_call_vol=int(calls_all["volume"].sum()),
+                total_put_vol=int(puts_all["volume"].sum()),
+            )
+            last_pack["frames"] = frames
+            last_pack["spot"] = spot
+            last_pack["calls_all"] = calls_all
+            last_pack["puts_all"] = puts_all
+            last_pack["snap"] = snap
+            print(
+                f"{C.GRAY}  vol snapshot CALL={snap.total_call_vol:,} "
+                f"PUT={snap.total_put_vol:,}{C.RESET}"
+            )
+            return snap
+
+        converged, _last, _snaps = await_volume_convergence(
+            _read_vols,
+            gap_sec=gap_sec,
+            max_attempts=max_attempts,
+        )
+        settlement_converged = bool(converged)
+        frames = last_pack["frames"]
+        spot = last_pack["spot"]
+        calls_all = last_pack["calls_all"]
+        puts_all = last_pack["puts_all"]
+        print(
+            f"{C.CYAN}EOD settlement_converged={settlement_converged} "
+            f"spot=${spot}{C.RESET}\n"
+        )
+    else:
+        print(f"\n{C.CYAN}Fetching {TICKER} data...{C.RESET}", end="", flush=True)
+        frames, spot, calls_all, puts_all = fetch_data()
+        print(f"  spot=${spot}")
     print(f"{C.CYAN}Analyzing...{C.RESET}\n")
     tf_data = analyze_tf(frames)
     or_data  = opening_range(frames.get("5M", pd.DataFrame()), frames.get("15M", pd.DataFrame()), spot)
@@ -779,6 +980,101 @@ def run():
     total_pv0 = int(puts_all["volume"].sum())
     pc0 = round(total_pv0 / total_cv0, 3) if total_cv0 > 0 else 0
     direction0, _, _ = direction_score(tf_data, pc0)
+
+    # ── Task A: chain-level session rollover guard ───────────────────────────
+    from chain_quality import (
+        archive_session_date,
+        chain_fails_quality_gate,
+        chain_volume_rolled_over,
+        eod_volume_lookup,
+        find_prior_eod_archive,
+        flag_stale_vs_eod,
+        majority_stale_abort,
+        stale_check_active,
+    )
+    from zoneinfo import ZoneInfo as _ZI
+    _ET_now = datetime.now(_ZI("America/New_York"))
+    _today_et = _ET_now.date()
+    if prev_result:
+        _prev_data, _prev_file = prev_result
+        _prev_day = archive_session_date(_prev_data)
+        if _prev_day == _today_et:
+            _pv = (_prev_data or {}).get("volume") or {}
+            _pc = int(_pv.get("total_call_vol") or 0)
+            _pp = int(_pv.get("total_put_vol") or 0)
+            if chain_volume_rolled_over(_pc, _pp, total_cv0, total_pv0):
+                print(
+                    f"{C.YELLOW}ABORT: chain volume rollover detected "
+                    f"(same ET session {_today_et}). "
+                    f"prev call/put={_pc:,}/{_pp:,}  "
+                    f"curr call/put={total_cv0:,}/{total_pv0:,}. "
+                    f"No archive, no attribution.{C.RESET}"
+                )
+                return
+
+    # Build a provisional volume block for the quality gate (top-30 shape)
+    _vol_gate = {
+        "top_calls": calls_all[calls_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+        "top_puts": puts_all[puts_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+        "total_call_vol": total_cv0,
+        "total_put_vol": total_pv0,
+    }
+    _q_fail, _q_detail = chain_fails_quality_gate(_vol_gate)
+    if _q_fail:
+        _cs = _q_detail.get("calls") or {}
+        print(
+            f"{C.YELLOW}ABORT: chain quality gate failed "
+            f"(unusable {_cs.get('unusable', 0)}/{_cs.get('total', 0)} "
+            f"top calls, frac={_q_detail.get('frac_unusable', 0):.0%}; "
+            f"zero_bid_ask={_cs.get('zero_bid_ask', 0)}, "
+            f"low_iv={_cs.get('low_iv', 0)}). "
+            f"No archive, no attribution.{C.RESET}"
+        )
+        return
+
+    # ── Stale volume vs prior EOD (CURSOR_STALE_VOLUME_FIX) ────────────────
+    _eod_lookup = None
+    _eod_arch, _eod_reason = find_prior_eod_archive(TICKER, "archive", now_et=_ET_now)
+    if _eod_arch is None:
+        print(
+            f"{C.YELLOW}WARN: EOD volume reference unavailable ({_eod_reason}); "
+            f"stale-volume check skipped — decrease detector only.{C.RESET}"
+        )
+    elif not stale_check_active(_ET_now):
+        print(
+            f"{C.GRAY}  Stale-volume EOD check skipped (past cutoff ET).{C.RESET}"
+        )
+        _eod_lookup = eod_volume_lookup(_eod_arch)  # still pass through for attach after cutoff? no
+        _eod_lookup = None
+    else:
+        _eod_lookup = eod_volume_lookup(_eod_arch)
+        _call_flags = flag_stale_vs_eod(
+            _vol_gate.get("top_calls") or [], _eod_lookup, side="CALL"
+        )
+        _put_flags = flag_stale_vs_eod(
+            _vol_gate.get("top_puts") or [], _eod_lookup, side="PUT"
+        )
+        _n_stale = sum(_call_flags) + sum(_put_flags)
+        _n_tot = len(_call_flags) + len(_put_flags)
+        print(
+            f"{C.GRAY}  Stale-volume vs EOD: flagged {_n_stale}/{_n_tot} "
+            f"top contracts (calls={sum(_call_flags)}, puts={sum(_put_flags)})."
+            f"{C.RESET}"
+        )
+        if majority_stale_abort(_n_stale, _n_tot):
+            print(
+                f"{C.YELLOW}ABORT: majority stale volume "
+                f"({_n_stale}/{_n_tot} > 50%). "
+                f"No archive, no attribution.{C.RESET}"
+            )
+            return
+
 
     # -- Session block: open, prev_close, day_high, day_low ------------------
     # Derived from frames["1D"] - already fetched, no extra network call.
@@ -820,9 +1116,39 @@ def run():
         session = None
     # ------------------------------------------------------------------------
 
-    fname_json, fname_txt = save_archive(spot, tf_data, calls_all, puts_all,
-                                         or_data=or_data, direction=direction0,
-                                         session=session)
+    fname_json, fname_txt = save_archive(
+        spot, tf_data, calls_all, puts_all,
+        or_data=or_data, direction=direction0,
+        session=session,
+        is_eod=IS_EOD,
+        settlement_converged=settlement_converged if IS_EOD else None,
+    )
+
+    # Attribution: every scored contract + ATM controls (fail-soft)
+    vol_curr = {
+        "top_calls": calls_all[calls_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+        "top_puts": puts_all[puts_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+    }
+    vol_prev_bv = None
+    if prev_result:
+        vol_prev_bv = (prev_result[0] or {}).get("volume")
+    _log_scan_attribution(
+        ticker=TICKER,
+        spot=spot,
+        calls_all=calls_all,
+        puts_all=puts_all,
+        vol_curr=vol_curr,
+        vol_prev=vol_prev_bv,
+        session=session,
+        run_kind="eod" if IS_EOD else "intraday",
+        eod_vol_lookup=_eod_lookup,
+    )
 
     # capture report as plain text
     import io

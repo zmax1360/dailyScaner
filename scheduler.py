@@ -10,7 +10,8 @@ Can be run directly OR auto-launched by app.py on startup.
 Behaviour
 ─────────
 • Every 30 s it checks which tickers are due for a scan.
-• Scans only run Mon–Fri between market_open and market_close (ET).
+• Scans only run Mon–Fri between market_open and eod_time (ET clocks only; F-23).
+• At eod_time (default 16:20 ET) one --eod scan per ticker runs with volume convergence.
 • Per-ticker intervals are read from scheduler_config.json.
 • After each successful scan a Telegram alert is sent (if bot is configured).
 • A PID file (scheduler.pid) prevents duplicate instances.
@@ -76,6 +77,8 @@ if not log.handlers:
 _DEFAULT_CFG: dict = {
     "market_open":          "09:30",
     "market_close":         "16:00",
+    "eod_time":             "16:20",  # ET — last daily run (configurable)
+    "post_close_buffer_min": 20,     # used only if eod_time omitted
     "default_interval_min": 5,
     "notify_telegram":      True,
     "tickers":              {},
@@ -134,26 +137,43 @@ def discover_tickers() -> list[str]:
     return sorted(tickers - excluded)
 
 # ── Market hours ───────────────────────────────────────────────────────────────
-def market_is_open(cfg: dict) -> bool:
+def _now_et() -> datetime:
+    """Always America/New_York — never the machine local clock (F-23)."""
+    return datetime.now(ET)
+
+
+def market_is_open(cfg: dict, now_et: datetime | None = None) -> bool:
     """
-    Return True if scans should run right now.
-    Window: market_open → market_close + post_close_buffer_min (ET).
-    The extra buffer captures the yfinance 15-minute delayed feed that
-    is only fully settled after the official close.
+    Return True if scans should run right now (ET clock).
+
+    Window: market_open → eod_time (default 16:20 ET). Prefer explicit
+    ``eod_time`` over market_close + post_close_buffer so the last slot is
+    configurable without hardcoding.
     """
-    now_et = datetime.now(ET)
+    from eod_settlement import scan_window_end_et
+
+    now_et = now_et or _now_et()
+    if now_et.tzinfo is None:
+        now_et = now_et.replace(tzinfo=ET)
+    now_et = now_et.astimezone(ET)
     if now_et.weekday() >= 5:          # Saturday / Sunday
         return False
-    open_h,  open_m  = map(int, cfg["market_open"].split(":"))
-    close_h, close_m = map(int, cfg["market_close"].split(":"))
-    buffer = int(cfg.get("post_close_buffer_min", 15))
-
-    # Extend close by buffer minutes
-    close_total_min  = close_h * 60 + close_m + buffer
-    close_h2, close_m2 = divmod(close_total_min, 60)
-
+    open_h, open_m = map(int, str(cfg.get("market_open", "09:30")).split(":"))
+    end = scan_window_end_et(cfg)
+    # Inclusive of the eod_time minute so the EOD run can start at 16:20
+    end_exclusive = (
+        dtime(end.hour, end.minute + 1)
+        if end.minute < 59
+        else dtime(end.hour + 1, 0)
+    )
     t = now_et.time()
-    return dtime(open_h, open_m) <= t < dtime(close_h2, close_m2)
+    return dtime(open_h, open_m) <= t < end_exclusive
+
+
+def should_run_eod(cfg: dict, now_et: datetime | None = None) -> bool:
+    """True once we have reached configured eod_time ET today."""
+    from eod_settlement import is_eod_slot
+    return is_eod_slot(now_et or _now_et(), cfg)
 
 # ── Telegram notify ────────────────────────────────────────────────────────────
 def _send_telegram(token: str, chat_id: str, text: str) -> bool:
@@ -227,17 +247,21 @@ def _notify(ticker: str, success: bool, env: dict, elapsed: float) -> None:
         log.warning(f"[{ticker}] notify error: {exc}")
 
 # ── Scanner runner ─────────────────────────────────────────────────────────────
-def run_scan(ticker: str, timeout: int = 300) -> tuple[bool, float]:
+def run_scan(ticker: str, timeout: int = 300, *, eod: bool = False) -> tuple[bool, float]:
     """
-    Invoke dailyScaner.py <ticker>.
+    Invoke dailyScaner.py <ticker> [--eod].
     Returns (success, elapsed_seconds).
+    EOD runs may take longer (convergence waits) — default timeout raised by caller.
     """
     python = sys.executable
     scanner = os.path.join(BASE_DIR, "dailyScaner.py")
+    cmd = [python, scanner, ticker]
+    if eod:
+        cmd.append("--eod")
     start = time.monotonic()
     try:
         result = subprocess.run(
-            [python, scanner, ticker],
+            cmd,
             cwd=BASE_DIR,
             capture_output=True,
             text=True,
@@ -353,12 +377,16 @@ def main(once: bool = False) -> None:
 
     # last_scan[ticker] = monotonic time of last scan
     last_scan: dict[str, float] = {}
+    # eod_done_day[ticker] = YYYY-MM-DD ET when EOD already ran
+    eod_done_day: dict[str, str] = {}
 
     try:
         while True:
             cfg     = load_config()
             env     = _load_env()
             tickers = discover_tickers()
+            now_dt  = _now_et()
+            today_s = now_dt.date().isoformat()
 
             if not tickers:
                 log.info("No tickers found — waiting …")
@@ -367,30 +395,55 @@ def main(once: bool = False) -> None:
                 time.sleep(60)
                 continue
 
-            open_now = market_is_open(cfg)
-            now_et   = datetime.now(ET).strftime("%H:%M ET")
+            open_now = market_is_open(cfg, now_dt)
+            now_et   = now_dt.strftime("%H:%M ET")
+            eod_now  = should_run_eod(cfg, now_dt)
+            # Convergence can run past eod_time; keep scheduling until each
+            # ticker has completed its once-per-day EOD for today (ET).
+            pending_eod = eod_now and any(
+                eod_done_day.get(t) != today_s for t in tickers
+            )
 
-            if not open_now and not once:
+            if not open_now and not pending_eod and not once:
                 log.info(f"Market closed ({now_et}) — sleeping 60 s")
                 time.sleep(60)
                 continue
 
-            default_interval = int(cfg.get("default_interval_min", 5)) * 60
-            notify           = bool(cfg.get("notify_telegram", True))
-            now_mono         = time.monotonic()
+            notify   = bool(cfg.get("notify_telegram", True))
+            now_mono = time.monotonic()
 
             for ticker in tickers:
                 ticker_cfg = (cfg.get("tickers") or {}).get(ticker, {})
                 interval   = int(ticker_cfg.get("interval_min",
                                   cfg.get("default_interval_min", 5))) * 60
 
+                # One EOD run per ticker per ET day once eod_time is reached
+                if eod_now and eod_done_day.get(ticker) != today_s and not once:
+                    log.info(f"[{ticker}] starting EOD scan @ {now_et}")
+                    # Convergence: up to 3 reads with 10 min gaps → ~25 min
+                    ok, elapsed = run_scan(ticker, timeout=2400, eod=True)
+                    eod_done_day[ticker] = today_s
+                    last_scan[ticker] = time.monotonic()
+                    if notify:
+                        _notify(ticker, ok, env, elapsed)
+                    continue
+
                 last = last_scan.get(ticker, 0)
                 due  = (now_mono - last) >= interval
 
+                # Skip new intraday scans once we are in/after the EOD slot
+                if eod_now and not once:
+                    continue
+                if not open_now and not once:
+                    continue
+
                 if due or once:
-                    log.info(f"[{ticker}] starting scan "
-                             f"(interval={interval//60}min, market={'open' if open_now else 'manual'})")
-                    ok, elapsed = run_scan(ticker)
+                    mode = "manual" if once else "open"
+                    log.info(
+                        f"[{ticker}] starting scan "
+                        f"(interval={interval//60}min, market={mode})"
+                    )
+                    ok, elapsed = run_scan(ticker, eod=False)
                     last_scan[ticker] = time.monotonic()
                     if notify:
                         _notify(ticker, ok, env, elapsed)

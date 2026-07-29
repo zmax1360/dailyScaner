@@ -8,10 +8,12 @@ in dailyScaner.py.
 """
 
 import math
-from datetime import date, datetime
+from datetime import datetime
 
 import pandas as pd
 import yfinance as yf
+
+from attribution import now_et
 
 
 def _safe_int(v, default: int = 0) -> int:
@@ -49,12 +51,13 @@ def fetch_full_chain(ticker: str = "AAPL") -> pd.DataFrame:
         volume          int
         openInterest    int
         impliedVolatility float
+        delta             float | None  (Black-Scholes; None when IV/DTE unusable)
 
     The DataFrame is never filtered or sorted here — callers decide what
     they want to keep.  Returns an empty DataFrame (correct columns) on
     any fetch failure so the caller can display a graceful error.
     """
-    today = date.today()
+    today = now_et().date()
     rows: list[dict] = []
 
     try:
@@ -90,10 +93,38 @@ def fetch_full_chain(ticker: str = "AAPL") -> pd.DataFrame:
                     "volume":            _safe_int(row.get("volume")),
                     "openInterest":      _safe_int(row.get("openInterest")),
                     "impliedVolatility": _safe_float(row.get("impliedVolatility")),
+                    "delta":             None,  # filled below
                 })
 
     if not rows:
         return _empty_frame()
+
+    from greeks import bs_delta, effective_dte_days
+    from config import SCORING
+
+    # Spot for delta: prefer underlying last from first successful history
+    spot = None
+    try:
+        hist = t.history(period="1d")
+        if hist is not None and not hist.empty:
+            spot = _safe_float(hist["Close"].iloc[-1])
+    except Exception:
+        spot = None
+    r_free = float(SCORING.get("risk_free_rate", 0.045))
+    asof = now_et()
+    for row in rows:
+        if spot and spot > 0:
+            # Pass DAYS via effective_dte_days (0DTE → fraction of a day to 16:00 ET)
+            t_days = effective_dte_days(
+                row["dte"], expiry=row["expiry"], now_et=asof,
+            )
+            d = bs_delta(
+                row["side"], spot, row["strike"], t_days,
+                row["impliedVolatility"], r=r_free,
+            )
+        else:
+            d = None
+        row["delta"] = d
     return pd.DataFrame(rows)
 
 
@@ -156,5 +187,5 @@ def _empty_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=[
         "side", "strike", "expiry", "dte",
         "bid", "ask", "mid", "last",
-        "volume", "openInterest", "impliedVolatility",
+        "volume", "openInterest", "impliedVolatility", "delta",
     ])
