@@ -51,4 +51,8 @@ SCORING: dict[str, float | int] = {
     "min_iv_usable": 0.01,
     "quality_top_n": 30,
     "max_unusable_frac": 0.20,
+    # Stale Yahoo volume vs prior EOD (CURSOR_STALE_VOLUME_FIX)
+    "stale_volume_ratio": 0.95,
+    "stale_check_cutoff_et": "11:00",
+    "stale_majority_abort_frac": 0.50,
 }

@@ -47,6 +47,7 @@ def _log_scan_attribution(
     vol_prev: dict | None,
     session: dict | None,
     run_kind: str = "intraday",
+    eod_vol_lookup: dict | None = None,
 ) -> None:
     """
     Score + append attribution rows. Fail-soft: never abort a scan.
@@ -78,6 +79,7 @@ def _log_scan_attribution(
             daily_bias=daily_bias,
             market_state=market_state,
             news_bias=news_bias,
+            eod_vol_lookup=eod_vol_lookup,
         )
 
         chain = pd.concat(
@@ -984,9 +986,15 @@ def run():
         archive_session_date,
         chain_fails_quality_gate,
         chain_volume_rolled_over,
+        eod_volume_lookup,
+        find_prior_eod_archive,
+        flag_stale_vs_eod,
+        majority_stale_abort,
+        stale_check_active,
     )
     from zoneinfo import ZoneInfo as _ZI
-    _today_et = datetime.now(_ZI("America/New_York")).date()
+    _ET_now = datetime.now(_ZI("America/New_York"))
+    _today_et = _ET_now.date()
     if prev_result:
         _prev_data, _prev_file = prev_result
         _prev_day = archive_session_date(_prev_data)
@@ -1029,6 +1037,43 @@ def run():
             f"No archive, no attribution.{C.RESET}"
         )
         return
+
+    # ── Stale volume vs prior EOD (CURSOR_STALE_VOLUME_FIX) ────────────────
+    _eod_lookup = None
+    _eod_arch, _eod_reason = find_prior_eod_archive(TICKER, "archive", now_et=_ET_now)
+    if _eod_arch is None:
+        print(
+            f"{C.YELLOW}WARN: EOD volume reference unavailable ({_eod_reason}); "
+            f"stale-volume check skipped — decrease detector only.{C.RESET}"
+        )
+    elif not stale_check_active(_ET_now):
+        print(
+            f"{C.GRAY}  Stale-volume EOD check skipped (past cutoff ET).{C.RESET}"
+        )
+        _eod_lookup = eod_volume_lookup(_eod_arch)  # still pass through for attach after cutoff? no
+        _eod_lookup = None
+    else:
+        _eod_lookup = eod_volume_lookup(_eod_arch)
+        _call_flags = flag_stale_vs_eod(
+            _vol_gate.get("top_calls") or [], _eod_lookup, side="CALL"
+        )
+        _put_flags = flag_stale_vs_eod(
+            _vol_gate.get("top_puts") or [], _eod_lookup, side="PUT"
+        )
+        _n_stale = sum(_call_flags) + sum(_put_flags)
+        _n_tot = len(_call_flags) + len(_put_flags)
+        print(
+            f"{C.GRAY}  Stale-volume vs EOD: flagged {_n_stale}/{_n_tot} "
+            f"top contracts (calls={sum(_call_flags)}, puts={sum(_put_flags)})."
+            f"{C.RESET}"
+        )
+        if majority_stale_abort(_n_stale, _n_tot):
+            print(
+                f"{C.YELLOW}ABORT: majority stale volume "
+                f"({_n_stale}/{_n_tot} > 50%). "
+                f"No archive, no attribution.{C.RESET}"
+            )
+            return
 
 
     # -- Session block: open, prev_close, day_high, day_low ------------------
@@ -1102,6 +1147,7 @@ def run():
         vol_prev=vol_prev_bv,
         session=session,
         run_kind="eod" if IS_EOD else "intraday",
+        eod_vol_lookup=_eod_lookup,
     )
 
     # capture report as plain text

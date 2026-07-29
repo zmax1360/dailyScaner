@@ -26,7 +26,14 @@ def _contract_price(c: dict) -> float:
     return last if last > 0 else 0.0
 
 
-def attach_dvol(df: pd.DataFrame, vol_prev: dict | None) -> pd.DataFrame:
+def attach_dvol(
+    df: pd.DataFrame,
+    vol_prev: dict | None,
+    *,
+    eod_vol_lookup: dict | None = None,
+    now_et: datetime | None = None,
+    cfg: dict | None = None,
+) -> pd.DataFrame:
     """
     Attach ΔVol vs previous archive top-30 snapshot.
 
@@ -34,42 +41,84 @@ def attach_dvol(df: pd.DataFrame, vol_prev: dict | None) -> pd.DataFrame:
     NOT volume - 0. Treating absence as prev=0 made new entrants look like
     full-volume surges and systematically win BEST VALUE (phantom ΔVol).
 
-    Contract-level session rollover (Task A): if current volume < prior volume
-    for the same (side, strike, expiry), set dVol = NaN and dvol_suspect=True.
-    Never take abs() of a negative dVol — that is handled at the flow leg.
+    Detectors (both set dVol=NaN + dvol_suspect; never write 0):
+      1. Decrease vs prior scan — contract already rolled (Task A)
+      2. EOD-match — volume still >= ratio * prior-day EOD (not yet rolled)
+
+    stale_volume=True only for detector (2). Counts logged via attrs on the frame.
     """
+    from chain_quality import (
+        is_volume_stale_vs_eod,
+        stale_check_active,
+    )
+    from config import SCORING
+
+    cfg = cfg or SCORING
     df = df.copy()
     if "dvol_suspect" not in df.columns:
         df["dvol_suspect"] = False
-    if not vol_prev:
+    if "stale_volume" not in df.columns:
+        df["stale_volume"] = False
+
+    if not vol_prev and not eod_vol_lookup:
         return df
 
     prev_lookup: dict[tuple, int] = {}
-    for side, key in [("CALL", "top_calls"), ("PUT", "top_puts")]:
-        for c in (vol_prev.get(key) or []):
-            k = (side, float(c.get("strike") or 0), c.get("expiry", ""))
-            prev_lookup[k] = int(c.get("volume") or 0)
+    if vol_prev:
+        for side, key in [("CALL", "top_calls"), ("PUT", "top_puts")]:
+            for c in (vol_prev.get(key) or []):
+                k = (side, float(c.get("strike") or 0), c.get("expiry", ""))
+                prev_lookup[k] = int(c.get("volume") or 0)
 
+    eod_lookup = eod_vol_lookup or {}
+    do_eod = bool(eod_lookup) and (
+        now_et is None or stale_check_active(now_et, cfg=cfg)
+    )
+
+    n_decrease = 0
+    n_eod_stale = 0
     dvols: list[float] = []
     suspects: list[bool] = []
+    stales: list[bool] = []
+
     for _, r in df.iterrows():
         k = (r["side"], float(r["strike"]), r["expiry"])
-        if k not in prev_lookup:
-            dvols.append(float("nan"))
-            suspects.append(False)
-            continue
-        prev_v = float(prev_lookup[k])
         curr_v = float(r["volume"])
-        if curr_v < prev_v:
-            # Yahoo rolled prior-session cumulative volume off this contract
-            dvols.append(float("nan"))
-            suspects.append(True)
-        else:
-            dvols.append(curr_v - prev_v)
-            suspects.append(False)
+        suspect = False
+        stale = False
+        dvol = float("nan")
+
+        if k in prev_lookup:
+            prev_v = float(prev_lookup[k])
+            if curr_v < prev_v:
+                # Yahoo rolled prior-session cumulative volume off this contract
+                n_decrease += 1
+                suspect = True
+                dvol = float("nan")
+            else:
+                dvol = curr_v - prev_v
+        # else: new entrant — dVol stays NaN, not suspect
+
+        if (
+            not suspect
+            and do_eod
+            and k in eod_lookup
+            and is_volume_stale_vs_eod(curr_v, eod_lookup[k], cfg=cfg)
+        ):
+            n_eod_stale += 1
+            suspect = True
+            stale = True
+            dvol = float("nan")
+
+        dvols.append(dvol)
+        suspects.append(suspect)
+        stales.append(stale)
 
     df["dVol"] = dvols
     df["dvol_suspect"] = suspects
+    df["stale_volume"] = stales
+    df.attrs["n_decrease_suspect"] = n_decrease
+    df.attrs["n_eod_stale"] = n_eod_stale
     return df
 
 
@@ -240,14 +289,24 @@ def calculate_best_value(
         ) / work.loc[has_delta, "last"].replace(0, float("nan"))
         work.loc[has_delta, "_lev"] = lev
 
-    voi_raw = work["volume"] / work["openInterest"].clip(lower=1)
+    voi_raw = work["volume"].astype(float) / work["openInterest"].clip(lower=1)
+    # Stale Yahoo volume is not a measurement — exclude from volume-derived flow
+    # (NaN, never 0). Decrease-suspect keeps volume; only dVol is unknown.
+    if "stale_volume" in work.columns:
+        voi_raw = voi_raw.where(~work["stale_volume"].astype(bool), float("nan"))
     if "dVol" in work.columns:
         # Direction of flow is signal — do NOT abs(). New entrants (NaN) → ×1
-        # (F-05 fillna(1.0) left unchanged by Task A).
-        d_vol = work["dVol"].fillna(1.0)
+        # (F-05 fillna(1.0) left unchanged). Stale rows keep NaN dVol (no fill).
+        d_vol = work["dVol"].copy()
+        if "stale_volume" in work.columns:
+            fill = d_vol.isna() & ~work["stale_volume"].astype(bool)
+            d_vol = d_vol.where(~fill, 1.0)
+        else:
+            d_vol = d_vol.fillna(1.0)
     else:
         d_vol = work["volume"]
-    work["_flow"] = (voi_raw * d_vol).fillna(0.0).clip(lower=0)
+    work["_flow"] = (voi_raw * d_vol).clip(lower=0)
+    # NaN flow (stale) stays NaN — do not fillna(0); excluded from nflow minmax below
 
     def _minmax(s: pd.Series) -> pd.Series:
         mn, mx = s.min(), s.max()
@@ -256,14 +315,18 @@ def calculate_best_value(
         return (s - mn) / (mx - mn)
 
     work["_nlev"] = float("nan")
-    work["_nflow"] = _minmax(work["_flow"])
+    work["_nflow"] = float("nan")
+    flow_ok = work["_flow"].notna()
+    if flow_ok.any():
+        work.loc[flow_ok, "_nflow"] = _minmax(work.loc[flow_ok, "_flow"].astype(float))
     if has_delta.any():
         work.loc[has_delta, "_nlev"] = _minmax(work.loc[has_delta, "_lev"].astype(float))
-    # Only rows with a real delta participate in Value_Score
+    # Only rows with a real delta AND usable flow participate in Value_Score
     work["Value_Score"] = float("nan")
-    work.loc[has_delta, "Value_Score"] = (
-        work.loc[has_delta, "_nlev"] * w_lev
-        + work.loc[has_delta, "_nflow"] * w_flow
+    scored_mask = has_delta & flow_ok
+    work.loc[scored_mask, "Value_Score"] = (
+        work.loc[scored_mask, "_nlev"] * w_lev
+        + work.loc[scored_mask, "_nflow"] * w_flow
     )
 
     # Per-row multiplier breakdown (product must reproduce Value_Score)
@@ -510,6 +573,8 @@ def calculate_best_value(
         df.loc[work.index, "_bias_unknown"] = work["_bias_unknown"]
     if "dvol_suspect" in work.columns:
         df.loc[work.index, "dvol_suspect"] = work["dvol_suspect"]
+    if "stale_volume" in work.columns:
+        df.loc[work.index, "stale_volume"] = work["stale_volume"]
     return df
 
 
@@ -525,6 +590,7 @@ def build_best_value_df(
     now_et: datetime | None = None,
     profited_shares_pct: float | None = None,
     *,
+    eod_vol_lookup: dict | None = None,
     upper_1sd: float | None = None,
     lower_1sd: float | None = None,
     optimal_strategy: str | None = None,
@@ -563,7 +629,12 @@ def build_best_value_df(
     if not rows:
         return pd.DataFrame()
 
-    df = attach_dvol(pd.DataFrame(rows), vol_prev)
+    df = attach_dvol(
+        pd.DataFrame(rows),
+        vol_prev,
+        eod_vol_lookup=eod_vol_lookup,
+        now_et=now_et,
+    )
     return calculate_best_value(
         df,
         spot_price=spot,

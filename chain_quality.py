@@ -205,3 +205,194 @@ def iv_degraded_for_1sd(
         return True
     # Degraded if fewer than half the rows have usable IV, or none do
     return len(usable) == 0 or (len(usable) / total) < 0.5
+
+
+# ── Stale volume vs prior EOD (CURSOR_STALE_VOLUME_FIX) ───────────────────────
+
+def prior_trading_day(d: date) -> date:
+    """Most recent weekday strictly before *d* (Mon → Fri)."""
+    from datetime import timedelta
+
+    cur = d - timedelta(days=1)
+    while cur.weekday() >= 5:
+        cur -= timedelta(days=1)
+    return cur
+
+
+def parse_cutoff_hhmm(value: str, default: str = "11:00"):
+    from datetime import time as dtime
+
+    raw = (value or default).strip()
+    parts = raw.split(":")
+    return dtime(int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+
+
+def stale_check_active(now_et: datetime, *, cfg: Mapping[str, Any] | None = None) -> bool:
+    """
+    True while the EOD-match stale check should run.
+
+    Chosen: clock cutoff (default 11:00 ET), not 'observed decrease this session'.
+    Tracking per-contract roll state across scans needs durable process state that
+    dies on restart; a config-hashed cutoff is deterministic and enough for the
+    morning Yahoo-cache failure mode.
+    """
+    cfg = cfg or SCORING
+    if now_et.tzinfo is None:
+        now_et = now_et.replace(tzinfo=ET)
+    now_et = now_et.astimezone(ET)
+    cutoff = parse_cutoff_hhmm(str(cfg.get("stale_check_cutoff_et", "11:00")))
+    return now_et.time() < cutoff
+
+
+def is_volume_stale_vs_eod(
+    today_volume: float | int,
+    prior_eod_volume: float | int,
+    *,
+    ratio: float | None = None,
+    cfg: Mapping[str, Any] | None = None,
+) -> bool:
+    """
+    today_volume >= prior_eod_volume * ratio → stale (feed not refreshed).
+
+    Do not use equality — late prints often push the cached value slightly above EOD.
+    """
+    cfg = cfg or SCORING
+    r = float(cfg.get("stale_volume_ratio", 0.95) if ratio is None else ratio)
+    try:
+        today = float(today_volume)
+        eod = float(prior_eod_volume)
+    except (TypeError, ValueError):
+        return False
+    if eod <= 0 or today != today or eod != eod:
+        return False
+    return today >= eod * r
+
+
+def eod_volume_lookup(archive: Mapping[str, Any] | None) -> dict[tuple, int]:
+    """(side, strike, expiry) → volume from an EOD archive volume block."""
+    out: dict[tuple, int] = {}
+    if not archive:
+        return out
+    vol = archive.get("volume") or archive
+    for side, key in (("CALL", "top_calls"), ("PUT", "top_puts")):
+        for c in vol.get(key) or []:
+            try:
+                k = (side, float(c.get("strike") or 0), str(c.get("expiry") or ""))
+                out[k] = int(float(c.get("volume") or 0))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def find_prior_eod_archive(
+    ticker: str,
+    archive_dir: str | Any = "archive",
+    *,
+    now_et: datetime | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """
+    Load the most recent prior-trading-day EOD archive for *ticker*.
+
+    Returns (payload, reason). reason is 'ok' on success; otherwise explains
+    why the EOD-match check must be skipped.
+    """
+    import json
+    import logging
+    from pathlib import Path
+
+    log = logging.getLogger("chain_quality")
+
+    now_et = now_et or datetime.now(ET)
+    if now_et.tzinfo is None:
+        now_et = now_et.replace(tzinfo=ET)
+    now_et = now_et.astimezone(ET)
+    target = prior_trading_day(now_et.date())
+
+    root = Path(archive_dir)
+    if not root.is_dir():
+        reason = f"archive_dir missing: {archive_dir}"
+        log.warning("EOD volume reference unavailable: %s", reason)
+        return None, reason
+
+    prefix = f"{ticker.upper()}_"
+    candidates: list[tuple[date, Path, dict]] = []
+    for path in sorted(root.glob(f"{prefix}*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not data.get("is_eod"):
+            continue
+        day = archive_session_date(data)
+        if day is None:
+            continue
+        candidates.append((day, path, data))
+
+    if not candidates:
+        reason = "no is_eod=true archive on disk for ticker"
+        log.warning("EOD volume reference unavailable: %s", reason)
+        return None, reason
+
+    for day, path, data in reversed(candidates):
+        if day == target:
+            if data.get("settlement_converged") is not True:
+                reason = (
+                    f"EOD archive {path.name} for {target} has "
+                    f"settlement_converged={data.get('settlement_converged')!r} "
+                    f"(need true)"
+                )
+                log.warning("EOD volume reference unavailable: %s", reason)
+                return None, reason
+            return data, "ok"
+        if day > target:
+            continue
+        reason = (
+            f"latest EOD archive is {day.isoformat()} "
+            f"(need prior trading day {target.isoformat()}); stale reference rejected"
+        )
+        log.warning("EOD volume reference unavailable: %s", reason)
+        return None, reason
+
+    reason = f"no EOD archive for prior trading day {target.isoformat()}"
+    log.warning("EOD volume reference unavailable: %s", reason)
+    return None, reason
+
+
+def flag_stale_vs_eod(
+    contracts: Iterable[Mapping[str, Any]],
+    eod_lookup: Mapping[tuple, int],
+    *,
+    side: str = "CALL",
+    cfg: Mapping[str, Any] | None = None,
+) -> list[bool]:
+    """Per-contract stale flags (True = stale vs EOD). Length matches input."""
+    cfg = cfg or SCORING
+    ratio = float(cfg.get("stale_volume_ratio", 0.95))
+    flags: list[bool] = []
+    for c in contracts:
+        try:
+            k = (side, float(c.get("strike") or 0), str(c.get("expiry") or ""))
+            today_v = float(c.get("volume") or 0)
+        except (TypeError, ValueError):
+            flags.append(False)
+            continue
+        eod_v = eod_lookup.get(k)
+        if eod_v is None:
+            flags.append(False)
+            continue
+        flags.append(is_volume_stale_vs_eod(today_v, eod_v, ratio=ratio, cfg=cfg))
+    return flags
+
+
+def majority_stale_abort(
+    n_stale: int,
+    n_total: int,
+    *,
+    cfg: Mapping[str, Any] | None = None,
+) -> bool:
+    """True when flagged-stale fraction of top-N exceeds threshold (default 50%)."""
+    cfg = cfg or SCORING
+    frac_lim = float(cfg.get("stale_majority_abort_frac", 0.50))
+    if n_total <= 0:
+        return False
+    return (n_stale / n_total) > frac_lim
