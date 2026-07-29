@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from sources.base import CHAIN_COLUMNS, MarketDataSource, validate_chain
 from sources.fixture import FixtureSource
+from sources.massive import MassiveSource
 from sources.yahoo import YahooSource
 
 __all__ = [
     "CHAIN_COLUMNS",
     "FixtureSource",
     "MarketDataSource",
+    "MassiveSource",
     "YahooSource",
     "get_source",
     "validate_chain",
@@ -27,13 +29,11 @@ def get_source(name: str) -> MarketDataSource:
     key = str(name or "yahoo").strip().lower()
     if key == "yahoo":
         return YahooSource()
+    if key == "massive":
+        return MassiveSource()
     if key == "fixture":
         raise ValueError(
             "fixture source must be constructed as FixtureSource(path_or_dict); "
             "get_source('fixture') is not supported"
-        )
-    if key == "massive":
-        raise ValueError(
-            "massive source is not available until CURSOR_SOURCES_STEPS Step 6"
         )
     raise ValueError(f"unknown market_data_source: {name!r}")
