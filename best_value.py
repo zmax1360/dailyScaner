@@ -34,6 +34,9 @@ def attach_dvol(
     now_et: datetime | None = None,
     cfg: dict | None = None,
     volume_is_session_scoped: bool = False,
+    current_source: str = "yahoo",
+    prev_archive_source: str | None = None,
+    eod_archive_source: str | None = None,
 ) -> pd.DataFrame:
     """
     Attach ΔVol vs previous archive top-30 snapshot.
@@ -49,9 +52,13 @@ def attach_dvol(
     When ``volume_is_session_scoped`` is True (e.g. Massive), both detectors
     are dormant — session volume is already clean.
 
+    Cross-source comparisons are skipped (Yahoo vs Massive volume semantics
+    differ); missing archive ``source`` is treated as yahoo.
+
     stale_volume=True only for detector (2). Counts logged via attrs on the frame.
     """
     from chain_quality import (
+        archive_source_name,
         is_volume_stale_vs_eod,
         rollover_detectors_active,
         stale_check_active,
@@ -73,17 +80,39 @@ def attach_dvol(
         df.attrs["rollover_detectors"] = "dormant_session_scoped"
         return df
 
-    if not vol_prev and not eod_vol_lookup:
+    curr_src = archive_source_name({"source": current_source})
+    prev_src = archive_source_name({"source": prev_archive_source})
+    eod_src = archive_source_name({"source": eod_archive_source})
+
+    use_prev = bool(vol_prev) and prev_src == curr_src
+    use_eod_lookup = bool(eod_vol_lookup) and eod_src == curr_src
+
+    if vol_prev and not use_prev:
+        df.attrs["prev_source_compare"] = (
+            f"skipped_mismatch:{prev_src}->{curr_src}"
+        )
+    if eod_vol_lookup and not use_eod_lookup:
+        df.attrs["eod_source_compare"] = (
+            f"skipped_mismatch:{eod_src}->{curr_src}"
+        )
+
+    if not use_prev and not use_eod_lookup:
+        if "dVol" not in df.columns:
+            df["dVol"] = float("nan")
+        df.attrs["n_decrease_suspect"] = 0
+        df.attrs["n_eod_stale"] = 0
+        if vol_prev or eod_vol_lookup:
+            df.attrs["rollover_detectors"] = "skipped_source_mismatch"
         return df
 
     prev_lookup: dict[tuple, int] = {}
-    if vol_prev:
+    if use_prev and vol_prev:
         for side, key in [("CALL", "top_calls"), ("PUT", "top_puts")]:
             for c in (vol_prev.get(key) or []):
                 k = (side, float(c.get("strike") or 0), c.get("expiry", ""))
                 prev_lookup[k] = int(c.get("volume") or 0)
 
-    eod_lookup = eod_vol_lookup or {}
+    eod_lookup = eod_vol_lookup if use_eod_lookup else {}
     do_eod = bool(eod_lookup) and (
         now_et is None or stale_check_active(now_et, cfg=cfg)
     )
@@ -586,6 +615,9 @@ def build_best_value_df(
     *,
     eod_vol_lookup: dict | None = None,
     volume_is_session_scoped: bool = False,
+    current_source: str = "yahoo",
+    prev_archive_source: str | None = None,
+    eod_archive_source: str | None = None,
     upper_1sd: float | None = None,
     lower_1sd: float | None = None,
     optimal_strategy: str | None = None,
@@ -632,6 +664,9 @@ def build_best_value_df(
         eod_vol_lookup=eod_vol_lookup,
         now_et=now_et,
         volume_is_session_scoped=volume_is_session_scoped,
+        current_source=current_source,
+        prev_archive_source=prev_archive_source,
+        eod_archive_source=eod_archive_source,
     )
     return calculate_best_value(
         df,

@@ -26,11 +26,19 @@ ET = ZoneInfo("America/New_York")
 log = logging.getLogger("sources.massive")
 
 REST_BASE = "https://api.massive.com"
-_MAX_PAGES = 5
 
 
 class MassivePlanError(RuntimeError):
     """Raised on HTTP 403 — plan does not cover the endpoint. Do not retry."""
+
+
+class MassiveChainTruncatedError(RuntimeError):
+    """
+    Raised when pagination hits massive_max_pages with more results remaining.
+
+    Chosen (a): abort rather than score a silent partial chain — truncated
+    totals and top-30 rankings are worse than skipping the scan.
+    """
 
 
 def _today_et() -> date:
@@ -142,12 +150,24 @@ class MassiveSource:
     name = "massive"
     volume_is_session_scoped = True
 
-    def __init__(self, api_key: str | None = None, *, timeout: float = 20.0) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        timeout: float = 20.0,
+        max_pages: int | None = None,
+    ) -> None:
         key = api_key if api_key is not None else os.environ.get("MASSIVE_API_KEY", "")
         if not str(key).strip():
             raise ValueError("MASSIVE_API_KEY is required for MassiveSource")
         self._api_key = str(key).strip()
         self._timeout = float(timeout)
+        if max_pages is not None:
+            self._max_pages = int(max_pages)
+        else:
+            from config import SCORING
+
+            self._max_pages = int(SCORING.get("massive_max_pages", 20))
         # Last request URL with key redacted — for tests / debugging
         self.last_request_url_redacted: str | None = None
 
@@ -228,7 +248,8 @@ class MassiveSource:
         all_results: list[dict[str, Any]] = []
         url: str | None = path
         pages = 0
-        while url and pages < _MAX_PAGES:
+        max_pages = int(self._max_pages)
+        while url and pages < max_pages:
             pages += 1
             payload = self._request(url if pages > 1 else path, None if pages > 1 else params)
             batch = list(payload.get("results") or [])
@@ -238,11 +259,13 @@ class MassiveSource:
                 break
             url = str(nxt)
         else:
-            if pages >= _MAX_PAGES:
-                log.warning(
-                    "Massive chain pagination hit %s-page cap for %s",
-                    _MAX_PAGES, ticker,
-                )
+            # Loop exhausted on page cap with next_url still set → truncated.
+            raise MassiveChainTruncatedError(
+                f"Massive chain pagination hit {max_pages}-page cap for {ticker} "
+                f"with more results remaining ({len(all_results)} contracts so far). "
+                f"Raise SCORING['massive_max_pages'] or narrow the expiry filter; "
+                f"refusing to score a partial chain."
+            )
 
         return map_snapshot_results_to_chain(
             all_results, today_et=today, max_dte=max_dte,

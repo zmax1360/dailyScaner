@@ -140,6 +140,7 @@ def test_expiry_filter_sent_server_side():
         src.fetch_chain("AAPL", max_dte=45)
     assert captured["path"].endswith("/v3/snapshot/options/AAPL")
     assert "expiration_date.lte" in captured["params"]
+    assert "expiration_date.gte" in captured["params"]
     assert captured["params"]["limit"] == 250
 
 

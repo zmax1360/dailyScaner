@@ -172,6 +172,51 @@ def rollover_detectors_active(volume_is_session_scoped: bool) -> bool:
     return not bool(volume_is_session_scoped)
 
 
+def archive_source_name(archive: Mapping[str, Any] | None) -> str:
+    """
+    MarketDataSource.name that wrote this archive.
+
+    Archives written before source tagging have no ``source`` key — treat as
+    ``"yahoo"`` (that is what wrote them), not as unknown.
+    """
+    if not archive or "source" not in archive:
+        return "yahoo"
+    raw = archive.get("source")
+    if raw is None or str(raw).strip() == "":
+        return "yahoo"
+    return str(raw).strip().lower()
+
+
+def volume_sources_match(prev_source: str, current_source: str) -> bool:
+    """True when both sides share the same volume semantics for comparison."""
+    return archive_source_name({"source": prev_source}) == archive_source_name(
+        {"source": current_source}
+    )
+
+
+def should_apply_chain_rollover_check(
+    prev_archive: Mapping[str, Any] | None,
+    current_source: str,
+    today_et: date,
+) -> tuple[bool, str]:
+    """
+    Whether chain-level call/put totals may be compared for session rollover.
+
+    Returns (apply, reason). reason is ``"ok"`` when apply is True; otherwise a
+    short skip reason (``different_session_date``, ``source_mismatch:...``, …).
+    """
+    if not prev_archive:
+        return False, "no_prev"
+    prev_day = archive_session_date(prev_archive)
+    if prev_day != today_et:
+        return False, "different_session_date"
+    prev_src = archive_source_name(prev_archive)
+    curr_src = archive_source_name({"source": current_source})
+    if prev_src != curr_src:
+        return False, f"source_mismatch:{prev_src}->{curr_src}"
+    return True, "ok"
+
+
 def archive_session_date(archive: Mapping[str, Any] | None) -> date | None:
     """ET calendar date of an archive payload (from timestamp)."""
     if not archive:
@@ -297,12 +342,16 @@ def find_prior_eod_archive(
     archive_dir: str | Any = "archive",
     *,
     now_et: datetime | None = None,
+    required_source: str | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """
     Load the most recent prior-trading-day EOD archive for *ticker*.
 
     Returns (payload, reason). reason is 'ok' on success; otherwise explains
     why the EOD-match check must be skipped.
+
+    When *required_source* is set, the EOD archive's ``source`` must match
+    (missing key → yahoo). Cross-source EOD volume is not comparable.
     """
     import json
     import logging
@@ -341,6 +390,12 @@ def find_prior_eod_archive(
         log.warning("EOD volume reference unavailable: %s", reason)
         return None, reason
 
+    want_src = (
+        None
+        if required_source is None
+        else archive_source_name({"source": required_source})
+    )
+
     for day, path, data in reversed(candidates):
         if day == target:
             if data.get("settlement_converged") is not True:
@@ -351,6 +406,14 @@ def find_prior_eod_archive(
                 )
                 log.warning("EOD volume reference unavailable: %s", reason)
                 return None, reason
+            if want_src is not None:
+                got = archive_source_name(data)
+                if got != want_src:
+                    reason = (
+                        f"EOD archive source {got!r} != current source {want_src!r}"
+                    )
+                    log.warning("EOD volume reference unavailable: %s", reason)
+                    return None, reason
             return data, "ok"
         if day > target:
             continue

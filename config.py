@@ -57,4 +57,6 @@ SCORING: dict[str, float | int | str] = {
     "stale_majority_abort_frac": 0.50,
     # Market data adapter (CURSOR_SOURCES_STEPS) — does not change scoring math
     "market_data_source": "yahoo",
+    # Massive options snapshot pagination (CURSOR_SOURCE_AWARE_ROLLOVER)
+    "massive_max_pages": 20,
 }

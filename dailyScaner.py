@@ -28,6 +28,16 @@ def _parse_ticker() -> str:
 def _parse_is_eod() -> bool:
     return "--eod" in sys.argv
 
+
+def _parse_source_name() -> str | None:
+    """Optional ``--source yahoo|massive|fixture`` override (CLI)."""
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--source" and i + 1 < len(args):
+            return str(args[i + 1]).strip().lower()
+        if a.startswith("--source="):
+            return str(a.split("=", 1)[1]).strip().lower()
+    return None
 TICKER = _parse_ticker()
 IS_EOD = _parse_is_eod()
 
@@ -48,6 +58,9 @@ def _log_scan_attribution(
     run_kind: str = "intraday",
     eod_vol_lookup: dict | None = None,
     volume_is_session_scoped: bool = False,
+    current_source: str = "yahoo",
+    prev_archive_source: str | None = None,
+    eod_archive_source: str | None = None,
 ) -> None:
     """
     Score + append attribution rows. Fail-soft: never abort a scan.
@@ -81,6 +94,9 @@ def _log_scan_attribution(
             news_bias=news_bias,
             eod_vol_lookup=eod_vol_lookup,
             volume_is_session_scoped=volume_is_session_scoped,
+            current_source=current_source,
+            prev_archive_source=prev_archive_source,
+            eod_archive_source=eod_archive_source,
         )
 
         chain = pd.concat(
@@ -818,7 +834,7 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
     print(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
 
 # ?? ARCHIVE ???????????????????????????????????????????????????????????????????
-def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None, *, is_eod=False, settlement_converged=None):
+def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None, *, is_eod=False, settlement_converged=None, source_name: str = "yahoo"):
     os.makedirs("archive", exist_ok=True)
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -828,6 +844,7 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
 
     payload = {
         "timestamp": ts_aware.isoformat(),
+        "source": str(source_name),
         "is_eod": bool(is_eod),
         "settlement_converged": (
             None if settlement_converged is None else bool(settlement_converged)
@@ -962,8 +979,9 @@ def run(source=None):
     direction0, _, _ = direction_score(tf_data, pc0)
 
     # ?? Task A: chain-level session rollover guard ???????????????????????????
+    import logging as _logging
     from chain_quality import (
-        archive_session_date,
+        archive_source_name,
         chain_fails_quality_gate,
         chain_volume_rolled_over,
         eod_volume_lookup,
@@ -971,21 +989,37 @@ def run(source=None):
         flag_stale_vs_eod,
         majority_stale_abort,
         rollover_detectors_active,
+        should_apply_chain_rollover_check,
         stale_check_active,
     )
     from zoneinfo import ZoneInfo as _ZI
+    _scan_log = _logging.getLogger("dailyScaner")
     _ET_now = datetime.now(_ZI("America/New_York"))
     _today_et = _ET_now.date()
     _session_scoped = bool(getattr(source, "volume_is_session_scoped", False))
+    _curr_source = str(getattr(source, "name", "yahoo") or "yahoo")
+    _prev_archive_source = None
+    if prev_result:
+        _prev_archive_source = archive_source_name(prev_result[0])
     if not rollover_detectors_active(_session_scoped):
         print(
             f"{C.GRAY}  Rollover/stale-volume detectors DORMANT "
-            f"(source={getattr(source, 'name', '?')} is session-scoped).{C.RESET}"
+            f"(source={_curr_source} is session-scoped).{C.RESET}"
         )
     if prev_result and rollover_detectors_active(_session_scoped):
         _prev_data, _prev_file = prev_result
-        _prev_day = archive_session_date(_prev_data)
-        if _prev_day == _today_et:
+        _apply, _why = should_apply_chain_rollover_check(
+            _prev_data, _curr_source, _today_et,
+        )
+        if not _apply and _why.startswith("source_mismatch"):
+            _ps = archive_source_name(_prev_data)
+            _msg = (
+                f"previous archive written by source {_ps}, current source is "
+                f"{_curr_source} — rollover check skipped"
+            )
+            _scan_log.warning(_msg)
+            print(f"{C.YELLOW}WARN: {_msg}{C.RESET}")
+        elif _apply:
             _pv = (_prev_data or {}).get("volume") or {}
             _pc = int(_pv.get("total_call_vol") or 0)
             _pp = int(_pv.get("total_put_vol") or 0)
@@ -1027,10 +1061,13 @@ def run(source=None):
 
     # ?? Stale volume vs prior EOD (CURSOR_STALE_VOLUME_FIX) ????????????????
     _eod_lookup = None
+    _eod_archive_source = None
     if not rollover_detectors_active(_session_scoped):
         _eod_arch, _eod_reason = None, "dormant_session_scoped"
     else:
-        _eod_arch, _eod_reason = find_prior_eod_archive(TICKER, "archive", now_et=_ET_now)
+        _eod_arch, _eod_reason = find_prior_eod_archive(
+            TICKER, "archive", now_et=_ET_now, required_source=_curr_source,
+        )
     if _eod_arch is None:
         print(
             f"{C.YELLOW}WARN: EOD volume reference unavailable ({_eod_reason}); "
@@ -1044,6 +1081,7 @@ def run(source=None):
         _eod_lookup = None
     else:
         _eod_lookup = eod_volume_lookup(_eod_arch)
+        _eod_archive_source = archive_source_name(_eod_arch)
         _call_flags = flag_stale_vs_eod(
             _vol_gate.get("top_calls") or [], _eod_lookup, side="CALL"
         )
@@ -1112,6 +1150,7 @@ def run(source=None):
         session=session,
         is_eod=IS_EOD,
         settlement_converged=settlement_converged if IS_EOD else None,
+        source_name=_curr_source,
     )
 
     # Attribution: every scored contract + ATM controls (fail-soft)
@@ -1139,6 +1178,9 @@ def run(source=None):
         run_kind="eod" if IS_EOD else "intraday",
         eod_vol_lookup=_eod_lookup,
         volume_is_session_scoped=_session_scoped,
+        current_source=_curr_source,
+        prev_archive_source=_prev_archive_source,
+        eod_archive_source=_eod_archive_source,
     )
 
     # capture report as plain text
@@ -1161,7 +1203,15 @@ def run(source=None):
 
 if __name__ == "__main__":
     try:
-        run()
+        from sources import get_source
+        from sources.massive import MassiveChainTruncatedError
+
+        _src_name = _parse_source_name()
+        _source = get_source(_src_name) if _src_name else None
+        run(source=_source)
+    except MassiveChainTruncatedError as e:
+        print(f"{C.YELLOW}ABORT: {e}{C.RESET}")
+        sys.exit(1)
     except ValueError as e:
         print(f"{C.RED}ERROR:{C.RESET} {e}")
         sys.exit(1)
