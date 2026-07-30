@@ -33,6 +33,7 @@ def test_massive_source_satisfies_protocol():
     assert isinstance(src, MarketDataSource)
     assert src.name == "massive"
     assert src.volume_is_session_scoped is True
+    assert src.provides_quotes is False
 
 
 def test_massive_maps_to_chain_contract(snapshot_payload):
@@ -136,18 +137,21 @@ def test_expiry_filter_sent_server_side():
         captured["params"] = dict(params or {})
         return {"status": "OK", "results": [], "next_url": None}
 
-    with patch.object(src, "_request", side_effect=fake_request):
-        src.fetch_chain("AAPL", max_dte=45)
+    with patch.object(src, "fetch_spot", return_value=340.0):
+        with patch.object(src, "_request", side_effect=fake_request):
+            src.fetch_chain("AAPL", max_dte=45)
     assert captured["path"].endswith("/v3/snapshot/options/AAPL")
     assert "expiration_date.lte" in captured["params"]
     assert "expiration_date.gte" in captured["params"]
+    assert "strike_price.gte" in captured["params"]
     assert captured["params"]["limit"] == 250
 
 
 def test_api_key_absent_from_logs_and_archive(snapshot_payload, caplog):
     src = MassiveSource(api_key="SUPER_SECRET_KEY_XYZ")
-    with patch.object(src, "_request", return_value=snapshot_payload):
-        df = src.fetch_chain("AAPL", max_dte=45)
+    with patch.object(src, "fetch_spot", return_value=340.0):
+        with patch.object(src, "_request", return_value=snapshot_payload):
+            df = src.fetch_chain("AAPL", max_dte=45)
     # Frame / archive-shaped output must not contain the key
     blob = df.to_csv()
     assert "SUPER_SECRET_KEY_XYZ" not in blob

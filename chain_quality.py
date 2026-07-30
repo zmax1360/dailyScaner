@@ -22,25 +22,49 @@ def contract_is_usable(
     iv: Any,
     dte: Any,
     cfg: Mapping[str, Any] | None = None,
+    provides_quotes: bool = True,
+    last: Any = None,
 ) -> bool:
     """
     Per-contract quality predicate (Task B).
 
-    Usable iff bid > 0 AND ask > 0 AND iv >= min_iv_usable AND dte >= 0.
+    When provides_quotes is True (Yahoo / fixture):
+      usable iff bid > 0 AND ask > 0 AND iv >= min_iv_usable AND dte >= 0.
+
+    When provides_quotes is False (Massive Starter — no NBBO entitlement):
+      skip bid/ask; require last (day.close) > 0 plus the same iv/dte checks.
+      Never synthesise bid/ask from last.
+
     Never substitutes defaults for degraded values — caller excludes the row.
     """
     cfg = cfg or SCORING
     min_iv = float(cfg.get("min_iv_usable", 0.01))
     try:
-        b = float(bid or 0)
-        a = float(ask or 0)
         sigma = float(iv)
         d = float(dte)
     except (TypeError, ValueError):
         return False
-    if b != b or a != a or sigma != sigma or d != d:  # NaN
+    if sigma != sigma or d != d:  # NaN
         return False
-    return b > 0 and a > 0 and sigma >= min_iv and d >= 0
+    if not (sigma >= min_iv and d >= 0):
+        return False
+
+    if provides_quotes:
+        try:
+            b = float(bid)
+            a = float(ask)
+        except (TypeError, ValueError):
+            return False
+        if b != b or a != a:  # NaN
+            return False
+        return b > 0 and a > 0
+
+    # No quote entitlement — price from daily bar only.
+    try:
+        last_f = float(last)
+    except (TypeError, ValueError):
+        return False
+    return last_f == last_f and last_f > 0
 
 
 def top_n_contracts(
@@ -58,12 +82,14 @@ def quality_failure_counts(
     contracts: Iterable[Mapping[str, Any]],
     *,
     cfg: Mapping[str, Any] | None = None,
+    provides_quotes: bool = True,
 ) -> dict[str, int]:
     """Count failures among a contract list (for logging / tests)."""
     cfg = cfg or SCORING
     total = 0
     fail = 0
     zero_ba = 0
+    missing_last = 0
     low_iv = 0
     bad_dte = 0
     for c in contracts:
@@ -72,26 +98,36 @@ def quality_failure_counts(
         ask = c.get("ask")
         iv = c.get("impliedVolatility", c.get("iv"))
         dte = c.get("dte", 0)
+        last = c.get("lastPrice", c.get("last"))
         try:
-            b = float(bid or 0)
-            a = float(ask or 0)
+            b = float(bid) if bid is not None else float("nan")
+            a = float(ask) if ask is not None else float("nan")
             sigma = float(iv) if iv is not None else float("nan")
             d = float(dte)
+            last_f = float(last) if last is not None else float("nan")
         except (TypeError, ValueError):
             fail += 1
             continue
-        if b <= 0 and a <= 0:
-            zero_ba += 1
+        if provides_quotes:
+            if not (b == b and a == a and b > 0 and a > 0):
+                zero_ba += 1
+        else:
+            if not (last_f == last_f and last_f > 0):
+                missing_last += 1
         if not (sigma == sigma) or sigma < float(cfg.get("min_iv_usable", 0.01)):
             low_iv += 1
         if not (d == d) or d < 0:
             bad_dte += 1
-        if not contract_is_usable(bid=bid, ask=ask, iv=iv, dte=dte, cfg=cfg):
+        if not contract_is_usable(
+            bid=bid, ask=ask, iv=iv, dte=dte, cfg=cfg,
+            provides_quotes=provides_quotes, last=last,
+        ):
             fail += 1
     return {
         "total": total,
         "unusable": fail,
         "zero_bid_ask": zero_ba,
+        "missing_last": missing_last,
         "low_iv": low_iv,
         "bad_dte": bad_dte,
     }
@@ -101,6 +137,7 @@ def chain_fails_quality_gate(
     volume_block: Mapping[str, Any] | None,
     *,
     cfg: Mapping[str, Any] | None = None,
+    provides_quotes: bool = True,
 ) -> tuple[bool, dict[str, Any]]:
     """
     True when more than max_unusable_frac of the top-N calls fail
@@ -130,9 +167,14 @@ def chain_fails_quality_gate(
 
     calls = _sample(raw_calls)
     puts = _sample(raw_puts)
-    call_stats = quality_failure_counts(calls, cfg=cfg)
-    put_stats = quality_failure_counts(puts, cfg=cfg) if puts else {
-        "total": 0, "unusable": 0, "zero_bid_ask": 0, "low_iv": 0, "bad_dte": 0,
+    call_stats = quality_failure_counts(
+        calls, cfg=cfg, provides_quotes=provides_quotes,
+    )
+    put_stats = quality_failure_counts(
+        puts, cfg=cfg, provides_quotes=provides_quotes,
+    ) if puts else {
+        "total": 0, "unusable": 0, "zero_bid_ask": 0, "missing_last": 0,
+        "low_iv": 0, "bad_dte": 0,
     }
     total = call_stats["total"]
     unusable = call_stats["unusable"]
@@ -142,6 +184,7 @@ def chain_fails_quality_gate(
         "fails": fails,
         "frac_unusable": frac,
         "max_unusable_frac": max_frac,
+        "provides_quotes": bool(provides_quotes),
         "calls": call_stats,
         "puts": put_stats,
     }

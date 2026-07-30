@@ -43,6 +43,9 @@ class MarketDataSource(Protocol):
     # True  = volume resets each session (clean).
     # False = may carry prior session (Yahoo).
     volume_is_session_scoped: bool
+    # True  = NBBO bid/ask expected on the chain.
+    # False = quotes not entitled (e.g. Massive Starter); use last/day.close.
+    provides_quotes: bool
 
     def fetch_chain(self, ticker: str, *, max_dte: int) -> pd.DataFrame: ...
 

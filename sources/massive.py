@@ -115,7 +115,7 @@ def map_snapshot_results_to_chain(
         if isinstance(greeks, dict) and greeks:
             delta = _as_float(greeks.get("delta"))
 
-        # Absent last_quote → NaN bid/ask (never 0)
+        # Absent last_quote → NaN bid/ask (never 0, never synthesised from close)
         if quote:
             bid = _as_float(quote.get("bid"), zero_to_nan=True)
             ask = _as_float(quote.get("ask"), zero_to_nan=True)
@@ -142,6 +142,31 @@ def map_snapshot_results_to_chain(
     return validate_chain(pd.DataFrame(rows, columns=CHAIN_COLUMNS))
 
 
+def _cap_strikes_per_expiry(
+    df: pd.DataFrame,
+    *,
+    spot: float,
+    max_per_side: int,
+) -> pd.DataFrame:
+    """Keep at most *max_per_side* nearest-to-spot strikes per expiry×side."""
+    if df.empty or max_per_side <= 0:
+        return df
+    parts: list[pd.DataFrame] = []
+    for _, g in df.groupby(["expiry", "side"], sort=False):
+        if len(g) <= max_per_side:
+            parts.append(g)
+            continue
+        g2 = g.copy()
+        g2["_dist"] = (g2["strike"].astype(float) - float(spot)).abs()
+        parts.append(
+            g2.nsmallest(int(max_per_side), "_dist").drop(columns=["_dist"])
+        )
+    if not parts:
+        return df
+    out = pd.concat(parts, ignore_index=True)
+    return validate_chain(out[CHAIN_COLUMNS])
+
+
 def _retry_sleep(attempt: int, *, base: float = 2.0) -> float:
     return base * (2 ** (attempt - 1))
 
@@ -149,6 +174,7 @@ def _retry_sleep(attempt: int, *, base: float = 2.0) -> float:
 class MassiveSource:
     name = "massive"
     volume_is_session_scoped = True
+    provides_quotes = False  # Starter: day bar only; no NBBO entitlement
 
     def __init__(
         self,
@@ -156,20 +182,39 @@ class MassiveSource:
         *,
         timeout: float = 20.0,
         max_pages: int | None = None,
+        strike_window_pct: float | None = None,
+        max_strikes_per_expiry: int | None = None,
     ) -> None:
         key = api_key if api_key is not None else os.environ.get("MASSIVE_API_KEY", "")
         if not str(key).strip():
             raise ValueError("MASSIVE_API_KEY is required for MassiveSource")
         self._api_key = str(key).strip()
         self._timeout = float(timeout)
+        from config import SCORING
+
         if max_pages is not None:
             self._max_pages = int(max_pages)
         else:
-            from config import SCORING
-
             self._max_pages = int(SCORING.get("massive_max_pages", 20))
+        if strike_window_pct is not None:
+            self._strike_window_pct = float(strike_window_pct)
+        else:
+            self._strike_window_pct = float(
+                SCORING.get("massive_strike_window_pct", 0.06)
+            )
+        if max_strikes_per_expiry is not None:
+            self._max_strikes_per_expiry = int(max_strikes_per_expiry)
+        else:
+            self._max_strikes_per_expiry = int(
+                SCORING.get("massive_max_strikes_per_expiry", 20)
+            )
         # Last request URL with key redacted — for tests / debugging
         self.last_request_url_redacted: str | None = None
+        # Diagnostics from the most recent fetch_chain call
+        self.last_chain_pages: int = 0
+        self.last_chain_contracts: int = 0
+        self.last_chain_used_strike_window: bool = False
+        self.last_chain_spot: float | None = None
 
     def _request(
         self,
@@ -237,13 +282,32 @@ class MassiveSource:
     def fetch_chain(self, ticker: str, *, max_dte: int) -> pd.DataFrame:
         today = _today_et()
         end = today + timedelta(days=int(max_dte))
-        params = {
+        params: dict[str, Any] = {
             "expiration_date.lte": end.isoformat(),
             "expiration_date.gte": today.isoformat(),
             "limit": 250,
             "sort": "expiration_date",
             "order": "asc",
         }
+
+        spot = self.fetch_spot(ticker)
+        used_window = False
+        if spot is not None and spot > 0 and spot == spot:
+            pct = float(self._strike_window_pct)
+            lo = float(spot) * (1.0 - pct)
+            hi = float(spot) * (1.0 + pct)
+            params["strike_price.gte"] = round(lo, 4)
+            params["strike_price.lte"] = round(hi, 4)
+            used_window = True
+            self.last_chain_spot = float(spot)
+        else:
+            self.last_chain_spot = None
+            log.warning(
+                "Massive spot unavailable for %s — falling back to full chain "
+                "(no strike_price window)",
+                ticker,
+            )
+
         path = f"/v3/snapshot/options/{urllib.parse.quote(ticker)}"
         all_results: list[dict[str, Any]] = []
         url: str | None = path
@@ -251,7 +315,10 @@ class MassiveSource:
         max_pages = int(self._max_pages)
         while url and pages < max_pages:
             pages += 1
-            payload = self._request(url if pages > 1 else path, None if pages > 1 else params)
+            payload = self._request(
+                url if pages > 1 else path,
+                None if pages > 1 else params,
+            )
             batch = list(payload.get("results") or [])
             all_results.extend(batch)
             nxt = payload.get("next_url")
@@ -263,13 +330,22 @@ class MassiveSource:
             raise MassiveChainTruncatedError(
                 f"Massive chain pagination hit {max_pages}-page cap for {ticker} "
                 f"with more results remaining ({len(all_results)} contracts so far). "
-                f"Raise SCORING['massive_max_pages'] or narrow the expiry filter; "
-                f"refusing to score a partial chain."
+                f"Raise SCORING['massive_max_pages'] or narrow the strike/expiry "
+                f"filter; refusing to score a partial chain."
             )
 
-        return map_snapshot_results_to_chain(
+        df = map_snapshot_results_to_chain(
             all_results, today_et=today, max_dte=max_dte,
         )
+        if used_window and spot is not None and not df.empty:
+            df = _cap_strikes_per_expiry(
+                df, spot=float(spot), max_per_side=int(self._max_strikes_per_expiry),
+            )
+
+        self.last_chain_pages = pages
+        self.last_chain_contracts = int(len(df))
+        self.last_chain_used_strike_window = used_window
+        return df
 
     def fetch_history(
         self, ticker: str, *, interval: str, period: str

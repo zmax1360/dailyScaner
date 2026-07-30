@@ -142,6 +142,7 @@ class YahooSource:
 
     name = "yahoo"
     volume_is_session_scoped = False
+    provides_quotes = True
 
     def fetch_chain(self, ticker: str, *, max_dte: int) -> pd.DataFrame:
         t = yf.Ticker(ticker)

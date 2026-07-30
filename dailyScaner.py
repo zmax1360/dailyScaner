@@ -392,8 +392,9 @@ def _legacy_option_leg(chain: pd.DataFrame, side: str) -> pd.DataFrame:
         "volume": sub["volume"].fillna(0).astype(float),
         "openInterest": sub["openInterest"].fillna(0).astype(float),
         "impliedVolatility": sub["iv"],
-        "bid": sub["bid"].fillna(0).astype(float),
-        "ask": sub["ask"].fillna(0).astype(float),
+        # Preserve NaN bid/ask -- never coerce missing quotes to 0 (zero-width lie).
+        "bid": pd.to_numeric(sub["bid"], errors="coerce"),
+        "ask": pd.to_numeric(sub["ask"], errors="coerce"),
         "expiry": sub["expiry"].astype(str),
         "dte": sub["dte"],
     })
@@ -817,13 +818,25 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
             print(f"  Volume target  : ${target['strike']:.1f}  ({int(target['dte'])} DTE on {target['expiry']})")
             print(f"  Vol/OI         : {target['volume']:.0f} / {target['openInterest']:.0f}  = {target['volume']/max(target['openInterest'],1):.1f}x conviction")
 
-            bid, ask = float(target.get("bid", 0)), float(target.get("ask", 0))
-            mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else float(target["lastPrice"])
+            bid_raw, ask_raw = target.get("bid"), target.get("ask")
+            try:
+                bid = float(bid_raw) if bid_raw is not None else float("nan")
+            except (TypeError, ValueError):
+                bid = float("nan")
+            try:
+                ask = float(ask_raw) if ask_raw is not None else float("nan")
+            except (TypeError, ValueError):
+                ask = float("nan")
+            # Mid only from real NBBO; NaN bid/ask is not a zero-width spread.
+            if bid == bid and ask == ask and bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+            else:
+                mid = float(target["lastPrice"])
             if mid > 0:
                 print(f"  Est. premium   : ${mid:.2f}  (x100 = ${mid*100:.0f})")
                 # Spread-aware stop (BUGFIX 2026-07-16): a % stop on a
                 # wide-spread contract market-sells into whatever bid exists.
-                if bid > 0 and ask > 0 and (ask - bid) / mid > 0.20:
+                if bid == bid and ask == ask and bid > 0 and ask > 0 and (ask - bid) / mid > 0.20:
                     print(f"  Stop loss      : {warn('spread %.0f%% of mid - too wide for a reliable stop; size as full-loss risk' % ((ask-bid)/mid*100))}")
                 else:
                     print(f"  Stop loss      : ${mid*0.60:.2f}  (40% max loss rule)")
@@ -834,7 +847,7 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
     print(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
 
 # ?? ARCHIVE ???????????????????????????????????????????????????????????????????
-def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None, *, is_eod=False, settlement_converged=None, source_name: str = "yahoo"):
+def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None, *, is_eod=False, settlement_converged=None, source_name: str = "yahoo", quote_source: str = "nbbo"):
     os.makedirs("archive", exist_ok=True)
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -845,6 +858,7 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
     payload = {
         "timestamp": ts_aware.isoformat(),
         "source": str(source_name),
+        "quote_source": str(quote_source),
         "is_eod": bool(is_eod),
         "settlement_converged": (
             None if settlement_converged is None else bool(settlement_converged)
@@ -998,6 +1012,8 @@ def run(source=None):
     _today_et = _ET_now.date()
     _session_scoped = bool(getattr(source, "volume_is_session_scoped", False))
     _curr_source = str(getattr(source, "name", "yahoo") or "yahoo")
+    _provides_quotes = bool(getattr(source, "provides_quotes", True))
+    _quote_source = "nbbo" if _provides_quotes else "daily_bar"
     _prev_archive_source = None
     if prev_result:
         _prev_archive_source = archive_source_name(prev_result[0])
@@ -1015,7 +1031,7 @@ def run(source=None):
             _ps = archive_source_name(_prev_data)
             _msg = (
                 f"previous archive written by source {_ps}, current source is "
-                f"{_curr_source} — rollover check skipped"
+                f"{_curr_source} -- rollover check skipped"
             )
             _scan_log.warning(_msg)
             print(f"{C.YELLOW}WARN: {_msg}{C.RESET}")
@@ -1046,7 +1062,9 @@ def run(source=None):
         "total_call_vol": total_cv0,
         "total_put_vol": total_pv0,
     }
-    _q_fail, _q_detail = chain_fails_quality_gate(_vol_gate)
+    _q_fail, _q_detail = chain_fails_quality_gate(
+        _vol_gate, provides_quotes=_provides_quotes,
+    )
     if _q_fail:
         _cs = _q_detail.get("calls") or {}
         print(
@@ -1151,6 +1169,7 @@ def run(source=None):
         is_eod=IS_EOD,
         settlement_converged=settlement_converged if IS_EOD else None,
         source_name=_curr_source,
+        quote_source=_quote_source,
     )
 
     # Attribution: every scored contract + ATM controls (fail-soft)

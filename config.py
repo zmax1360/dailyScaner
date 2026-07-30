@@ -59,4 +59,7 @@ SCORING: dict[str, float | int | str] = {
     "market_data_source": "yahoo",
     # Massive options snapshot pagination (CURSOR_SOURCE_AWARE_ROLLOVER)
     "massive_max_pages": 20,
+    # Massive near-ATM strike window (Starter-friendly; narrower than full chain)
+    "massive_strike_window_pct": 0.06,
+    "massive_max_strikes_per_expiry": 20,
 }

@@ -168,9 +168,10 @@ def test_page_cap_hit_does_not_return_partial_chain_silently():
             "next_url": f"https://api.massive.com/next?page={n['i']}",
         }
 
-    with patch.object(src, "_request", side_effect=forever_next):
-        with pytest.raises(MassiveChainTruncatedError, match="page cap"):
-            src.fetch_chain("AAPL", max_dte=45)
+    with patch.object(src, "fetch_spot", return_value=None):
+        with patch.object(src, "_request", side_effect=forever_next):
+            with pytest.raises(MassiveChainTruncatedError, match="page cap"):
+                src.fetch_chain("AAPL", max_dte=45)
 
 
 def test_expiration_date_gte_sent_server_side():
@@ -181,8 +182,25 @@ def test_expiration_date_gte_sent_server_side():
         captured["params"] = dict(params or {})
         return {"status": "OK", "results": [], "next_url": None}
 
-    with patch.object(src, "_request", side_effect=fake_request):
-        src.fetch_chain("AAPL", max_dte=45)
+    with patch.object(src, "fetch_spot", return_value=None):
+        with patch.object(src, "_request", side_effect=fake_request):
+            src.fetch_chain("AAPL", max_dte=45)
     assert "expiration_date.gte" in captured["params"]
     assert "expiration_date.lte" in captured["params"]
     assert captured["params"]["limit"] == 250
+    assert "strike_price.gte" not in captured["params"]
+
+
+def test_expiration_date_gte_with_spot_includes_strike_window():
+    src = MassiveSource(api_key="test-key-not-real")
+    captured: dict = {}
+
+    def fake_request(path_or_url, params=None, **_k):
+        captured["params"] = dict(params or {})
+        return {"status": "OK", "results": [], "next_url": None}
+
+    with patch.object(src, "fetch_spot", return_value=100.0):
+        with patch.object(src, "_request", side_effect=fake_request):
+            src.fetch_chain("AAPL", max_dte=45)
+    assert "strike_price.gte" in captured["params"]
+    assert "strike_price.lte" in captured["params"]

@@ -25,6 +25,7 @@ def test_fixture_source_serves_recorded_chain():
     assert isinstance(src, MarketDataSource)
     assert src.name == "fixture"
     assert src.volume_is_session_scoped is False
+    assert src.provides_quotes is True
     df = src.fetch_chain("AAPL", max_dte=45)
     assert list(df.columns) == CHAIN_COLUMNS
     assert not df.empty

@@ -38,6 +38,7 @@ def test_yahoo_source_satisfies_protocol():
     assert isinstance(src, MarketDataSource)
     assert src.name == "yahoo"
     assert src.volume_is_session_scoped is False
+    assert src.provides_quotes is True
     assert callable(src.fetch_chain)
     assert callable(src.fetch_history)
     assert callable(src.fetch_spot)

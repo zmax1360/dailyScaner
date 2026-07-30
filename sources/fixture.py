@@ -106,6 +106,7 @@ class FixtureSource:
 
     name = "fixture"
     volume_is_session_scoped = False
+    provides_quotes = True
 
     def __init__(self, archive: str | Path | dict[str, Any]) -> None:
         if isinstance(archive, dict):

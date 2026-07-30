@@ -17,13 +17,22 @@ from config import SCORING
 
 
 def _contract_price(c: dict) -> float:
-    """Prefer mid(bid, ask); fall back to lastPrice."""
-    bid = float(c.get("bid") or 0)
-    ask = float(c.get("ask") or 0)
-    last = float(c.get("lastPrice") or c.get("last") or 0)
-    if bid > 0 and ask > 0:
+    """Prefer mid(bid, ask) only when both are real quotes; else lastPrice.
+
+    Never treat NaN bid/ask as a zero-width spread.
+    """
+    try:
+        bid = float(c["bid"]) if c.get("bid") is not None else float("nan")
+    except (TypeError, ValueError):
+        bid = float("nan")
+    try:
+        ask = float(c["ask"]) if c.get("ask") is not None else float("nan")
+    except (TypeError, ValueError):
+        ask = float("nan")
+    if bid == bid and ask == ask and bid > 0 and ask > 0:
         return (bid + ask) / 2.0
-    return last if last > 0 else 0.0
+    last = float(c.get("lastPrice") or c.get("last") or 0)
+    return last if last == last and last > 0 else 0.0
 
 
 def attach_dvol(
@@ -641,14 +650,23 @@ def build_best_value_df(
             exp = c.get("expiry", "")
             t_days = effective_dte_days(dte_i, expiry=exp, now_et=now_et)
             d = bs_delta(side, float(spot), strike_f, t_days, iv_f, r=r_free)
+            def _quote_f(key: str) -> float:
+                v = c.get(key)
+                if v is None:
+                    return float("nan")
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return float("nan")
+
             rows.append({
                 "side": side,
                 "strike": strike_f,
                 "expiry": exp,
                 "dte": dte_i,
                 "last": _contract_price(c),
-                "bid": float(c.get("bid") or 0),
-                "ask": float(c.get("ask") or 0),
+                "bid": _quote_f("bid"),
+                "ask": _quote_f("ask"),
                 "volume": vol_i,
                 "openInterest": oi_i,
                 "iv": iv_f,
