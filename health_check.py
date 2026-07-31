@@ -14,7 +14,7 @@ import sys
 from datetime import datetime, time as dtime
 
 from attribution import _db, default_db_path, now_et
-from mark_runner import count_overdue_t1h
+from mark_runner import count_overdue_t1h, t1h_mark_health_ok
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
@@ -77,12 +77,14 @@ def _checks(conn) -> list[tuple[str, bool, str]]:
         WHERE ts_et > date('now', '-7 days')
         """
     ).fetchone()[0]
+    # Expiry intrinsic may be exactly 0.0 (OTM settled) — not a garbage quote.
     zero_marks = conn.execute(
         """
         SELECT COUNT(*) FROM flags
-        WHERE mark_t1h = 0 OR mark_t1d = 0 OR mark_expiry = 0
+        WHERE mark_t1h = 0 OR mark_t1d = 0
         """
     ).fetchone()[0]
+    t1h_ok, t1h_detail = t1h_mark_health_ok(conn, as_of=now_et())
     null_scores = conn.execute(
         """
         SELECT COUNT(*) FROM flags
@@ -122,6 +124,7 @@ def _checks(conn) -> list[tuple[str, bool, str]]:
             f"{hashes} distinct (expect ≤1)",
         ),
         ("zero_marks", zero_marks == 0, str(zero_marks)),
+        ("t1h_mark_freshness", t1h_ok, t1h_detail),
         ("null_score_non_control", null_scores == 0, str(null_scores)),
         (
             "latest_run_missing_base",

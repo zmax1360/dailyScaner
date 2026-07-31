@@ -13,7 +13,7 @@ Preserved intentionally (do not "fix" here):
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -26,11 +26,16 @@ ET = ZoneInfo("America/New_York")
 
 
 def _yf_retry(fn, *, label: str, attempts: int = 5, base_sleep: float = 3.0):
-    """Call Yahoo via yfinance with backoff on rate limits / transient errors."""
+    """Call Yahoo via yfinance with backoff on rate limits / transient errors.
+
+    ValueError (e.g. expiry/strike not found) is permanent — never retried.
+    """
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
             return fn()
+        except ValueError:
+            raise
         except Exception as e:
             last_err = e
             name = type(e).__name__
@@ -60,6 +65,33 @@ def _clean_history(df: pd.DataFrame | None) -> pd.DataFrame:
         df = df.copy()
         df.index = df.index.tz_localize(None) if df.index.tz else df.index
     return df
+
+
+def fetch_underlying_close_on(ticker: str, day: date) -> float | None:
+    """
+    Equity close on an ET calendar ``day`` (used for expiry intrinsic marks).
+
+    Returns None when the bar is confirmed missing / non-positive.
+    Propagates transient transport errors after ``_yf_retry`` exhausts.
+    """
+    end = day + timedelta(days=1)
+    hist = _yf_retry(
+        lambda: yf.Ticker(ticker).history(
+            start=day.isoformat(),
+            end=end.isoformat(),
+            auto_adjust=True,
+        ),
+        label=f"close {ticker} {day.isoformat()}",
+        attempts=3,
+        base_sleep=2.0,
+    )
+    hist = _clean_history(hist)
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return None
+    close = float(hist["Close"].iloc[-1])
+    if not (close == close and close > 0):
+        return None
+    return close
 
 
 def _today_et() -> datetime.date:
@@ -237,28 +269,37 @@ class YahooSource:
         strike: float,
         expiry: str,
     ) -> float | None:
-        """Best-effort live mid. Returns None on any failure — never 0.0."""
+        """
+        Best-effort live mid. Never returns 0.0 as a stand-in.
+
+        Raises ValueError for permanent failures (unknown expiry / strike).
+        Returns None only for transient/empty-quote cases that may succeed later.
+        """
+        t = yf.Ticker(ticker)
         try:
-            t = yf.Ticker(ticker)
             chain = _yf_retry(
                 lambda: t.option_chain(expiry),
                 label=f"mid {expiry}",
                 attempts=3,
                 base_sleep=2.0,
             )
-            book = chain.calls if str(side).upper() == "CALL" else chain.puts
-            row = book[abs(book["strike"] - float(strike)) < 1e-6]
-            if row.empty:
-                return None
-            r = row.iloc[0]
-            bid = float(r.get("bid") or 0)
-            ask = float(r.get("ask") or 0)
-            last = float(r.get("lastPrice") or 0)
-            if bid > 0 and ask > 0:
-                mid = (bid + ask) / 2.0
-                return mid if mid > 0 else None
-            if last > 0:
-                return last
-            return None
+        except ValueError:
+            raise
         except Exception:
             return None
+        book = chain.calls if str(side).upper() == "CALL" else chain.puts
+        row = book[abs(book["strike"] - float(strike)) < 1e-6]
+        if row.empty:
+            raise ValueError(
+                f"strike not found: {ticker} {side} {strike} {expiry}"
+            )
+        r = row.iloc[0]
+        bid = float(r.get("bid") or 0)
+        ask = float(r.get("ask") or 0)
+        last = float(r.get("lastPrice") or 0)
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2.0
+            return mid if mid > 0 else None
+        if last > 0:
+            return last
+        return None

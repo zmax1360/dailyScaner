@@ -89,14 +89,16 @@ def test_expiry_mark_exempt_from_staleness(tmp_path, monkeypatch):
     as_of = _et(2026, 7, 20, 12, 0)
     assert is_past_staleness_ceiling("expiry", ts, as_of) is False
 
+    # Intrinsic from underlying close: CALL 250 @ underlying 251.25 → 1.25
     monkeypatch.setattr(
-        "mark_runner.fetch_option_mid",
-        lambda *a, **k: 1.25,
+        "mark_runner.fetch_underlying_close",
+        lambda *a, **k: 251.25,
     )
     monkeypatch.setattr("attribution.now_et", lambda: as_of)
-    attempted, written = _mark_horizon(
+    attempted, written, stopped = _mark_horizon(
         "expiry", dry_run=False, as_of=as_of, db_path=db
     )
+    assert stopped is False
     assert attempted >= 1
     assert written == 1
     with _db(db) as c:

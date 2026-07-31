@@ -6,6 +6,11 @@ mark_runner.py — Write-once T+1h / T+1d / expiry marks for attribution flags.
   python mark_runner.py
   python mark_runner.py --expiry-only
   python mark_runner.py --force          # ignore market-hours gate
+
+Expiry marks use intrinsic value from the underlying's close on the expiry
+date (expired contracts are absent from live chains). Horizons run in priority
+order: t1h → t1d → expiry. A wall-clock runtime cap exits 0 so launchd's next
+StartInterval gets a clean slot.
 """
 
 from __future__ import annotations
@@ -13,14 +18,17 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import socket
 import sys
-from datetime import datetime, timedelta, time as dtime
+import time
+from datetime import date, datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 from attribution import (
     default_db_path,
     due_for_marking,
     fetch_option_mid,
+    note_mark_failure,
     note_stale_horizon,
     now_et,
     write_mark,
@@ -39,6 +47,9 @@ _SESSION_LEN = datetime.combine(datetime(2000, 1, 1).date(), MARK_WINDOW_END) - 
 )
 SESSION_LEN_HOURS = _SESSION_LEN.total_seconds() / 3600.0  # 6.75
 T1H_STALE_MARKET_HOURS = 4.0
+
+# Time-sensitive first — never starve t1h behind expiry backfill.
+HORIZON_PRIORITY: tuple[str, ...] = ("t1h", "t1d", "expiry")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +73,14 @@ def _load_env() -> None:
                     os.environ[k] = v
     except FileNotFoundError:
         pass
+
+
+def _cfg_float(key: str, default: float) -> float:
+    try:
+        from config import SCORING
+        return float(SCORING.get(key, default))
+    except Exception:
+        return float(default)
 
 
 def in_mark_window(now: datetime | None = None) -> bool:
@@ -207,6 +226,7 @@ def count_overdue_t1h(conn, as_of: datetime | None = None) -> int:
             LEFT JOIN runs r ON r.run_id = f.run_id
             WHERE f.mark_t1h IS NULL
               AND (f.notes IS NULL OR f.notes NOT LIKE '%stale:t1h%')
+              AND (f.notes IS NULL OR f.notes NOT LIKE '%fail:t1h%')
               AND (f.notes IS NULL OR f.notes NOT LIKE '%n/a:eod%')
               AND (r.run_kind IS NULL OR r.run_kind != 'eod')
             """
@@ -219,6 +239,7 @@ def count_overdue_t1h(conn, as_of: datetime | None = None) -> int:
                 SELECT ts_et FROM flags
                 WHERE mark_t1h IS NULL
                   AND (notes IS NULL OR notes NOT LIKE '%stale:t1h%')
+                  AND (notes IS NULL OR notes NOT LIKE '%fail:t1h%')
                   AND (notes IS NULL OR notes NOT LIKE '%n/a:eod%')
                 """
             ).fetchall()
@@ -235,12 +256,50 @@ def count_overdue_t1h(conn, as_of: datetime | None = None) -> int:
             ts = r[0]
             notes = r[1] if len(r) > 1 else None
         if notes is not None and (
-            "stale:t1h" in str(notes) or "n/a:eod" in str(notes)
+            "stale:t1h" in str(notes)
+            or "fail:t1h" in str(notes)
+            or "n/a:eod" in str(notes)
         ):
             continue
         if is_t1h_overdue(ts, as_of):
             n += 1
     return n
+
+
+def option_intrinsic(side: str, strike: float, underlying: float) -> float:
+    """Settlement-style intrinsic from underlying close (never negative)."""
+    k = float(strike)
+    u = float(underlying)
+    if str(side).upper() == "CALL":
+        return max(0.0, u - k)
+    return max(0.0, k - u)
+
+
+def fetch_underlying_close(
+    ticker: str,
+    expiry_day: date,
+    *,
+    cache: dict[tuple[str, str], float | None],
+) -> float | None:
+    """
+    Underlying close on *expiry_day* (ET calendar). Cached per (ticker, date).
+
+    Returns a positive close, or None when the bar is confirmed missing
+    (cached). Raises on transient transport errors so the caller can retry
+    later without writing a permanent-fail note.
+    """
+    key = (str(ticker).upper(), expiry_day.isoformat())
+    if key in cache:
+        return cache[key]
+    from sources.yahoo import fetch_underlying_close_on
+
+    close = fetch_underlying_close_on(ticker, expiry_day)
+    cache[key] = close
+    return close
+
+
+def _deadline_exceeded(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def _mark_horizon(
@@ -249,12 +308,27 @@ def _mark_horizon(
     dry_run: bool,
     as_of: datetime | None = None,
     db_path: str | None = None,
-) -> tuple[int, int]:
+    deadline: float | None = None,
+    underlying_cache: dict[tuple[str, str], float | None] | None = None,
+) -> tuple[int, int, bool]:
+    """
+    Returns (attempted, written, stopped_early).
+    stopped_early True when the runtime deadline fired mid-horizon.
+    """
     as_of = as_of or now_et()
+    cache = underlying_cache if underlying_cache is not None else {}
     rows = due_for_marking(horizon, db_path=db_path, as_of=as_of)  # type: ignore[arg-type]
     attempted = 0
     written = 0
     for r in rows:
+        if _deadline_exceeded(deadline):
+            log.warning(
+                "runtime cap hit during %s — stopping horizon early "
+                "(attempted=%d written=%d remaining≈%d)",
+                horizon, attempted, written, max(0, len(rows) - attempted),
+            )
+            return attempted, written, True
+
         fid = int(r["flag_id"])
         if horizon in ("t1h", "t1d") and is_past_staleness_ceiling(
             horizon, r["ts_et"], as_of
@@ -273,12 +347,54 @@ def _mark_horizon(
             continue
 
         attempted += 1
-        mid = fetch_option_mid(
-            r["ticker"], r["side"], float(r["strike"]), str(r["expiry"]),
-        )
+        mid: float | None = None
+        try:
+            if horizon == "expiry":
+                exp = date.fromisoformat(str(r["expiry"])[:10])
+                try:
+                    u_close = fetch_underlying_close(
+                        str(r["ticker"]), exp, cache=cache,
+                    )
+                except Exception as exc:
+                    # Network / rate-limit after source retries — try next run.
+                    log.info(
+                        "skip expiry flag_id=%s %s — underlying close "
+                        "transient: %s",
+                        fid, r["ticker"], exc,
+                    )
+                    continue
+                if u_close is None:
+                    raise ValueError(
+                        f"underlying close unavailable for "
+                        f"{r['ticker']} on {exp.isoformat()}"
+                    )
+                mid = option_intrinsic(str(r["side"]), float(r["strike"]), u_close)
+            else:
+                mid = fetch_option_mid(
+                    r["ticker"], r["side"], float(r["strike"]), str(r["expiry"]),
+                )
+        except ValueError as exc:
+            reason = str(exc) or "permanent"
+            if dry_run:
+                log.info(
+                    "dry-run fail %s flag_id=%s — would note %r",
+                    horizon, fid, reason,
+                )
+            else:
+                noted = note_mark_failure(
+                    fid, horizon, reason, db_path=db_path,  # type: ignore[arg-type]
+                )
+                log.info(
+                    "permanent fail %s flag_id=%s %s %s %s — %s (%s)",
+                    horizon, fid, r["ticker"], r["side"], r["strike"],
+                    reason, "noted" if noted else "already noted",
+                )
+            continue
+
         if mid is None:
+            # Transient empty quote — leave unmarked for a later pass.
             log.info(
-                "skip %s flag_id=%s %s %s %s — no mid",
+                "skip %s flag_id=%s %s %s %s — no mid (transient)",
                 horizon, fid, r["ticker"], r["side"], r["strike"],
             )
             continue
@@ -297,7 +413,53 @@ def _mark_horizon(
                 "unchanged %s flag_id=%s (already set or refused)",
                 horizon, fid,
             )
-    return attempted, written
+    return attempted, written, False
+
+
+def max_marked_t1h_age_minutes(
+    conn,
+    as_of: datetime | None = None,
+) -> float | None:
+    """Age in minutes of MAX(marked_t1h_at), or None if no t1h marks exist."""
+    as_of = as_of or datetime.now(ET)
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=ET)
+    as_of = as_of.astimezone(ET)
+    row = conn.execute("SELECT MAX(marked_t1h_at) FROM flags").fetchone()
+    raw = row[0] if row else None
+    if not raw:
+        return None
+    try:
+        marked = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if marked.tzinfo is None:
+        marked = marked.replace(tzinfo=ET)
+    marked = marked.astimezone(ET)
+    return (as_of - marked).total_seconds() / 60.0
+
+
+def t1h_mark_health_ok(
+    conn,
+    as_of: datetime | None = None,
+    *,
+    max_age_min: float | None = None,
+) -> tuple[bool, str]:
+    """
+    During mark-window hours: fail if MAX(marked_t1h_at) is older than max_age_min
+    (default from config, 90). Outside the window: always ok.
+    """
+    as_of = as_of or datetime.now(ET)
+    if max_age_min is None:
+        max_age_min = _cfg_float("mark_t1h_health_max_age_min", 90.0)
+    if not in_mark_window(as_of):
+        return True, "outside mark window"
+    age = max_marked_t1h_age_minutes(conn, as_of=as_of)
+    if age is None:
+        return False, "no marked_t1h_at rows"
+    if age > float(max_age_min):
+        return False, f"MAX(marked_t1h_at) age={age:.1f}m > {max_age_min:.0f}m"
+    return True, f"MAX(marked_t1h_at) age={age:.1f}m"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -312,20 +474,49 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     _load_env()
-    log.info("db=%s dry_run=%s", default_db_path(), args.dry_run)
+    max_runtime = _cfg_float("mark_runner_max_runtime_sec", 600.0)
+    sock_timeout = _cfg_float("mark_runner_socket_timeout_sec", 30.0)
+    prev_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(sock_timeout)
+    deadline = time.monotonic() + max_runtime
+    log.info(
+        "db=%s dry_run=%s max_runtime=%.0fs socket_timeout=%.0fs",
+        default_db_path(), args.dry_run, max_runtime, sock_timeout,
+    )
 
-    if args.expiry_only:
-        horizons: tuple[str, ...] = ("expiry",)
-    elif args.force or _in_mark_window():
-        horizons = ("t1h", "t1d", "expiry")
-    else:
-        log.info("outside mark window (09:30–16:15 ET) — expiry pass only")
-        horizons = ("expiry",)
+    try:
+        if args.expiry_only:
+            horizons: tuple[str, ...] = ("expiry",)
+        elif args.force or _in_mark_window():
+            horizons = HORIZON_PRIORITY
+        else:
+            log.info("outside mark window (09:30–16:15 ET) — expiry pass only")
+            horizons = ("expiry",)
 
-    for h in horizons:
-        a, w = _mark_horizon(h, dry_run=args.dry_run)
-        log.info("%s: due=%d written=%d", h, a, w)
-    return 0
+        underlying_cache: dict[tuple[str, str], float | None] = {}
+        for h in horizons:
+            if _deadline_exceeded(deadline):
+                log.warning(
+                    "runtime cap %.0fs exceeded before %s — exiting 0 for launchd",
+                    max_runtime, h,
+                )
+                return 0
+            a, w, stopped = _mark_horizon(
+                h,
+                dry_run=args.dry_run,
+                deadline=deadline,
+                underlying_cache=underlying_cache,
+            )
+            log.info("%s: due=%d written=%d", h, a, w)
+            if stopped:
+                log.warning(
+                    "runtime cap %.0fs exceeded — exiting 0 for launchd",
+                    max_runtime,
+                )
+                return 0
+        return 0
+    finally:
+        socket.setdefaulttimeout(prev_timeout)
 
 
 if __name__ == "__main__":

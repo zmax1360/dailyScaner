@@ -665,6 +665,7 @@ def due_for_marking(
     cutoff_iso = cutoff.isoformat(timespec="seconds")
     today = as_of.date().isoformat()
 
+    fail_like = f"%fail:{horizon}%"
     with _db(db_path) as conn:
         if horizon == "expiry":
             rows = conn.execute(
@@ -673,8 +674,9 @@ def due_for_marking(
                 FROM flags
                 WHERE {col} IS NULL
                   AND expiry < ?
+                  AND (notes IS NULL OR notes NOT LIKE ?)
                 """,
-                (today,),
+                (today, fail_like),
             ).fetchall()
         else:
             stale_tag = f"stale:{horizon}"
@@ -687,27 +689,26 @@ def due_for_marking(
                 WHERE f.{col} IS NULL
                   AND f.ts_et <= ?
                   AND (f.notes IS NULL OR f.notes NOT LIKE ?)
+                  AND (f.notes IS NULL OR f.notes NOT LIKE ?)
                   AND (f.notes IS NULL OR f.notes NOT LIKE '%n/a:eod%')
                   AND (r.run_kind IS NULL OR r.run_kind != 'eod')
                 """,
-                (cutoff_iso, f"%{stale_tag}%"),
+                (cutoff_iso, f"%{stale_tag}%", fail_like),
             ).fetchall()
     return list(rows)
 
 
-def note_stale_horizon(
+
+def _append_flag_note(
     flag_id: int,
-    horizon: Horizon,
+    tag: str,
     *,
     db_path: str | None = None,
 ) -> bool:
-    """
-    Write-once 'stale:t1h' / 'stale:t1d' into flags.notes.
-    Does not write a mark value. Returns True if the note was newly written.
-    """
-    if horizon not in ("t1h", "t1d"):
-        raise ValueError(f"staleness notes only apply to t1h/t1d, got {horizon}")
-    tag = f"stale:{horizon}"
+    """Write-once note tag into flags.notes. Returns True if newly written."""
+    tag = str(tag).strip()
+    if not tag:
+        return False
     with _db(db_path) as conn:
         row = conn.execute(
             "SELECT notes FROM flags WHERE flag_id = ?",
@@ -734,6 +735,38 @@ def note_stale_horizon(
         return cur.rowcount == 1
 
 
+def note_stale_horizon(
+    flag_id: int,
+    horizon: Horizon,
+    *,
+    db_path: str | None = None,
+) -> bool:
+    """
+    Write-once 'stale:t1h' / 'stale:t1d' into flags.notes.
+    Does not write a mark value. Returns True if the note was newly written.
+    """
+    if horizon not in ("t1h", "t1d"):
+        raise ValueError(f"staleness notes only apply to t1h/t1d, got {horizon}")
+    return _append_flag_note(flag_id, f"stale:{horizon}", db_path=db_path)
+
+
+def note_mark_failure(
+    flag_id: int,
+    horizon: Horizon,
+    reason: str,
+    *,
+    db_path: str | None = None,
+) -> bool:
+    """
+    Permanent mark failure — write-once ``fail:{horizon}:{reason}``.
+    due_for_marking excludes these so the row is never attempted again.
+    """
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(reason))[:80]
+    return _append_flag_note(
+        flag_id, f"fail:{horizon}:{safe or 'error'}", db_path=db_path,
+    )
+
+
 def write_mark(
     flag_id: int,
     horizon: Horizon,
@@ -751,8 +784,9 @@ def write_mark(
         v = float(value)
     except (TypeError, ValueError):
         return False
-    # Explicit reject of non-positive marks (failed/garbage quotes)
-    if v <= 0.0:
+    # Reject non-positive marks for live horizons (failed/garbage quotes).
+    # Expiry intrinsic may be exactly 0.0 for OTM contracts — that is valid.
+    if v < 0.0 or (v == 0.0 and horizon != "expiry"):
         log.warning("refusing non-positive mark for flag_id=%s: %s", flag_id, v)
         return False
 
@@ -781,10 +815,11 @@ def fetch_option_mid(
     source=None,
 ) -> float | None:
     """
-    Best-effort live mid. Returns None on any failure — never 0.0, never raises.
+    Best-effort live mid. Never returns 0.0 as a stand-in.
 
-    ``source`` is a MarketDataSource constructed at the caller entry point when
-    omitted (never a module-level singleton).
+    Re-raises ValueError for permanent failures (unknown expiry / strike).
+    Returns None on transient failures. ``source`` is a MarketDataSource
+    constructed at the caller entry point when omitted.
     """
     try:
         if source is None:
@@ -792,6 +827,9 @@ def fetch_option_mid(
             from sources import get_source
             source = get_source(str(SCORING.get("market_data_source", "yahoo")))
         return source.fetch_option_mid(ticker, side, strike, expiry)
+    except ValueError:
+        # Permanent (expiry/strike not found) — caller must note & skip retries.
+        raise
     except Exception as exc:
         log.debug("fetch_option_mid failed: %s", exc)
         return None

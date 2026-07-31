@@ -62,4 +62,9 @@ SCORING: dict[str, float | int | str] = {
     # Massive near-ATM strike window (Starter-friendly; narrower than full chain)
     "massive_strike_window_pct": 0.06,
     "massive_max_strikes_per_expiry": 20,
+    # mark_runner — wall-clock cap so launchd StartInterval gets a clean slot
+    "mark_runner_max_runtime_sec": 600,
+    "mark_runner_socket_timeout_sec": 30,
+    # health_check: fail if MAX(marked_t1h_at) older than this during RTH
+    "mark_t1h_health_max_age_min": 90,
 }
