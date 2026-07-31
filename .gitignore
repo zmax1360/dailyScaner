@@ -12,4 +12,6 @@ files/
 files.zip
 .env
 *.log
+logs/
+report/
 backups/

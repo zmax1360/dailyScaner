@@ -29,22 +29,15 @@ from news_service import get_news_sentiment, get_market_news
 from best_value import build_best_value_df, resolve_biases_for_ticker
 from cost_distribution import calculate_cost_distribution, BLUE_SKY_TAG, is_blue_sky_breakout
 
+from logging_config import LOG_DIR, setup_logging
+
 ET       = ZoneInfo("America/New_York")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
-LOG_FILE = os.path.join(BASE_DIR, "telegram_bot.log")
+LOG_FILE = os.path.join(LOG_DIR, "telegram_bot.log")
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),                     # terminal
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),       # file
-    ],
-)
-log = logging.getLogger("tgbot")
+log = setup_logging("telegram_bot")
 
 
 def _now_et() -> str:
@@ -75,11 +68,11 @@ _ALLOWED_CHAT_IDS = {
 }
 
 if not TOKEN:
-    print("ERROR: TELEGRAM_BOT_TOKEN not found in .env")
+    log.error("TELEGRAM_BOT_TOKEN not found in .env")
     sys.exit(1)
 
 if not _ALLOWED_CHAT_IDS:
-    print("ERROR: TELEGRAM_CHAT_ID not found in .env — bot refuses all chats")
+    log.error("TELEGRAM_CHAT_ID not found in .env — bot refuses all chats")
     sys.exit(1)
 
 API = f"https://api.telegram.org/bot{TOKEN}"
@@ -910,11 +903,9 @@ def main() -> None:
         log.error(f"Could not connect to Telegram: {me.get('error')}")
         sys.exit(1)
     username = me["result"].get("username", "unknown")
-    log.info(f"Bot started as @{username}")
-    log.info(f"Open Telegram → @{username} → press Start")
-    log.info(f"Log file: {LOG_FILE}")
-    print(f"\n✅  Bot running as @{username}  (Ctrl+C to stop)")
-    print(f"    Logs → {LOG_FILE}\n")
+    log.info("Bot started as @%s (Ctrl+C to stop)", username)
+    log.info("Open Telegram → @%s → press Start", username)
+    log.info("Log file: %s", LOG_FILE)
 
     offset = 0
     while True:
@@ -971,7 +962,6 @@ def main() -> None:
 
         except KeyboardInterrupt:
             log.info("Bot stopped by user (Ctrl+C)")
-            print("\n🛑  Bot stopped.")
             break
         except Exception as exc:
             log.exception(f"Unexpected error: {exc}")

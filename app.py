@@ -6,6 +6,7 @@ functions or archive JSON files. No indicators recomputed here.
 
 import glob
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -19,6 +20,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytz
 import streamlit as st
+
+from logging_config import LOG_DIR, setup_logging
 
 import data_adapter
 import snapshot_store as ss
@@ -76,6 +79,10 @@ from pov_leakage import (
 import portfolio_store as portfolio_store
 
 ET = ZoneInfo("America/New_York")
+
+# Dashboard process log (rotating). Streamlit also writes to its own sinks.
+setup_logging("app", console=False)
+log = logging.getLogger("app")
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -802,11 +809,15 @@ def _ensure_services() -> None:
             if out.stdout.strip():
                 continue  # already running
 
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_name = script.replace(".py", ".log")
+        log_path = os.path.join(LOG_DIR, log_name)
         subprocess.Popen(
             [python, script_path],
             cwd=_SCANNER_DIR,
-            stdout=open(os.path.join(_SCANNER_DIR, script.replace(".py", ".log")), "a"),
+            stdout=open(log_path, "a"),
             stderr=subprocess.STDOUT,
+            env={**os.environ, "OPTIONTRADING_PROCESS": script.replace(".py", "")},
         )
 
 

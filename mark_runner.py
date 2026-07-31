@@ -33,6 +33,7 @@ from attribution import (
     now_et,
     write_mark,
 )
+from logging_config import setup_logging
 
 ET = ZoneInfo("America/New_York")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,11 +52,6 @@ T1H_STALE_MARKET_HOURS = 4.0
 # Time-sensitive first — never starve t1h behind expiry backfill.
 HORIZON_PRIORITY: tuple[str, ...] = ("t1h", "t1d", "expiry")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 log = logging.getLogger("mark_runner")
 
 
@@ -474,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     _load_env()
+    setup_logging("mark_runner")
     max_runtime = _cfg_float("mark_runner_max_runtime_sec", 600.0)
     sock_timeout = _cfg_float("mark_runner_socket_timeout_sec", 30.0)
     prev_timeout = socket.getdefaulttimeout()

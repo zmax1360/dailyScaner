@@ -12,9 +12,14 @@ import json
 import os
 import time
 import warnings
+import logging
 warnings.filterwarnings("ignore")
 
+from logging_config import setup_logging
+
 from config import SCORING
+
+log = logging.getLogger("dailyScaner")
 
 def _parse_ticker() -> str:
     """Read ticker from argv[1], ignoring pytest/script paths (must be 1-5 alpha chars)."""
@@ -129,18 +134,18 @@ def _log_scan_attribution(
             run_kind=run_kind,
         )
         if (run_kind or "").lower() == "eod":
-            print(
+            log.info(
                 f"{C.GRAY}  Attribution - run_id={run_id[:8]}... "
                 f"run_kind=eod (flags skipped){C.RESET}"
             )
         else:
             n = int(bv_df["Value_Score"].notna().sum()) if not bv_df.empty else 0
-            print(
+            log.info(
                 f"{C.GRAY}  Attribution - run_id={run_id[:8]}... "
                 f"scored={n} ctrl={len(ctrl)}{C.RESET}"
             )
     except Exception as exc:
-        print(f"{C.YELLOW}  Attribution log failed (scan continues): {exc}{C.RESET}")
+        log.warning(f"{C.YELLOW}  Attribution log failed (scan continues): {exc}{C.RESET}")
         try:
             from attribution import alert_attribution_failure
             alert_attribution_failure(
@@ -592,44 +597,44 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
     pc_ratio = round(total_pv / total_cv, 3) if total_cv > 0 else 0
     direction, bv, brv = direction_score(tf_data, pc_ratio)
 
-    print()
-    print(f"{C.BOLD}{C.BG_DARK}{'?'*W}{C.RESET}")
-    print(f"{C.BOLD}{C.BG_DARK}  ??  {TICKER} OPTIONS SCANNER  ?  {now}{C.RESET}")
-    print(f"{C.BOLD}{C.BG_DARK}{'?'*W}{C.RESET}")
+    log.info("")
+    log.info(f"{C.BOLD}{C.BG_DARK}{'?'*W}{C.RESET}")
+    log.info(f"{C.BOLD}{C.BG_DARK}  ??  {TICKER} OPTIONS SCANNER  ?  {now}{C.RESET}")
+    log.info(f"{C.BOLD}{C.BG_DARK}{'?'*W}{C.RESET}")
     # ?? CHANGES vs previous run ???????????????????????????????????????????????
     if changes:
-        print(hdr("?? CHANGES vs LAST RUN ????????????????????????????????????????"))
+        log.info(hdr("?? CHANGES vs LAST RUN ????????????????????????????????????????"))
         for line in changes:
-            print(line)
-        print()
+            log.info(line)
+        log.info("")
 
-    print(f"  {bold('SPOT')}  ${spot:.2f}    {bold('P/C Ratio')}  ", end="")
-    if pc_ratio >= 1.3:   print(bear(f"{pc_ratio}  ? BEARISH SKEW"))
-    elif pc_ratio <= 0.7: print(bull(f"{pc_ratio}  ? BULLISH SKEW"))
-    else:                 print(warn(f"{pc_ratio}  ? NEUTRAL"))
+    log.info(f"  {bold('SPOT')}  ${spot:.2f}    {bold('P/C Ratio')}  ")
+    if pc_ratio >= 1.3:   log.info(bear(f"{pc_ratio}  ? BEARISH SKEW"))
+    elif pc_ratio <= 0.7: log.info(bull(f"{pc_ratio}  ? BULLISH SKEW"))
+    else:                 log.info(warn(f"{pc_ratio}  ? NEUTRAL"))
 
     dir_lbl = bull(f"? {direction}") if direction=="BULLISH" else bear(f"? {direction}") if direction=="BEARISH" else warn(f"? {direction}")
-    print(f"  {bold('DIRECTION')}  {dir_lbl}   (bull signals:{bv} | bear signals:{brv})")
-    print()
+    log.info(f"  {bold('DIRECTION')}  {dir_lbl}   (bull signals:{bv} | bear signals:{brv})")
+    log.info("")
 
     # ?? Multi-TF ??????????????????????????????????????????????????????????????
-    print(hdr("?? MULTI-TIMEFRAME ????????????????????????????????????????????"))
-    print(f"  {'TF':<5}  {'RSI':<24}  {'MACD':<30}  {'VolSpike':<10}  {'Support':<9}  Resist")
-    print("  " + "?"*(W-2))
+    log.info(hdr("?? MULTI-TIMEFRAME ????????????????????????????????????????????"))
+    log.info(f"  {'TF':<5}  {'RSI':<24}  {'MACD':<30}  {'VolSpike':<10}  {'Support':<9}  Resist")
+    log.info("  " + "?"*(W-2))
     for tf in ["5M","10M","15M","45M","1H","4H","1D"]:
         d = tf_data.get(tf)
         if not d: continue
         vs_str = bull(f"{d['vs']}x") if d['vs'] >= 1.5 else dim(f"{d['vs']}x")
-        print(f"  {bold(tf):<14}  {rsi_lbl(d['rsi']):<44}  {macd_lbl(d['hist']):<50}  {vs_str:<20}  ${d['support']:<9}  ${d['resist']}")
-    print()
+        log.info(f"  {bold(tf):<14}  {rsi_lbl(d['rsi']):<44}  {macd_lbl(d['hist']):<50}  {vs_str:<20}  ${d['support']:<9}  ${d['resist']}")
+    log.info("")
 
     # ?? VOLUME LEADERBOARD ????????????????????????????????????????????????????
     prev_put_vol  = prev_vol.get("puts",  {}) if prev_vol else {}
     prev_call_vol = prev_vol.get("calls", {}) if prev_vol else {}
 
-    print(hdr("?? PUT VOLUME  (all expiries, ranked) ?????????????????????????"))
-    print(f"  {'STRIKE':<10}  {'EXPIRY':<12}  {'DTE':<5}  {'PRICE':>7}  {'VOLUME':>10}  {'CHANGE':>14}  {'VOL/OI':>10}  {'OI':>8}")
-    print("  " + "?"*(W-2))
+    log.info(hdr("?? PUT VOLUME  (all expiries, ranked) ?????????????????????????"))
+    log.info(f"  {'STRIKE':<10}  {'EXPIRY':<12}  {'DTE':<5}  {'PRICE':>7}  {'VOLUME':>10}  {'CHANGE':>14}  {'VOL/OI':>10}  {'OI':>8}")
+    log.info("  " + "?"*(W-2))
     top_puts = puts_all[puts_all["volume"] > 0].head(10)
     for i, (_, r) in enumerate(top_puts.iterrows()):
         magnet   = "  ? TOP VOL" if i == 0 else ""
@@ -650,12 +655,12 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
             delta_s = warn(f"{'NEW ?':>10}")
         else:
             delta_s = dim(f"{'':>10}")
-        print(f"  {strike_s:<10}  {r['expiry']:<12}  {int(r['dte']):>3}d  {price_s:>7}  {vol_s}  {delta_s}  {voi_s}  {int(r['openInterest']):>8,}{bear(magnet) if i==0 else ''}")
-    print()
+        log.info(f"  {strike_s:<10}  {r['expiry']:<12}  {int(r['dte']):>3}d  {price_s:>7}  {vol_s}  {delta_s}  {voi_s}  {int(r['openInterest']):>8,}{bear(magnet) if i==0 else ''}")
+    log.info("")
 
-    print(hdr("?? CALL VOLUME (all expiries, ranked) ?????????????????????????"))
-    print(f"  {'STRIKE':<10}  {'EXPIRY':<12}  {'DTE':<5}  {'PRICE':>7}  {'VOLUME':>10}  {'CHANGE':>14}  {'VOL/OI':>10}  {'OI':>8}")
-    print("  " + "?"*(W-2))
+    log.info(hdr("?? CALL VOLUME (all expiries, ranked) ?????????????????????????"))
+    log.info(f"  {'STRIKE':<10}  {'EXPIRY':<12}  {'DTE':<5}  {'PRICE':>7}  {'VOLUME':>10}  {'CHANGE':>14}  {'VOL/OI':>10}  {'OI':>8}")
+    log.info("  " + "?"*(W-2))
     top_calls = calls_all[calls_all["volume"] > 0].head(10)
     for i, (_, r) in enumerate(top_calls.iterrows()):
         magnet   = "  ? TOP VOL" if i == 0 else ""
@@ -676,13 +681,13 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
             delta_s = warn(f"{'NEW ?':>10}")
         else:
             delta_s = dim(f"{'':>10}")
-        print(f"  {strike_s:<10}  {r['expiry']:<12}  {int(r['dte']):>3}d  {price_s:>7}  {vol_s}  {delta_s}  {voi_s}  {int(r['openInterest']):>8,}{bull(magnet) if i==0 else ''}")
-    print()
+        log.info(f"  {strike_s:<10}  {r['expiry']:<12}  {int(r['dte']):>3}d  {price_s:>7}  {vol_s}  {delta_s}  {voi_s}  {int(r['openInterest']):>8,}{bull(magnet) if i==0 else ''}")
+    log.info("")
 
     # ?? SIGNAL ????????????????????????????????????????????????????????????????
-    print(hdr("?? VOLUME BY EXPIRY ???????????????????????????????????????????"))
-    print(f"  {'EXPIRY':<12}  {'DTE':<5}  {'CALL VOL':>12}  {'PUT VOL':>12}  {'P/C':>6}  BIAS")
-    print("  " + "?"*(W-2))
+    log.info(hdr("?? VOLUME BY EXPIRY ???????????????????????????????????????????"))
+    log.info(f"  {'EXPIRY':<12}  {'DTE':<5}  {'CALL VOL':>12}  {'PUT VOL':>12}  {'P/C':>6}  BIAS")
+    log.info("  " + "?"*(W-2))
 
     # aggregate by expiry across all strikes
     call_by_exp = calls_all.groupby(["expiry","dte"])["volume"].sum().reset_index()
@@ -715,18 +720,18 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
         if flag:
             notable_expiries.append((r["expiry"], dte, pc))
 
-        print(f"  {r['expiry']:<12}  {dte:>3}d  {cv_s}  {pv_s}  {pc:>6.2f}  {bias}{flag}")
-    print()
+        log.info(f"  {r['expiry']:<12}  {dte:>3}d  {cv_s}  {pv_s}  {pc:>6.2f}  {bias}{flag}")
+    log.info("")
 
     # ?? EXPIRY DRILL-DOWN - notable expiries only ??????????????????????????????
     if notable_expiries:
-        print(hdr("?? EXPIRY DRILL-DOWN  (notable P/C divergence) ????????????????"))
+        log.info(hdr("?? EXPIRY DRILL-DOWN  (notable P/C divergence) ????????????????"))
         for expiry, dte, pc in notable_expiries:
             bias_word = "BEARISH" if pc >= 1.05 else "BULLISH"
             bias_color = bear if pc >= 1.05 else bull
-            print(f"  {bold(expiry)}  ({dte}d)  P/C {pc:.2f}  {bias_color(f'? {bias_word} vs overall {overall_pc:.2f}')}")
-            print(f"  {'SIDE':<5}  {'STRIKE':<9}  {'PRICE':>7}  {'VOLUME':>10}  {'VOL/OI':>10}  {'OI':>8}")
-            print("  " + "?" * (W - 2))
+            log.info(f"  {bold(expiry)}  ({dte}d)  P/C {pc:.2f}  {bias_color(f'? {bias_word} vs overall {overall_pc:.2f}')}")
+            log.info(f"  {'SIDE':<5}  {'STRIKE':<9}  {'PRICE':>7}  {'VOLUME':>10}  {'VOL/OI':>10}  {'OI':>8}")
+            log.info("  " + "?" * (W - 2))
 
             # top 5 calls for this expiry
             exp_calls = calls_all[(calls_all["expiry"] == expiry) & (calls_all["volume"] > 0)]\
@@ -734,7 +739,7 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
             for _, r in exp_calls.iterrows():
                 voi_s = vol_oi_lbl(r["volume"], r["openInterest"])
                 vol_v = int(r["volume"])
-                print(f"  {bull('CALL'):<14}  ${r['strike']:<8.1f}  ${r['lastPrice']:>6.2f}  {bull(f'{vol_v:>10,}'):}  {voi_s}  {int(r['openInterest']):>8,}")
+                log.info(f"  {bull('CALL'):<14}  ${r['strike']:<8.1f}  ${r['lastPrice']:>6.2f}  {bull(f'{vol_v:>10,}'):}  {voi_s}  {int(r['openInterest']):>8,}")
 
             # top 5 puts for this expiry
             exp_puts = puts_all[(puts_all["expiry"] == expiry) & (puts_all["volume"] > 0)]\
@@ -742,16 +747,16 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
             for _, r in exp_puts.iterrows():
                 voi_s = vol_oi_lbl(r["volume"], r["openInterest"])
                 vol_v = int(r["volume"])
-                print(f"  {bear('PUT '):<14}  ${r['strike']:<8.1f}  ${r['lastPrice']:>6.2f}  {bear(f'{vol_v:>10,}'):}  {voi_s}  {int(r['openInterest']):>8,}")
-            print()
+                log.info(f"  {bear('PUT '):<14}  ${r['strike']:<8.1f}  ${r['lastPrice']:>6.2f}  {bear(f'{vol_v:>10,}'):}  {voi_s}  {int(r['openInterest']):>8,}")
+            log.info("")
 
     # ?? Opening Range ?????????????????????????????????????????????????????????
     if or_data:
-        print(hdr("?? OPENING RANGE BREAKOUT ?????????????????????????????????????"))
+        log.info(hdr("?? OPENING RANGE BREAKOUT ?????????????????????????????????????"))
         for label, minutes_label in [("5M", "9:30-9:35"), ("15M", "9:30-9:45")]:
             d = or_data.get(label)
             if not d:
-                print(f"  {bold(label)} ({minutes_label})  {dim('No data - market may be closed')}")
+                log.info(f"  {bold(label)} ({minutes_label})  {dim('No data - market may be closed')}")
                 continue
 
             if d["bias_dir"] == "bull":
@@ -763,27 +768,27 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
             else:
                 bias_str = warn(f"? {d['bias']} - wait for break")
 
-            print(f"  {bold(label+' OR')} ({minutes_label})  Open: ${d['open']}  ?  High: {bull(f"${d['high']}")}  ?  Low: {bear(f"${d['low']}")}")
-            print(f"         Range: ${d['range']} ({d['range_pct']}%)  ?  Current: ${spot}  ?  {bias_str}")
-            print()
-        print(f"  {dim('Break above OR High = call confirmation')}")
-        print(f"  {dim('Break below OR Low  = put confirmation')}")
-        print(f"  {dim('Inside range        = wait, no edge')}")
-        print()
+            log.info(f"  {bold(label+' OR')} ({minutes_label})  Open: ${d['open']}  ?  High: {bull(f"${d['high']}")}  ?  Low: {bear(f"${d['low']}")}")
+            log.info(f"         Range: ${d['range']} ({d['range_pct']}%)  ?  Current: ${spot}  ?  {bias_str}")
+            log.info("")
+        log.info(f"  {dim('Break above OR High = call confirmation')}")
+        log.info(f"  {dim('Break below OR Low  = put confirmation')}")
+        log.info(f"  {dim('Inside range        = wait, no edge')}")
+        log.info("")
 
-    print(hdr("?? SIGNAL ?????????????????????????????????????????????????????"))
+    log.info(hdr("?? SIGNAL ?????????????????????????????????????????????????????"))
 
     # ?? Actionability guard (BUGFIX 2026-07-16): the 16:32 run on
     # 2026-07-15 recommended a 0DTE contract that had expired at 16:00.
     market_open_now = market_is_open(_now_et())
 
     if not market_open_now:
-        print(f"  {warn('? MARKET CLOSED - data is end-of-day, no actionable signal')}")
-        print(f"  {dim('Magnets and flow below are a record of today, not a recommendation.')}")
-        print()
-        print(f"  {dim('Flow shows where money went. Whether it was right is a separate question.')}")
-        print(f"{C.BOLD}{C.BG_DARK}{'?'*W}{C.RESET}")
-        print(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
+        log.info(f"  {warn('? MARKET CLOSED - data is end-of-day, no actionable signal')}")
+        log.info(f"  {dim('Magnets and flow below are a record of today, not a recommendation.')}")
+        log.info("")
+        log.info(f"  {dim('Flow shows where money went. Whether it was right is a separate question.')}")
+        log.info(f"{C.BOLD}{C.BG_DARK}{'?'*W}{C.RESET}")
+        log.info(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
         return
 
     # Qualified magnets only - DTE >= 1, OI >= MIN_OI_FOR_MAGNET, Vol/OI >= 1.
@@ -797,26 +802,26 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
 
     for side, m, fmt in [("? PUT  MAGNET", pm, bear), ("? CALL MAGNET", cm, bull)]:
         if m is None:
-            print(f"  {fmt(side)}  ?  {dim('no qualified contract (DTE?1, OI?%d, vol/OI?1)' % MIN_OI_FOR_MAGNET)}")
+            log.info(f"  {fmt(side)}  ?  {dim('no qualified contract (DTE?1, OI?%d, vol/OI?1)' % MIN_OI_FOR_MAGNET)}")
         else:
-            print(f"  {fmt(side)}  ?  Strike ${m['strike']:.1f}  ?  Expiry {m['expiry']} ({int(m['dte'])}d)  ?  Vol {int(m['volume']):,}")
-    print()
+            log.info(f"  {fmt(side)}  ?  Strike ${m['strike']:.1f}  ?  Expiry {m['expiry']} ({int(m['dte'])}d)  ?  Vol {int(m['volume']):,}")
+    log.info("")
 
     target = cm if direction == "BULLISH" else (pm if direction == "BEARISH" else None)
 
     if direction not in ("BULLISH", "BEARISH"):
-        print(f"  {warn('? NO CLEAR EDGE  -  volume mixed, wait for confirmation')}")
+        log.info(f"  {warn('? NO CLEAR EDGE  -  volume mixed, wait for confirmation')}")
     elif target is None:
-        print(f"  {warn('? DIRECTION %s but no qualified contract - no trade' % direction)}")
+        log.info(f"  {warn('? DIRECTION %s but no qualified contract - no trade' % direction)}")
     else:
         # Same-day expiries are already excluded (DTE >= 1); guard anyway.
         if int(target["dte"]) < 1:
-            print(f"  {warn('? Nearest qualified contract expires today - no trade')}")
+            log.info(f"  {warn('? Nearest qualified contract expires today - no trade')}")
         else:
             side_lbl = bull('? DIRECTION: CALL') if direction == "BULLISH" else bear('? DIRECTION: PUT')
-            print(f"  {side_lbl}")
-            print(f"  Volume target  : ${target['strike']:.1f}  ({int(target['dte'])} DTE on {target['expiry']})")
-            print(f"  Vol/OI         : {target['volume']:.0f} / {target['openInterest']:.0f}  = {target['volume']/max(target['openInterest'],1):.1f}x conviction")
+            log.info(f"  {side_lbl}")
+            log.info(f"  Volume target  : ${target['strike']:.1f}  ({int(target['dte'])} DTE on {target['expiry']})")
+            log.info(f"  Vol/OI         : {target['volume']:.0f} / {target['openInterest']:.0f}  = {target['volume']/max(target['openInterest'],1):.1f}x conviction")
 
             bid_raw, ask_raw = target.get("bid"), target.get("ask")
             try:
@@ -833,18 +838,18 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
             else:
                 mid = float(target["lastPrice"])
             if mid > 0:
-                print(f"  Est. premium   : ${mid:.2f}  (x100 = ${mid*100:.0f})")
+                log.info(f"  Est. premium   : ${mid:.2f}  (x100 = ${mid*100:.0f})")
                 # Spread-aware stop (BUGFIX 2026-07-16): a % stop on a
                 # wide-spread contract market-sells into whatever bid exists.
                 if bid == bid and ask == ask and bid > 0 and ask > 0 and (ask - bid) / mid > 0.20:
-                    print(f"  Stop loss      : {warn('spread %.0f%% of mid - too wide for a reliable stop; size as full-loss risk' % ((ask-bid)/mid*100))}")
+                    log.info(f"  Stop loss      : {warn('spread %.0f%% of mid - too wide for a reliable stop; size as full-loss risk' % ((ask-bid)/mid*100))}")
                 else:
-                    print(f"  Stop loss      : ${mid*0.60:.2f}  (40% max loss rule)")
+                    log.info(f"  Stop loss      : ${mid*0.60:.2f}  (40% max loss rule)")
 
-    print()
-    print(f"  {dim('Flow shows where money went. Whether it was right is a separate question.')}")
-    print(f"{C.BOLD}{C.BG_DARK}{'?'*W}{C.RESET}")
-    print(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
+    log.info("")
+    log.info(f"  {dim('Flow shows where money went. Whether it was right is a separate question.')}")
+    log.info(f"{C.BOLD}{C.BG_DARK}{'?'*W}{C.RESET}")
+    log.info(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
 
 # ?? ARCHIVE ???????????????????????????????????????????????????????????????????
 def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None, *, is_eod=False, settlement_converged=None, source_name: str = "yahoo", quote_source: str = "nbbo"):
@@ -910,6 +915,10 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
 
 # ?? MAIN ??????????????????????????????????????????????????????????????????????
 def run(source=None):
+    # Scan activity lands in logs/scheduler.log (subprocess of scheduler),
+    # or the interactive console when run from a TTY.
+    _proc = os.environ.get("OPTIONTRADING_PROCESS", "scheduler")
+    setup_logging(_proc)
     from sources import get_source
 
     if source is None:
@@ -926,7 +935,7 @@ def run(source=None):
             max_attempts = int(_ecfg.get("eod_convergence_max_attempts", max_attempts))
         except Exception:
             pass
-        print(f"\n{C.CYAN}EOD mode -- converging settlement volumes for {TICKER}...{C.RESET}")
+        log.info(f"\n{C.CYAN}EOD mode -- converging settlement volumes for {TICKER}...{C.RESET}")
         last_pack = {}
 
         def _read_vols():
@@ -940,7 +949,7 @@ def run(source=None):
             last_pack["calls_all"] = calls_all
             last_pack["puts_all"] = puts_all
             last_pack["snap"] = snap
-            print(
+            log.info(
                 f"{C.GRAY}  vol snapshot CALL={snap.total_call_vol:,} "
                 f"PUT={snap.total_put_vol:,}{C.RESET}"
             )
@@ -956,15 +965,15 @@ def run(source=None):
         spot = last_pack["spot"]
         calls_all = last_pack["calls_all"]
         puts_all = last_pack["puts_all"]
-        print(
+        log.info(
             f"{C.CYAN}EOD settlement_converged={settlement_converged} "
             f"spot=${spot}{C.RESET}\n"
         )
     else:
-        print(f"\n{C.CYAN}Fetching {TICKER} data...{C.RESET}", end="", flush=True)
+        log.info(f"\n{C.CYAN}Fetching {TICKER} data...{C.RESET}")
         frames, spot, calls_all, puts_all = fetch_data(source)
-        print(f"  spot=${spot}")
-    print(f"{C.CYAN}Analyzing...{C.RESET}\n")
+        log.info(f"  spot=${spot}")
+    log.info(f"{C.CYAN}Analyzing...{C.RESET}\n")
     tf_data = analyze_tf(frames)
     or_data  = opening_range(frames.get("5M", pd.DataFrame()), frames.get("15M", pd.DataFrame()), spot)
 
@@ -978,7 +987,7 @@ def run(source=None):
         total_pv = int(puts_all["volume"].sum())
         curr_pc  = round(total_pv / total_cv, 3) if total_cv > 0 else 0
         changes = diff_reports(prev_data, spot, tf_data, calls_all, puts_all, curr_pc)
-        print(f"{C.GRAY}  Comparing to ? {prev_file}{C.RESET}")
+        log.info(f"{C.GRAY}  Comparing to ? {prev_file}{C.RESET}")
         # build (strike, expiry) ? volume lookups for inline deltas
         prev_vol = {
             "calls": {(r["strike"], r["expiry"]): r["volume"]
@@ -1018,7 +1027,7 @@ def run(source=None):
     if prev_result:
         _prev_archive_source = archive_source_name(prev_result[0])
     if not rollover_detectors_active(_session_scoped):
-        print(
+        log.info(
             f"{C.GRAY}  Rollover/stale-volume detectors DORMANT "
             f"(source={_curr_source} is session-scoped).{C.RESET}"
         )
@@ -1034,13 +1043,13 @@ def run(source=None):
                 f"{_curr_source} -- rollover check skipped"
             )
             _scan_log.warning(_msg)
-            print(f"{C.YELLOW}WARN: {_msg}{C.RESET}")
+            log.warning(f"{C.YELLOW}WARN: {_msg}{C.RESET}")
         elif _apply:
             _pv = (_prev_data or {}).get("volume") or {}
             _pc = int(_pv.get("total_call_vol") or 0)
             _pp = int(_pv.get("total_put_vol") or 0)
             if chain_volume_rolled_over(_pc, _pp, total_cv0, total_pv0):
-                print(
+                log.info(
                     f"{C.YELLOW}ABORT: chain volume rollover detected "
                     f"(same ET session {_today_et}). "
                     f"prev call/put={_pc:,}/{_pp:,}  "
@@ -1067,7 +1076,7 @@ def run(source=None):
     )
     if _q_fail:
         _cs = _q_detail.get("calls") or {}
-        print(
+        log.info(
             f"{C.YELLOW}ABORT: chain quality gate failed "
             f"(unusable {_cs.get('unusable', 0)}/{_cs.get('total', 0)} "
             f"top calls, frac={_q_detail.get('frac_unusable', 0):.0%}; "
@@ -1087,12 +1096,12 @@ def run(source=None):
             TICKER, "archive", now_et=_ET_now, required_source=_curr_source,
         )
     if _eod_arch is None:
-        print(
+        log.info(
             f"{C.YELLOW}WARN: EOD volume reference unavailable ({_eod_reason}); "
             f"stale-volume check skipped  decrease detector only.{C.RESET}"
         )
     elif not stale_check_active(_ET_now):
-        print(
+        log.info(
             f"{C.GRAY}  Stale-volume EOD check skipped (past cutoff ET).{C.RESET}"
         )
         _eod_lookup = eod_volume_lookup(_eod_arch)  # still pass through for attach after cutoff? no
@@ -1108,13 +1117,13 @@ def run(source=None):
         )
         _n_stale = sum(_call_flags) + sum(_put_flags)
         _n_tot = len(_call_flags) + len(_put_flags)
-        print(
+        log.info(
             f"{C.GRAY}  Stale-volume vs EOD: flagged {_n_stale}/{_n_tot} "
             f"top contracts (calls={sum(_call_flags)}, puts={sum(_put_flags)})."
             f"{C.RESET}"
         )
         if majority_stale_abort(_n_stale, _n_tot):
-            print(
+            log.info(
                 f"{C.YELLOW}ABORT: majority stale volume "
                 f"({_n_stale}/{_n_tot} > 50%). "
                 f"No archive, no attribution.{C.RESET}"
@@ -1202,23 +1211,33 @@ def run(source=None):
         eod_archive_source=_eod_archive_source,
     )
 
-    # capture report as plain text
+    # Capture report via a temporary logging handler (print_report uses log.*).
     import io
-    buf = io.StringIO()
-    import sys as _sys
-    _old_stdout = _sys.stdout
-    _sys.stdout = buf
-    print_report(spot, tf_data, calls_all, puts_all, or_data, changes=changes, prev_vol=prev_vol)
-    _sys.stdout = _old_stdout
-    report_text = buf.getvalue()
+    _cap = io.StringIO()
+
+    class _ReportCapture(logging.Handler):
+        def emit(self, record):
+            _cap.write(record.getMessage() + "\n")
+
+    _rh = _ReportCapture()
+    _prev_prop = log.propagate
+    _prev_handlers = list(log.handlers)
+    log.handlers = [_rh]
+    log.propagate = False
+    try:
+        print_report(spot, tf_data, calls_all, puts_all, or_data, changes=changes, prev_vol=prev_vol)
+    finally:
+        log.handlers = _prev_handlers
+        log.propagate = _prev_prop
+    report_text = _cap.getvalue()
 
     # save plain text report
     with open(fname_txt, "w") as f:
         f.write(strip_ansi(report_text))
 
-    print(f"{C.GRAY}  Archived ? {fname_json}{C.RESET}")
-    print(f"{C.GRAY}  Report   ? {fname_txt}{C.RESET}\n")
-    print(report_text, end="")
+    log.info(f"{C.GRAY}  Archived ? {fname_json}{C.RESET}")
+    log.info(f"{C.GRAY}  Report   ? {fname_txt}{C.RESET}\n")
+    log.info(report_text)
 
 if __name__ == "__main__":
     try:
@@ -1229,8 +1248,8 @@ if __name__ == "__main__":
         _source = get_source(_src_name) if _src_name else None
         run(source=_source)
     except MassiveChainTruncatedError as e:
-        print(f"{C.YELLOW}ABORT: {e}{C.RESET}")
+        log.error(f"{C.YELLOW}ABORT: {e}{C.RESET}")
         sys.exit(1)
     except ValueError as e:
-        print(f"{C.RED}ERROR:{C.RESET} {e}")
+        log.error(f"{C.RED}ERROR:{C.RESET} {e}")
         sys.exit(1)

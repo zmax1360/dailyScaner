@@ -15,7 +15,7 @@ Behaviour
 • Per-ticker intervals are read from scheduler_config.json.
 • After each successful scan a Telegram alert is sent (if bot is configured).
 • A PID file (scheduler.pid) prevents duplicate instances.
-• All activity is written to scheduler.log AND stdout.
+• All activity is written to logs/scheduler.log (rotating).
 
 scheduler_config.json schema
 ─────────────────────────────
@@ -45,33 +45,20 @@ import urllib.request
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
+from logging_config import LOG_DIR, setup_logging
+
 ET       = ZoneInfo("America/New_York")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PID_FILE = os.path.join(BASE_DIR, "scheduler.pid")
-LOG_FILE = os.path.join(BASE_DIR, "scheduler.log")
 CFG_FILE = os.path.join(BASE_DIR, "scheduler_config.json")
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 EXC_FILE = os.path.join(BASE_DIR, "tickers_excluded.json")
+LOG_FILE = os.path.join(LOG_DIR, "scheduler.log")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-# FileHandler only — app.py / nohup already redirect stdout to scheduler.log;
-# adding StreamHandler as well causes every line to be written twice.
-log = logging.getLogger("scheduler")
-log.setLevel(logging.INFO)
-log.propagate = False
-if not log.handlers:
-    _fmt = logging.Formatter(
-        "%(asctime)s  %(levelname)-7s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    _fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    _fh.setFormatter(_fmt)
-    log.addHandler(_fh)
-    # Console only when running interactively (not redirected to the log file)
-    if sys.stdout.isatty():
-        _sh = logging.StreamHandler(sys.stdout)
-        _sh.setFormatter(_fmt)
-        log.addHandler(_sh)
+# Rotating logs/scheduler.log — console echo only on a TTY (avoids double lines
+# when app.py / launchd already redirect stdout).
+log = setup_logging("scheduler")
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
 _DEFAULT_CFG: dict = {
@@ -259,6 +246,8 @@ def run_scan(ticker: str, timeout: int = 300, *, eod: bool = False) -> tuple[boo
     if eod:
         cmd.append("--eod")
     start = time.monotonic()
+    env = os.environ.copy()
+    env.setdefault("OPTIONTRADING_PROCESS", "scheduler")
     try:
         result = subprocess.run(
             cmd,
@@ -266,6 +255,7 @@ def run_scan(ticker: str, timeout: int = 300, *, eod: bool = False) -> tuple[boo
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         elapsed = time.monotonic() - start
         if result.returncode == 0:

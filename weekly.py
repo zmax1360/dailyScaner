@@ -5,6 +5,7 @@ Run every Monday morning before any weekly/biweekly options trade.
 Ali's trading system | June 2026
 """
 
+import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -14,6 +15,9 @@ from attribution import now_et
 from spread_gate import evaluate_spread_gate
 
 warnings.filterwarnings("ignore")
+
+from logging_config import setup_logging
+log = logging.getLogger("weekly")
 
 TICKER  = sys.argv[1].upper() if len(sys.argv) > 1 else "AAPL"
 W            = 70    # report width
@@ -314,7 +318,7 @@ def select_candidate_spread(calls, spot: float):
         atm_up = calls[calls["strike"] >= spot].sort_values("strike").reset_index(drop=True)
 
         if len(atm_up) < 2:
-            print(dim("  [gate] candidate: fewer than 2 strikes at/above ATM — skipping gate"))
+            log.info(dim("  [gate] candidate: fewer than 2 strikes at/above ATM — skipping gate"))
             return None
 
         long_row     = atm_up.iloc[0]
@@ -323,7 +327,7 @@ def select_candidate_spread(calls, spot: float):
         # Short leg: nearest strike to long_strike + SPREAD_WIDTH, strictly above long
         short_candidates = atm_up[atm_up["strike"] > long_strike].copy()
         if short_candidates.empty:
-            print(dim("  [gate] candidate: no strikes above long leg — skipping gate"))
+            log.info(dim("  [gate] candidate: no strikes above long leg — skipping gate"))
             return None
 
         target    = long_strike + SPREAD_WIDTH
@@ -332,7 +336,7 @@ def select_candidate_spread(calls, spot: float):
         ].iloc[0]
 
         if abs(float(short_row["strike"]) - target) > 2.5:
-            print(dim(
+            log.info(dim(
                 f"  [gate] candidate: no strike near target width "
                 f"(closest {float(short_row['strike']):.1f}, target {target:.1f}) — skipping gate"
             ))
@@ -342,30 +346,30 @@ def select_candidate_spread(calls, spot: float):
         short_bid, short_ask = float(short_row["bid"]), float(short_row["ask"])
 
         if long_bid <= 0 or long_ask <= 0:
-            print(dim(f"  [gate] candidate: long leg bid/ask invalid ({long_bid}/{long_ask}) — skipping gate"))
+            log.info(dim(f"  [gate] candidate: long leg bid/ask invalid ({long_bid}/{long_ask}) — skipping gate"))
             return None
         if short_bid <= 0 or short_ask <= 0:
-            print(dim(f"  [gate] candidate: short leg bid/ask invalid ({short_bid}/{short_ask}) — skipping gate"))
+            log.info(dim(f"  [gate] candidate: short leg bid/ask invalid ({short_bid}/{short_ask}) — skipping gate"))
             return None
 
         long_mid  = (long_bid  + long_ask)  / 2
         short_mid = (short_bid + short_ask) / 2
 
         if (long_ask - long_bid) / long_mid > 0.25:
-            print(dim(f"  [gate] candidate: long leg spread too wide ({(long_ask - long_bid) / long_mid:.2%}) — skipping gate"))
+            log.info(dim(f"  [gate] candidate: long leg spread too wide ({(long_ask - long_bid) / long_mid:.2%}) — skipping gate"))
             return None
         if (short_ask - short_bid) / short_mid > 0.25:
-            print(dim(f"  [gate] candidate: short leg spread too wide ({(short_ask - short_bid) / short_mid:.2%}) — skipping gate"))
+            log.info(dim(f"  [gate] candidate: short leg spread too wide ({(short_ask - short_bid) / short_mid:.2%}) — skipping gate"))
             return None
 
         iv = float(long_row["impliedVolatility"])
         if math.isnan(iv) or iv <= 0.05 or iv >= 2.0:
-            print(dim(f"  [gate] candidate: long leg IV={iv:.4f} out of range (0.05–2.0) — skipping gate"))
+            log.info(dim(f"  [gate] candidate: long leg IV={iv:.4f} out of range (0.05–2.0) — skipping gate"))
             return None
 
         net_debit = long_mid - short_mid
         if net_debit <= 0:
-            print(dim(f"  [gate] candidate: net debit {net_debit:.2f} <= 0 (nonsense mid prices) — skipping gate"))
+            log.info(dim(f"  [gate] candidate: net debit {net_debit:.2f} <= 0 (nonsense mid prices) — skipping gate"))
             return None
 
         return {
@@ -377,7 +381,7 @@ def select_candidate_spread(calls, spot: float):
         }
 
     except Exception as e:
-        print(dim(f"  [gate] candidate selection error: {e} — blocking"))
+        log.warning(dim(f"  [gate] candidate selection error: {e} — blocking"))
         return None
 
 
@@ -509,26 +513,26 @@ def print_report(ticker, ticker_data, macro, oi, score, checks, thesis, earnings
     spy    = macro.get("SPY",  {})
     qqq    = macro.get("QQQ",  {})
 
-    print(f"\n{'─'*W}")
-    print(bold(f"  📅  {ticker} WEEKLY SCANNER  │  {now}"))
-    print(f"{'─'*W}")
-    print()
+    log.info(f"\n{'─'*W}")
+    log.info(bold(f"  📅  {ticker} WEEKLY SCANNER  │  {now}"))
+    log.info(f"{'─'*W}")
+    log.info("")
 
     # ── 1. PRE-TRADE CHECKLIST ────────────────────────────────────────────────
     score_color = bull if score >= 4 else (warn if score == 3 else bear)
     verdict     = bull("GO ✓") if score >= 4 else (warn("MARGINAL") if score == 3 else bear("NO-GO ✗"))
-    print(hdr("┌─ PRE-TRADE CHECKLIST ───────────────────────────────────────┐"))
-    print(f"  Score: {score_color(f'{score}/5')}  →  {verdict}")
-    print("  " + "─" * (W - 2))
+    log.info(hdr("┌─ PRE-TRADE CHECKLIST ───────────────────────────────────────┐"))
+    log.info(f"  Score: {score_color(f'{score}/5')}  →  {verdict}")
+    log.info("  " + "─" * (W - 2))
     for name, passed, note in checks:
         icon  = bull("  ✓") if passed else bear("  ✗")
         color = bull if passed else bear
-        print(f"{icon}  {color(name)}")
-        print(f"     {dim(note)}")
-    print()
+        log.info(f"{icon}  {color(name)}")
+        log.info(f"     {dim(note)}")
+    log.info("")
 
     # ── 2. MACRO OVERVIEW ─────────────────────────────────────────────────────
-    print(hdr("┌─ MACRO OVERVIEW ────────────────────────────────────────────┐"))
+    log.info(hdr("┌─ MACRO OVERVIEW ────────────────────────────────────────────┐"))
     for sym, label in [("SPY", "S&P 500"), ("QQQ", "Nasdaq"), ("^VIX", "VIX")]:
         d = macro.get(sym, {})
         spot_s = f"${d.get('spot', 0):.2f}"
@@ -539,18 +543,18 @@ def print_report(ticker, ticker_data, macro, oi, score, checks, thesis, earnings
             status = bull("LOW — buy options ✓") if v < 15 else \
                      warn("MEDIUM — normal")      if v < 25 else \
                      bear("HIGH — options expensive ✗")
-            print(f"  {bold(label):<20}  {spot_s}  5d: {ret_s}   {status}")
+            log.info(f"  {bold(label):<20}  {spot_s}  5d: {ret_s}   {status}")
         else:
             a20 = bull("above EMA20 ✓") if d.get("above_ema20") else bear("below EMA20 ✗")
             a50 = bull("above EMA50 ✓") if d.get("above_ema50") else bear("below EMA50 ✗")
-            print(f"  {bold(label):<20}  {spot_s}  5d: {ret_s}   {a20}  {a50}")
-    print()
+            log.info(f"  {bold(label):<20}  {spot_s}  5d: {ret_s}   {a20}  {a50}")
+    log.info("")
 
     # ── 3. AAPL TECHNICAL LEVELS ──────────────────────────────────────────────
-    print(hdr("┌─ AAPL TECHNICAL LEVELS ─────────────────────────────────────┐"))
+    log.info(hdr("┌─ AAPL TECHNICAL LEVELS ─────────────────────────────────────┐"))
     spot = daily["spot"]
-    print(f"  {'':>25}  {'DAILY':>10}  {'WEEKLY':>10}")
-    print("  " + "─" * (W - 2))
+    log.info(f"  {'':>25}  {'DAILY':>10}  {'WEEKLY':>10}")
+    log.info("  " + "─" * (W - 2))
 
     for label, dk, wk in [
         ("Spot",        "spot",  "spot"),
@@ -574,11 +578,11 @@ def print_report(ticker, ticker_data, macro, oi, score, checks, thesis, earnings
             dv_s = bull(dv_s) if spot > daily["ema14"] else bear(dv_s)
         if dk == "ema28":
             dv_s = bull(dv_s) if spot > daily["ema28"] else bear(dv_s)
-        print(f"  {label:<25}  {dv_s:>10}  {wv_s:>10}")
-    print()
+        log.info(f"  {label:<25}  {dv_s:>10}  {wv_s:>10}")
+    log.info("")
 
     # ── 4. 30 DTE OPTIONS STRUCTURE ───────────────────────────────────────────
-    print(hdr("┌─ 30 DTE OPTIONS STRUCTURE (Institutional Positioning) ──────┐"))
+    log.info(hdr("┌─ 30 DTE OPTIONS STRUCTURE (Institutional Positioning) ──────┐"))
     pc_col  = bull if oi["pc_oi"] < 0.80 else (warn if oi["pc_oi"] < 1.0 else bear)
     skew_s  = f"{oi['iv_skew']:+.1f}%" if oi["iv_skew"] is not None else "n/a"
     skew_c  = bear if (oi["iv_skew"] or 0) > 3 else bull
@@ -586,60 +590,60 @@ def print_report(ticker, ticker_data, macro, oi, score, checks, thesis, earnings
     pc_oi_s    = pc_col(f"{oi['pc_oi']:.2f}")
     pc_lean    = 'bullish lean' if oi['pc_oi'] < 0.80 else 'neutral/bearish lean'
     skew_note  = 'put premium elevated — hedging active' if (oi['iv_skew'] or 0) > 3 else 'normal skew'
-    print(f"  Max Pain        : {max_pain_s}")
-    print(f"  P/C OI Ratio    : {pc_oi_s}  ({pc_lean})")
-    print(f"  IV Skew         : {skew_c(skew_s)}  ({skew_note})")
-    print(f"  Total Call OI   : {int(oi['total_call_oi']):>10,}")
-    print(f"  Total Put  OI   : {int(oi['total_put_oi']):>10,}")
-    print()
-    print(f"  {'SIDE':<6}  {'STRIKE':>8}  {'OI':>10}  {'IV':>8}")
-    print("  " + "─" * (W - 2))
+    log.info(f"  Max Pain        : {max_pain_s}")
+    log.info(f"  P/C OI Ratio    : {pc_oi_s}  ({pc_lean})")
+    log.info(f"  IV Skew         : {skew_c(skew_s)}  ({skew_note})")
+    log.info(f"  Total Call OI   : {int(oi['total_call_oi']):>10,}")
+    log.info(f"  Total Put  OI   : {int(oi['total_put_oi']):>10,}")
+    log.info("")
+    log.info(f"  {'SIDE':<6}  {'STRIKE':>8}  {'OI':>10}  {'IV':>8}")
+    log.info("  " + "─" * (W - 2))
     for r in oi["top_call_oi"]:
         iv_s = f"{r['impliedVolatility']*100:.1f}%" if r.get('impliedVolatility') else "  n/a"
-        print(f"  {bull('CALL'):<15}  ${r['strike']:>7.1f}  {int(r['openInterest']):>10,}  {iv_s:>8}")
+        log.info(f"  {bull('CALL'):<15}  ${r['strike']:>7.1f}  {int(r['openInterest']):>10,}  {iv_s:>8}")
     for r in oi["top_put_oi"]:
         iv_s = f"{r['impliedVolatility']*100:.1f}%" if r.get('impliedVolatility') else "  n/a"
-        print(f"  {bear('PUT'):<15}  ${r['strike']:>7.1f}  {int(r['openInterest']):>10,}  {iv_s:>8}")
-    print()
+        log.info(f"  {bear('PUT'):<15}  ${r['strike']:>7.1f}  {int(r['openInterest']):>10,}  {iv_s:>8}")
+    log.info("")
 
     # ── 5. EARNINGS AWARENESS ─────────────────────────────────────────────────
-    print(hdr("┌─ EARNINGS AWARENESS ────────────────────────────────────────┐"))
+    log.info(hdr("┌─ EARNINGS AWARENESS ────────────────────────────────────────┐"))
     if earnings_days is not None:
         e_color = bear if earnings_days <= 7 else (warn if earnings_days <= 14 else bull)
         e_warn  = "  ⚠️  DO NOT hold options through earnings!" if earnings_days <= 7 else \
                   "  ⚠️  Approaching — plan exit before earnings" if earnings_days <= 14 else \
                   "  ✓  Safe window for weekly/biweekly trades"
-        print(f"  {ticker} Earnings  :  {bold(earnings_date)}  ({e_color(f'{earnings_days} days away')})")
-        print(f"  {e_color(e_warn)}")
+        log.info(f"  {ticker} Earnings  :  {bold(earnings_date)}  ({e_color(f'{earnings_days} days away')})")
+        log.info(f"  {e_color(e_warn)}")
     else:
-        print(f"  {warn('No earnings date configured — update EARNINGS dict in script')}")
-    print()
+        log.info(f"  {warn('No earnings date configured — update EARNINGS dict in script')}")
+    log.info("")
 
     # ── 6. AI THESIS ──────────────────────────────────────────────────────────
-    print(hdr("┌─ WEEKLY TRADE THESIS  (AI-Generated) ───────────────────────┐"))
+    log.info(hdr("┌─ WEEKLY TRADE THESIS  (AI-Generated) ───────────────────────┐"))
     for line in thesis.split("\n"):
         stripped = line.strip()
         if not stripped:
-            print()
+            log.info("")
             continue
         # Color section headers
         if stripped.startswith(("1.", "2.", "3.", "4.", "5.", "6.")):
-            print(f"  {bold(stripped)}")
+            log.info(f"  {bold(stripped)}")
         elif "GO" in stripped and "NO-GO" not in stripped:
-            print(f"  {bull(stripped)}")
+            log.info(f"  {bull(stripped)}")
         elif "NO-GO" in stripped:
-            print(f"  {bear(stripped)}")
+            log.info(f"  {bear(stripped)}")
         elif "BULLISH" in stripped:
-            print(f"  {bull(stripped)}")
+            log.info(f"  {bull(stripped)}")
         elif "BEARISH" in stripped:
-            print(f"  {bear(stripped)}")
+            log.info(f"  {bear(stripped)}")
         else:
-            print(f"  {stripped}")
-    print()
+            log.info(f"  {stripped}")
+    log.info("")
 
-    print(f"{'─'*W}")
-    print(dim(f"  market data + Anthropic API  |  Not financial advice  |  {now}"))
-    print(f"{'─'*W}\n")
+    log.info(f"{'─'*W}")
+    log.info(dim(f"  market data + Anthropic API  |  Not financial advice  |  {now}"))
+    log.info(f"{'─'*W}\n")
 
 # ── GATE HELPERS ──────────────────────────────────────────────────────────────
 def _compute_exit_date(earnings_date, expiration: str) -> str:
@@ -692,16 +696,16 @@ def _format_gate_block(gate, cand, exit_date, exp, spot) -> str:
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run(source=None):
     src = _resolve_source(source)
-    print(f"\n{C.CYAN}  Fetching {TICKER} weekly data...{C.RESET}")
+    log.info(f"\n{C.CYAN}  Fetching {TICKER} weekly data...{C.RESET}")
     daily, weekly     = fetch_weekly_data(TICKER, source=src)
 
-    print(f"{C.CYAN}  Fetching macro data (SPY, QQQ, VIX)...{C.RESET}")
+    log.info(f"{C.CYAN}  Fetching macro data (SPY, QQQ, VIX)...{C.RESET}")
     macro_raw         = fetch_macro(source=src)
 
-    print(f"{C.CYAN}  Fetching 30 DTE options chain...{C.RESET}")
+    log.info(f"{C.CYAN}  Fetching 30 DTE options chain...{C.RESET}")
     calls, puts, exp  = fetch_options_30dte(TICKER, source=src)
 
-    print(f"{C.CYAN}  Analyzing...{C.RESET}")
+    log.info(f"{C.CYAN}  Analyzing...{C.RESET}")
     ticker_data       = analyze_ticker(daily, weekly)
     macro             = analyze_macro(macro_raw)
     oi                = analyze_oi_structure(calls, puts, ticker_data["daily"]["spot"])
@@ -727,7 +731,7 @@ def run(source=None):
         thesis = _format_gate_block(gate, cand, exit_date, exp,
                                     ticker_data["daily"]["spot"])
     else:
-        print(f"{C.CYAN}  Generating AI thesis..."
+        log.info(f"{C.CYAN}  Generating AI thesis..."
               f"  — PoP {gate['pop']:.0%}, EV ${gate['ev_per_contract']:+.2f}{C.RESET}")
         thesis = generate_thesis(TICKER, ticker_data, macro, oi,
                                  score, earnings_date, earnings_days,
@@ -736,11 +740,12 @@ def run(source=None):
 
     fname_json, fname_txt = save_archive(TICKER, ticker_data, macro, oi,
                                           score, thesis, earnings_date, earnings_days)
-    print(f"{C.GRAY}  Archived → {fname_json}{C.RESET}")
-    print(f"{C.GRAY}  Report   → {fname_txt}{C.RESET}")
+    log.info(f"{C.GRAY}  Archived → {fname_json}{C.RESET}")
+    log.info(f"{C.GRAY}  Report   → {fname_txt}{C.RESET}")
 
     print_report(TICKER, ticker_data, macro, oi, score, checks,
                  thesis, earnings_date, earnings_days)
 
 if __name__ == "__main__":
+    setup_logging(os.environ.get("OPTIONTRADING_PROCESS", "scheduler"))
     run()

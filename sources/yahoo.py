@@ -12,6 +12,7 @@ Preserved intentionally (do not "fix" here):
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -23,6 +24,7 @@ import yfinance as yf
 from sources.base import CHAIN_COLUMNS, validate_chain
 
 ET = ZoneInfo("America/New_York")
+log = logging.getLogger("sources.yahoo")
 
 
 def _yf_retry(fn, *, label: str, attempts: int = 5, base_sleep: float = 3.0):
@@ -49,10 +51,9 @@ def _yf_retry(fn, *, label: str, attempts: int = 5, base_sleep: float = 3.0):
             wait = base_sleep * (2 ** (attempt - 1))
             if rate_limited:
                 wait = max(wait, 15.0 * attempt)
-            print(
-                f"  Yahoo {label} retry {attempt}/{attempts} "
-                f"after {wait:.0f}s ({name})",
-                flush=True,
+            log.warning(
+                "Yahoo %s retry %d/%d after %.0fs (%s)",
+                label, attempt, attempts, wait, name,
             )
             time.sleep(wait)
     raise last_err

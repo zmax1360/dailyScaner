@@ -9,15 +9,19 @@ health_check.py — Daily attribution integrity checks.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from datetime import datetime, time as dtime
 
 from attribution import _db, default_db_path, now_et
+from logging_config import setup_logging
 from mark_runner import count_overdue_t1h, t1h_mark_health_ok
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
+
+log = logging.getLogger("health_check")
 
 
 def within_et_window(
@@ -139,7 +143,7 @@ def _telegram_alert(text: str) -> None:
     chat_raw = os.environ.get("TELEGRAM_CHAT_ID", "")
     chat = (chat_raw.split(",")[0] or "").strip()
     if not token or not chat:
-        print("WARN: Telegram not configured; alert not sent", file=sys.stderr)
+        log.warning("Telegram not configured; alert not sent")
         return
     try:
         import urllib.parse
@@ -153,7 +157,7 @@ def _telegram_alert(text: str) -> None:
         }).encode()
         urllib.request.urlopen(url, data=data, timeout=15)
     except Exception as exc:
-        print(f"WARN: Telegram send failed: {exc}", file=sys.stderr)
+        log.warning("Telegram send failed: %s", exc)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -177,20 +181,21 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     _load_env()
+    setup_logging("health_check")
     as_of = now_et()
     if args.require_et and not within_et_window(
         args.require_et, window_min=args.et_window_min, now=as_of
     ):
-        print(
-            f"SKIP: ET {as_of.strftime('%H:%M')} outside "
-            f"{args.require_et} ±{args.et_window_min}m window (F-23)"
+        log.info(
+            "SKIP: ET %s outside %s ±%sm window (F-23)",
+            as_of.strftime("%H:%M"), args.require_et, args.et_window_min,
         )
         return 0
 
     db = default_db_path()
-    print(f"db={db}  as_of={as_of.isoformat(timespec='seconds')}")
+    log.info("db=%s  as_of=%s", db, as_of.isoformat(timespec="seconds"))
     if not os.path.exists(db):
-        print("FAIL: attribution db missing")
+        log.error("FAIL: attribution db missing")
         if args.alert_on_fail:
             _telegram_alert(f"attribution health: DB missing at {db}")
         return 1
@@ -201,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     failed = []
     for name, ok, detail in results:
         status = "PASS" if ok else "FAIL"
-        print(f"  {status}  {name}: {detail}")
+        log.info("  %s  %s: %s", status, name, detail)
         if not ok:
             failed.append(f"{name}={detail}")
 
@@ -210,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.alert_on_fail:
             _telegram_alert(msg)
         return 1
-    print("OK: all checks passed")
+    log.info("OK: all checks passed")
     return 0
 
 
