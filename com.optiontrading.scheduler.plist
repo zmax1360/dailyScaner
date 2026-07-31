@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SCANNER_DB</key>
+		<string>/Users/alizafarianaraki/works/optionTrading/data/attribution.db</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.optiontrading.scheduler</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/alizafarianaraki/works/Conda/anaconda3/bin/python</string>
+		<string>/Users/alizafarianaraki/works/optionTrading/scheduler.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/alizafarianaraki/works/optionTrading/logs/scheduler.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/alizafarianaraki/works/optionTrading/logs/scheduler.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/alizafarianaraki/works/optionTrading</string>
+</dict>
+</plist>

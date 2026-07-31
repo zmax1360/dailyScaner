@@ -176,9 +176,9 @@
     </dict>
   </array>
   <key>StandardOutPath</key>
-  <string>/Users/alizafarianaraki/works/optionTrading/health_check.log</string>
+  <string>/Users/alizafarianaraki/works/optionTrading/logs/health_check.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/alizafarianaraki/works/optionTrading/health_check.log</string>
+  <string>/Users/alizafarianaraki/works/optionTrading/logs/health_check.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>SCANNER_DB</key>
