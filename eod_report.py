@@ -32,6 +32,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 REPORT_DIR = os.path.join(_BASE, "report")
@@ -39,6 +40,7 @@ DB = os.environ.get(
     "SCANNER_DB",
     os.path.join(_BASE, "data", "attribution.db"),
 )
+ET = ZoneInfo("America/New_York")
 MAX_HOURS_T1H = 2.0          # reject marks taken more than 2h after the flag
 MAX_HOURS_T1D = 30.0         # ~24h target + overnight slack
 # Expiry marks are intrinsic from the underlying close on expiry day — lag
@@ -55,13 +57,24 @@ DTE_BUCKET_SQL = """CASE
     ELSE '1DTE+'
 END"""
 
+# SQLite date()/time()/strftime() reinterpret offset-aware ISO strings
+# (…T16:19:37-04:00 → 20:19:37 UTC wall). Read the stored ET fields instead.
+def session_date_sql(column: str = "ts_et") -> str:
+    """ET calendar date YYYY-MM-DD from an offset-aware ISO timestamp column."""
+    return f"substr({column}, 1, 10)"
+
+
+def et_clock_sql(column: str = "ts_et") -> str:
+    """ET wall-clock HH:MM:SS from an offset-aware ISO timestamp column."""
+    return f"substr({column}, 12, 8)"
+
 
 @dataclass(frozen=True)
 class ReportFilter:
     """Parsed CLI window — used to build table-specific WHERE clauses."""
 
-    since: str | None = None          # date(ts_et) >= since
-    on_date: str | None = None        # date(ts_et) = on_date
+    since: str | None = None          # session date >= since
+    on_date: str | None = None        # session date = on_date
     ticker: str | None = None
 
     def where_sql(self, *, table_alias: str = "") -> tuple[str, list]:
@@ -69,15 +82,17 @@ class ReportFilter:
         Build an explicit WHERE for a given table (no string rewriting).
 
         table_alias: '' for bare columns, or 'f.' / 'v.' to qualify.
+        Session dates use substr — never SQLite date() on offset-aware ISO.
         """
         p = f"{table_alias}." if table_alias and not table_alias.endswith(".") else table_alias
+        sess = session_date_sql(f"{p}ts_et")
         clauses = ["1=1"]
         args: list = []
         if self.since is not None:
-            clauses.append(f"date({p}ts_et) >= ?")
+            clauses.append(f"{sess} >= ?")
             args.append(self.since)
         if self.on_date is not None:
-            clauses.append(f"date({p}ts_et) = ?")
+            clauses.append(f"{sess} = ?")
             args.append(self.on_date)
         if self.ticker is not None:
             clauses.append(f"{p}ticker = ?")
@@ -162,7 +177,7 @@ def clustered_bucket_rows(conn, where: str, args, horizon: str = "t1h"):
                       WHEN rank <= 10 THEN '04-10'
                       WHEN rank <= 20 THEN '11-20'
                       ELSE '21+' END rank_b,
-                 date(ts_et) d,
+                 {session_date_sql("ts_et")} d,
                  ticker||side||strike||expiry contract,
                  AVG({ret}) r
           FROM v_outcomes
@@ -187,7 +202,7 @@ def verdict_rows(conn, where: str, args):
         WITH pc AS (
           SELECT CASE WHEN is_control = 1 THEN 'CONTROL'
                       WHEN rank <= 3 THEN 'TOP3' ELSE 'REST' END b,
-                 date(ts_et) d,
+                 {session_date_sql("ts_et")} d,
                  ticker||side||strike||expiry c,
                  AVG(ret_t1h) r
           FROM v_outcomes
@@ -209,7 +224,7 @@ def section_coverage(conn, where, args):
         SELECT COUNT(*) flags,
                SUM(is_control) ctrl,
                COUNT(DISTINCT run_id) runs,
-               COUNT(DISTINCT date(ts_et)) days,
+               COUNT(DISTINCT {session_date_sql("ts_et")}) days,
                COUNT(DISTINCT config_hash) engines,
                SUM(mark_t1h IS NOT NULL) m1h,
                SUM(mark_t1d IS NOT NULL) m1d,
@@ -332,9 +347,11 @@ def section_flags(conn, filt: ReportFilter):
     if r and r[0][0] is not None and r[0][0] < 200:
         out.append(f"top-3 avg open interest {r[0][0]:.0f} — vol/OI likely inflated")
 
+    # Compare against an ET-offset ISO cutoff — never datetime('now') vs ts_et.
+    cutoff = (datetime.now(ET) - timedelta(hours=4)).isoformat(timespec="seconds")
     n = q(conn, f"""SELECT COUNT(*) FROM v_outcomes WHERE {v_where}
-                     AND mark_t1h IS NULL AND ts_et < datetime('now','-4 hours')""",
-          v_args)[0][0]
+                     AND mark_t1h IS NULL AND ts_et < ?""",
+          (*v_args, cutoff))[0][0]
     if n:
         out.append(f"{n} rows overdue for a T+1h mark — is mark_runner alive?")
 

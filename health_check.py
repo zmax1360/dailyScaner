@@ -12,7 +12,7 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 
 from attribution import _db, default_db_path, now_et
 from logging_config import setup_logging
@@ -65,8 +65,9 @@ def _load_env() -> None:
 
 def _checks(conn) -> list[tuple[str, bool, str]]:
     today = now_et().date().isoformat()
+    # substr — SQLite date(ts_et) shifts post-20:00 ET rows to the next UTC day.
     rows_today = conn.execute(
-        "SELECT COUNT(*) FROM flags WHERE date(ts_et) = ?", (today,)
+        "SELECT COUNT(*) FROM flags WHERE substr(ts_et, 1, 10) = ?", (today,)
     ).fetchone()[0]
     empty_mults = conn.execute(
         """
@@ -75,11 +76,13 @@ def _checks(conn) -> list[tuple[str, bool, str]]:
         """
     ).fetchone()[0]
     overdue = count_overdue_t1h(conn, as_of=now_et())
+    week_ago = (now_et().date() - timedelta(days=7)).isoformat()
     hashes = conn.execute(
         """
         SELECT COUNT(DISTINCT config_hash) FROM runs
-        WHERE ts_et > date('now', '-7 days')
-        """
+        WHERE substr(ts_et, 1, 10) >= ?
+        """,
+        (week_ago,),
     ).fetchone()[0]
     # Expiry intrinsic may be exactly 0.0 (OTM settled) — not a garbage quote.
     zero_marks = conn.execute(

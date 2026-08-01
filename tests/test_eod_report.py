@@ -214,11 +214,11 @@ def test_clustering_collapses_repeated_scans():
 def test_report_filter_builds_explicit_where():
     f = ReportFilter(since="2026-07-01", ticker="AAPL")
     sql, args = f.where_sql()
-    assert "date(ts_et) >= ?" in sql
+    assert "substr(ts_et, 1, 10) >= ?" in sql
     assert "ticker = ?" in sql
     assert args == ["2026-07-01", "AAPL"]
     sql_f, args_f = f.where_sql(table_alias="f")
-    assert "date(f.ts_et) >= ?" in sql_f
+    assert "substr(f.ts_et, 1, 10) >= ?" in sql_f
     assert args_f == args
 
 
