@@ -15,7 +15,7 @@ import sqlite3
 import subprocess
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from typing import Any, Iterator, Literal
 from zoneinfo import ZoneInfo
 
@@ -24,7 +24,10 @@ import pandas as pd
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger("attribution")
 
-Horizon = Literal["t1h", "t1d", "expiry"]
+Horizon = Literal["t1h", "t1d", "close", "expiry"]
+
+# Session close (ET). Same-session flags become due for mark_close at/after this.
+CLOSE_MARK_TIME = dtime(16, 15)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -64,10 +67,13 @@ CREATE TABLE IF NOT EXISTS flags (
     is_control  INTEGER NOT NULL DEFAULT 0,
     mark_t1h    REAL,
     mark_t1d    REAL,
+    mark_close  REAL,
     mark_expiry REAL,
     marked_t1h_at TEXT,
     marked_t1d_at TEXT,
+    marked_close_at TEXT,
     marked_exp_at TEXT,
+    close_method  TEXT,
     dte           INTEGER,
     volume        INTEGER,
     open_interest INTEGER,
@@ -103,10 +109,13 @@ SELECT
     f.is_control,
     f.mark_t1h,
     f.mark_t1d,
+    f.mark_close,
     f.mark_expiry,
     f.marked_t1h_at,
     f.marked_t1d_at,
+    f.marked_close_at,
     f.marked_exp_at,
+    f.close_method,
     r.config_hash,
     r.engine_sha,
     r.daily_bias,
@@ -121,6 +130,10 @@ SELECT
         THEN (f.mark_t1d - f.mid) / f.mid
     END AS ret_t1d,
     CASE
+        WHEN f.mid IS NOT NULL AND f.mid > 0 AND f.mark_close IS NOT NULL
+        THEN (f.mark_close - f.mid) / f.mid
+    END AS ret_close,
+    CASE
         WHEN f.mid IS NOT NULL AND f.mid > 0 AND f.mark_expiry IS NOT NULL
         THEN (f.mark_expiry - f.mid) / f.mid
     END AS ret_expiry,
@@ -132,6 +145,10 @@ SELECT
         WHEN f.marked_t1d_at IS NOT NULL
         THEN ROUND((julianday(f.marked_t1d_at) - julianday(f.ts_et)) * 24, 2)
     END AS hours_t1d,
+    CASE
+        WHEN f.marked_close_at IS NOT NULL
+        THEN ROUND((julianday(f.marked_close_at) - julianday(f.ts_et)) * 24, 2)
+    END AS hours_close,
     CASE
         WHEN f.marked_exp_at IS NOT NULL
         THEN ROUND((julianday(f.marked_exp_at) - julianday(f.ts_et)) * 24, 2)
@@ -160,6 +177,9 @@ _FLAG_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
     ("volume", "INTEGER"),
     ("open_interest", "INTEGER"),
     ("iv", "REAL"),
+    ("mark_close", "REAL"),
+    ("marked_close_at", "TEXT"),
+    ("close_method", "TEXT"),
 )
 
 _RUN_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
@@ -169,9 +189,9 @@ _RUN_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
 _MARK_AT_COL = {
     "t1h": "marked_t1h_at",
     "t1d": "marked_t1d_at",
+    "close": "marked_close_at",
     "expiry": "marked_exp_at",
 }
-
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
@@ -179,6 +199,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for col, sql_type in _FLAG_MIGRATE_COLS:
         if col not in cols:
             conn.execute(f"ALTER TABLE flags ADD COLUMN {col} {sql_type}")
+    # Index after migrate — mark_close is absent on pre-migration flags tables.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_flags_due_close ON flags(mark_close, ts_et)"
+    )
     run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
     for col, sql_type in _RUN_MIGRATE_COLS:
         if col not in run_cols:
@@ -656,6 +680,9 @@ def due_for_marking(
     elif horizon == "t1d":
         col = "mark_t1d"
         cutoff = as_of - timedelta(days=1)
+    elif horizon == "close":
+        col = "mark_close"
+        cutoff = as_of  # unused — session-date rule below
     elif horizon == "expiry":
         col = "mark_expiry"
         cutoff = as_of  # expiry < today handled in SQL
@@ -670,7 +697,7 @@ def due_for_marking(
         if horizon == "expiry":
             rows = conn.execute(
                 f"""
-                SELECT flag_id, ticker, side, strike, expiry, mid, ts_et, notes
+                SELECT flag_id, ticker, side, strike, expiry, mid, ts_et, notes, dte
                 FROM flags
                 WHERE {col} IS NULL
                   AND expiry < ?
@@ -678,12 +705,40 @@ def due_for_marking(
                 """,
                 (today, fail_like),
             ).fetchall()
+        elif horizon == "close":
+            # Due at 16:15 ET on the flag's session date; also return prior
+            # sessions so mark_runner can write stale:close (unrecoverable).
+            stale_tag = "stale:close"
+            sess = "substr(f.ts_et, 1, 10)"
+            if as_of.time() >= CLOSE_MARK_TIME:
+                # Today’s session is open for close marks + all prior sessions.
+                sess_clause = f"{sess} <= ?"
+                sess_args: tuple = (today,)
+            else:
+                # Before 16:15: only prior sessions (for stale notes).
+                sess_clause = f"{sess} < ?"
+                sess_args = (today,)
+            rows = conn.execute(
+                f"""
+                SELECT f.flag_id, f.ticker, f.side, f.strike, f.expiry,
+                       f.mid, f.ts_et, f.notes, f.dte
+                FROM flags f
+                LEFT JOIN runs r ON r.run_id = f.run_id
+                WHERE f.{col} IS NULL
+                  AND {sess_clause}
+                  AND (f.notes IS NULL OR f.notes NOT LIKE ?)
+                  AND (f.notes IS NULL OR f.notes NOT LIKE ?)
+                  AND (f.notes IS NULL OR f.notes NOT LIKE '%n/a:eod%')
+                  AND (r.run_kind IS NULL OR r.run_kind != 'eod')
+                """,
+                (*sess_args, f"%{stale_tag}%", fail_like),
+            ).fetchall()
         else:
             stale_tag = f"stale:{horizon}"
             rows = conn.execute(
                 f"""
                 SELECT f.flag_id, f.ticker, f.side, f.strike, f.expiry,
-                       f.mid, f.ts_et, f.notes
+                       f.mid, f.ts_et, f.notes, f.dte
                 FROM flags f
                 LEFT JOIN runs r ON r.run_id = f.run_id
                 WHERE f.{col} IS NULL
@@ -742,11 +797,13 @@ def note_stale_horizon(
     db_path: str | None = None,
 ) -> bool:
     """
-    Write-once 'stale:t1h' / 'stale:t1d' into flags.notes.
+    Write-once 'stale:t1h' / 'stale:t1d' / 'stale:close' into flags.notes.
     Does not write a mark value. Returns True if the note was newly written.
     """
-    if horizon not in ("t1h", "t1d"):
-        raise ValueError(f"staleness notes only apply to t1h/t1d, got {horizon}")
+    if horizon not in ("t1h", "t1d", "close"):
+        raise ValueError(
+            f"staleness notes only apply to t1h/t1d/close, got {horizon}"
+        )
     return _append_flag_note(flag_id, f"stale:{horizon}", db_path=db_path)
 
 
@@ -773,10 +830,12 @@ def write_mark(
     value: float | None,
     *,
     db_path: str | None = None,
+    close_method: str | None = None,
 ) -> bool:
     """
     Write-once mark. Returns True if written, False if already set or value is None.
     Never writes 0.0 as a stand-in for a failed fetch — callers must pass None.
+    Only expiry may be exactly 0.0 (OTM intrinsic). close rejects 0.0 like t1h/t1d.
     """
     if value is None:
         return False
@@ -790,19 +849,43 @@ def write_mark(
         log.warning("refusing non-positive mark for flag_id=%s: %s", flag_id, v)
         return False
 
-    col = {"t1h": "mark_t1h", "t1d": "mark_t1d", "expiry": "mark_expiry"}[horizon]
+    col = {
+        "t1h": "mark_t1h",
+        "t1d": "mark_t1d",
+        "close": "mark_close",
+        "expiry": "mark_expiry",
+    }[horizon]
     at_col = _MARK_AT_COL[horizon]
     marked_at = now_et().astimezone(ET).isoformat(timespec="seconds")
     with _db(db_path) as conn:
-        cur = conn.execute(
-            f"""
-            UPDATE flags
-            SET {col} = ?, {at_col} = ?
-            WHERE flag_id = ?
-              AND {col} IS NULL
-            """,
-            (v, marked_at, int(flag_id)),
-        )
+        if horizon == "close":
+            method = str(close_method or "").strip().lower()
+            if method not in ("quote", "intrinsic"):
+                log.warning(
+                    "refusing close mark without close_method "
+                    "quote|intrinsic flag_id=%s got %r",
+                    flag_id, close_method,
+                )
+                return False
+            cur = conn.execute(
+                """
+                UPDATE flags
+                SET mark_close = ?, marked_close_at = ?, close_method = ?
+                WHERE flag_id = ?
+                  AND mark_close IS NULL
+                """,
+                (v, marked_at, method, int(flag_id)),
+            )
+        else:
+            cur = conn.execute(
+                f"""
+                UPDATE flags
+                SET {col} = ?, {at_col} = ?
+                WHERE flag_id = ?
+                  AND {col} IS NULL
+                """,
+                (v, marked_at, int(flag_id)),
+            )
         return cur.rowcount == 1
 
 

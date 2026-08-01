@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-mark_runner.py — Write-once T+1h / T+1d / expiry marks for attribution flags.
+mark_runner.py — Write-once T+1h / T+1d / close / expiry marks for attribution.
 
   python mark_runner.py --dry-run
   python mark_runner.py
   python mark_runner.py --expiry-only
   python mark_runner.py --force          # ignore market-hours gate
 
-Expiry marks use intrinsic value from the underlying's close on the expiry
-date (expired contracts are absent from live chains). Horizons run in priority
-order: t1h → t1d → expiry. A wall-clock runtime cap exits 0 so launchd's next
-StartInterval gets a clean slot.
+Close marks are due at 16:15 ET on the flag's session date (buy-and-hold-to-
+close). Expiry marks use intrinsic from the underlying close on expiry day.
+Horizons run t1h → t1d → close → expiry. A wall-clock runtime cap exits 0 so
+launchd's next StartInterval gets a clean slot.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from datetime import date, datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 from attribution import (
+    CLOSE_MARK_TIME,
     default_db_path,
     due_for_marking,
     fetch_option_mid,
@@ -41,16 +42,21 @@ ENV_FILE = os.path.join(BASE_DIR, ".env")
 
 # Single source of truth for the t1h/t1d mark window (also used by health_check).
 MARK_WINDOW_START = dtime(9, 30)
-MARK_WINDOW_END = dtime(16, 15)
+MARK_WINDOW_END = dtime(16, 15)  # exclusive end — t1h/t1d stop here
+# Close marks are due at 16:15; chain quotes remain usable ~until 17:00.
+CLOSE_QUOTE_WINDOW_END = dtime(17, 0)
 # Full weekday mark window length (09:30–16:15) — t1d ceiling = one session.
 _SESSION_LEN = datetime.combine(datetime(2000, 1, 1).date(), MARK_WINDOW_END) - datetime.combine(
     datetime(2000, 1, 1).date(), MARK_WINDOW_START
 )
 SESSION_LEN_HOURS = _SESSION_LEN.total_seconds() / 3600.0  # 6.75
 T1H_STALE_MARKET_HOURS = 4.0
+# 0DTE: prefer intrinsic when quote diverges beyond this floor / relative band.
+_CLOSE_0DTE_ABS_TOL = 0.25
+_CLOSE_0DTE_REL_TOL = 0.05
 
-# Time-sensitive first — never starve t1h behind expiry backfill.
-HORIZON_PRIORITY: tuple[str, ...] = ("t1h", "t1d", "expiry")
+# Time-sensitive first — close before expiry (close is unrecoverable next day).
+HORIZON_PRIORITY: tuple[str, ...] = ("t1h", "t1d", "close", "expiry")
 
 log = logging.getLogger("mark_runner")
 
@@ -80,7 +86,7 @@ def _cfg_float(key: str, default: float) -> float:
 
 
 def in_mark_window(now: datetime | None = None) -> bool:
-    """Weekdays 09:30–16:15 ET (buffer for delayed quotes after the close)."""
+    """Weekdays 09:30–16:15 ET — t1h/t1d live-quote window (end exclusive)."""
     now = now or datetime.now(ET)
     if now.tzinfo is None:
         now = now.replace(tzinfo=ET)
@@ -93,6 +99,35 @@ def in_mark_window(now: datetime | None = None) -> bool:
 def _in_mark_window(now: datetime | None = None) -> bool:
     """Backward-compatible alias."""
     return in_mark_window(now)
+
+
+def in_close_quote_window(now: datetime | None = None) -> bool:
+    """Weekdays 16:15–17:00 ET — session close quotes still on the chain."""
+    now = now or datetime.now(ET)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ET)
+    now = now.astimezone(ET)
+    if now.weekday() >= 5:
+        return False
+    return CLOSE_MARK_TIME <= now.time() < CLOSE_QUOTE_WINDOW_END
+
+
+def session_date_of(ts_et: datetime | str) -> date:
+    """ET calendar date from a flag ts (substr-equivalent, offset-aware safe)."""
+    if isinstance(ts_et, str):
+        # Prefer the stored local date prefix (avoids SQLite/UTC reinterpret).
+        return date.fromisoformat(str(ts_et)[:10])
+    if ts_et.tzinfo is None:
+        ts_et = ts_et.replace(tzinfo=ET)
+    return ts_et.astimezone(ET).date()
+
+
+def is_close_stale(ts_et: datetime | str, as_of: datetime) -> bool:
+    """True when the flag's session is over — close price is unrecoverable."""
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=ET)
+    as_of = as_of.astimezone(ET)
+    return as_of.date() > session_date_of(ts_et)
 
 
 def first_markable_at(due: datetime) -> datetime:
@@ -172,7 +207,8 @@ def is_past_staleness_ceiling(
     t1d: > one full mark session (09:30–16:15)
     expiry: never stale under this rule
     """
-    if horizon == "expiry":
+    if horizon in ("expiry", "close"):
+        # close uses is_close_stale (session-date rule), not market-hours elapsed.
         return False
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=ET)
@@ -326,9 +362,12 @@ def _mark_horizon(
             return attempted, written, True
 
         fid = int(r["flag_id"])
-        if horizon in ("t1h", "t1d") and is_past_staleness_ceiling(
-            horizon, r["ts_et"], as_of
-        ):
+        stale = False
+        if horizon == "close":
+            stale = is_close_stale(r["ts_et"], as_of)
+        elif horizon in ("t1h", "t1d"):
+            stale = is_past_staleness_ceiling(horizon, r["ts_et"], as_of)
+        if stale:
             if dry_run:
                 log.info(
                     "dry-run stale %s flag_id=%s — would note, no mark",
@@ -344,6 +383,7 @@ def _mark_horizon(
 
         attempted += 1
         mid: float | None = None
+        close_method: str | None = None
         try:
             if horizon == "expiry":
                 exp = date.fromisoformat(str(r["expiry"])[:10])
@@ -365,6 +405,8 @@ def _mark_horizon(
                         f"{r['ticker']} on {exp.isoformat()}"
                     )
                 mid = option_intrinsic(str(r["side"]), float(r["strike"]), u_close)
+            elif horizon == "close":
+                mid, close_method = _fetch_close_mark(r, cache=cache)
             else:
                 mid = fetch_option_mid(
                     r["ticker"], r["side"], float(r["strike"]), str(r["expiry"]),
@@ -396,20 +438,97 @@ def _mark_horizon(
             continue
         if dry_run:
             log.info(
-                "dry-run %s flag_id=%s → mid=%.4f",
+                "dry-run %s flag_id=%s → mid=%.4f%s",
                 horizon, fid, mid,
+                f" method={close_method}" if close_method else "",
             )
             continue
-        ok = write_mark(fid, horizon, mid, db_path=db_path)  # type: ignore[arg-type]
+        ok = write_mark(
+            fid, horizon, mid, db_path=db_path,  # type: ignore[arg-type]
+            close_method=close_method,
+        )
         if ok:
             written += 1
-            log.info("marked %s flag_id=%s mid=%.4f", horizon, fid, mid)
+            log.info(
+                "marked %s flag_id=%s mid=%.4f%s",
+                horizon, fid, mid,
+                f" method={close_method}" if close_method else "",
+            )
         else:
             log.info(
                 "unchanged %s flag_id=%s (already set or refused)",
                 horizon, fid,
             )
     return attempted, written, False
+
+
+def _is_0dte(row) -> bool:
+    dte = row["dte"] if "dte" in row.keys() else None
+    if dte is not None:
+        try:
+            return int(dte) == 0
+        except (TypeError, ValueError):
+            pass
+    try:
+        return date.fromisoformat(str(row["expiry"])[:10]) == session_date_of(row["ts_et"])
+    except Exception:
+        return False
+
+
+def _fetch_close_mark(
+    row,
+    *,
+    cache: dict[tuple[str, str], float | None],
+) -> tuple[float | None, str | None]:
+    """
+    Session-close mark: quote first; 0DTE falls back to (or prefers) intrinsic.
+
+    Returns (value, close_method) or (None, None) for transient miss.
+    """
+    ticker = str(row["ticker"])
+    side = str(row["side"])
+    strike = float(row["strike"])
+    expiry = str(row["expiry"])
+    sess = session_date_of(row["ts_et"])
+
+    quote: float | None = None
+    try:
+        quote = fetch_option_mid(ticker, side, strike, expiry)
+    except ValueError:
+        # Permanent chain miss — for non-0DTE this is fatal; for 0DTE try intrinsic.
+        if not _is_0dte(row):
+            raise
+        quote = None
+
+    if not _is_0dte(row):
+        return (quote, "quote") if quote is not None else (None, None)
+
+    # 0DTE: compute intrinsic from that session's underlying close.
+    try:
+        u_close = fetch_underlying_close(ticker, sess, cache=cache)
+    except Exception:
+        u_close = None
+    intrinsic: float | None = None
+    if u_close is not None:
+        intrinsic = option_intrinsic(side, strike, u_close)
+
+    if quote is None and (intrinsic is None or intrinsic == 0.0):
+        if intrinsic == 0.0:
+            raise ValueError("0DTE close intrinsic is 0 (OTM) — use expiry horizon")
+        return None, None
+    if quote is None:
+        return intrinsic, "intrinsic"
+    if intrinsic is None or intrinsic == 0.0:
+        return quote, "quote"
+
+    tol = max(_CLOSE_0DTE_ABS_TOL, _CLOSE_0DTE_REL_TOL * max(quote, intrinsic))
+    if abs(quote - intrinsic) > tol:
+        log.info(
+            "0DTE close quote=%.4f intrinsic=%.4f diverges > %.4f — preferring intrinsic",
+            quote, intrinsic, tol,
+        )
+        return intrinsic, "intrinsic"
+    return quote, "quote"
 
 
 def max_marked_t1h_age_minutes(
@@ -482,13 +601,21 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
+        # Gate finding: MARK_WINDOW is 09:30–16:15 exclusive, so the old
+        # "outside → expiry only" path blocked close entirely between 16:15 and
+        # 17:00. Close + expiry still run outside that window; t1h/t1d do not.
         if args.expiry_only:
             horizons: tuple[str, ...] = ("expiry",)
         elif args.force or _in_mark_window():
             horizons = HORIZON_PRIORITY
         else:
-            log.info("outside mark window (09:30–16:15 ET) — expiry pass only")
-            horizons = ("expiry",)
+            log.info(
+                "outside t1h/t1d window (09:30–16:15 ET) — close + expiry pass"
+                "%s",
+                " (in close-quote window 16:15–17:00)" if in_close_quote_window()
+                else "",
+            )
+            horizons = ("close", "expiry")
 
         underlying_cache: dict[tuple[str, str], float | None] = {}
         for h in horizons:

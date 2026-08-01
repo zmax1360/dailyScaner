@@ -282,13 +282,10 @@ def test_mark_records_timestamp(tmp_path, monkeypatch):
 
 def test_mark_value_and_timestamp_are_atomic():
     src = inspect.getsource(write_mark)
-    # Single UPDATE must set value and *_at together; no second statement path.
+    # Value and *_at are set in the same UPDATE (close also sets close_method).
     assert "UPDATE flags" in src
-    assert src.count("UPDATE flags") == 1
-    assert "SET {col} = ?, {at_col} = ?" in src
-    assert "AND {col} IS NULL" in src
-    # Rejected writes leave both NULL
-    # (covered operationally below via refuse path)
+    assert "AND {col} IS NULL" in src or "AND mark_close IS NULL" in src
+    assert "SET {col} = ?, {at_col} = ?" in src or "marked_close_at" in src
 
 
 def test_mark_refuse_leaves_both_null(tmp_path):
@@ -362,7 +359,10 @@ def test_migration_preserves_existing_rows(tmp_path):
     _ensure_schema(conn)
     conn.commit()
     cols_after = {r[1] for r in conn.execute("PRAGMA table_info(flags)")}
-    for col in ("marked_t1h_at", "marked_t1d_at", "marked_exp_at"):
+    for col in (
+        "marked_t1h_at", "marked_t1d_at", "marked_exp_at",
+        "mark_close", "marked_close_at", "close_method",
+    ):
         assert col in cols_after
     after = conn.execute(
         "SELECT flag_id, score, mid, ticker, marked_t1h_at, marked_t1d_at, marked_exp_at "

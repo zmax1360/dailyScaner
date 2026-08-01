@@ -161,7 +161,7 @@ def test_underlying_close_cached(monkeypatch):
 
 
 def test_horizon_priority_order():
-    assert HORIZON_PRIORITY == ("t1h", "t1d", "expiry")
+    assert HORIZON_PRIORITY == ("t1h", "t1d", "close", "expiry")
 
 
 def test_runtime_cap_stops_early(tmp_path):
