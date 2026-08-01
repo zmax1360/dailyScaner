@@ -29,7 +29,9 @@ import argparse
 import io
 import os
 import sqlite3
+import statistics
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -48,6 +50,15 @@ MAX_HOURS_T1D = 30.0         # ~24h target + overnight slack
 # Do NOT apply a hours_expiry guard if/when an expiry outcomes section is added.
 MAX_HOURS_EXPIRY = None
 OUTLIER = 1.0                # returns >= +100% treated as tail events
+
+# ── Paper-strategy analysis parameters (NOT in config.py — must not move hash)
+ENTRY_TIME_ET = "10:00"      # CLOCK_1000: first scan at/after this ET clock
+CONFIRM_N = 5                # CONFIRM_5: consecutive rank-1 scans before entry
+_LOCKED_ENTRY_TIME_ET = "10:00"
+_LOCKED_CONFIRM_N = 5
+
+PAPER_RULES = ("FIRST_SEEN", "CLOCK_1000", "CONFIRM_5")
+PAPER_VARIANTS = ("ALL", "0DTE", "1DTE+", "CONTROL")
 
 # Shared by section_buckets and section_verdict — must never diverge.
 # NULL dte (pre-migration rows) is UNKNOWN, never silently pooled into 1DTE+.
@@ -310,6 +321,315 @@ def section_verdict(conn, where, args):
     return rows
 
 
+# ── paper strategy ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class PaperTrade:
+    rule: str
+    session: str
+    ticker: str
+    contract: str
+    entry_mid: float
+    mark_close: float
+    pnl: float
+    dte_bucket: str          # 0DTE / 1DTE+ / UNKNOWN
+    persist_scans: int       # consecutive rank-1 (or control) scans from entry
+    is_control: bool
+
+
+def _dte_bucket(dte) -> str:
+    if dte is None:
+        return "UNKNOWN"
+    try:
+        return "0DTE" if int(dte) == 0 else "1DTE+"
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+
+
+def _persist_from(scans: list, start_idx: int, contract: str) -> int:
+    """Count consecutive scans from start_idx where contract stays selected."""
+    n = 0
+    for i in range(start_idx, len(scans)):
+        if scans[i]["contract"] != contract:
+            break
+        n += 1
+    return n
+
+
+def _pick_entry_first_seen(scans: list) -> int | None:
+    return 0 if scans else None
+
+
+def _pick_entry_clock(scans: list) -> int | None:
+    for i, s in enumerate(scans):
+        if s["clock"] >= ENTRY_TIME_ET:
+            return i
+    return None
+
+
+def _pick_entry_confirm(scans: list) -> int | None:
+    if CONFIRM_N < 1:
+        return None
+    streak_c = None
+    streak_n = 0
+    for i, s in enumerate(scans):
+        c = s["contract"]
+        if c == streak_c:
+            streak_n += 1
+        else:
+            streak_c = c
+            streak_n = 1
+        if streak_n >= CONFIRM_N:
+            return i
+    return None
+
+
+_ENTRY_PICKERS = {
+    "FIRST_SEEN": _pick_entry_first_seen,
+    "CLOCK_1000": _pick_entry_clock,
+    "CONFIRM_5": _pick_entry_confirm,
+}
+
+
+def _row_to_scan(r) -> dict:
+    mc = r["mark_close"]
+    return {
+        "clock": r["clock"],
+        "ts_et": r["ts_et"],
+        "contract": r["contract"],
+        "mid": float(r["mid"]),
+        "mark_close": None if mc is None else float(mc),
+        "dte_bucket": _dte_bucket(r["dte"]),
+    }
+
+
+def _load_paper_scans(
+    conn,
+    where: str,
+    args,
+    *,
+    control: bool,
+) -> dict[tuple[str, str], list[dict]]:
+    """
+    Scans keyed by (session, ticker), ordered by ts_et.
+
+    Engine path: rank = 1, is_control = 0.
+    Control path: is_control = 1 (rank is NULL on controls); one row per run
+    (prefer CALL when both sides exist).
+
+    Requires conn.row_factory = sqlite3.Row.
+    """
+    if control:
+        sql = f"""
+            SELECT {session_date_sql("ts_et")} AS sess,
+                   {et_clock_sql("ts_et")} AS clock,
+                   ts_et, run_id, ticker, side, strike, expiry, dte,
+                   mid, mark_close,
+                   ticker || side || strike || expiry AS contract
+            FROM flags
+            WHERE {where}
+              AND is_control = 1
+              AND mid IS NOT NULL AND mid > 0
+            ORDER BY sess, ticker, ts_et, CASE side WHEN 'CALL' THEN 0 ELSE 1 END
+        """
+        rows = q(conn, sql, args)
+        by: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        seen_run: set[tuple[str, str, str]] = set()
+        for r in rows:
+            key = (r["sess"], r["ticker"])
+            run_key = (r["sess"], r["ticker"], r["run_id"])
+            if run_key in seen_run:
+                continue
+            seen_run.add(run_key)
+            by[key].append(_row_to_scan(r))
+        return by
+
+    sql = f"""
+        SELECT {session_date_sql("ts_et")} AS sess,
+               {et_clock_sql("ts_et")} AS clock,
+               ts_et, ticker, side, strike, expiry, dte,
+               mid, mark_close,
+               ticker || side || strike || expiry AS contract
+        FROM flags
+        WHERE {where}
+          AND is_control = 0
+          AND rank = 1
+          AND mid IS NOT NULL AND mid > 0
+        ORDER BY sess, ticker, ts_et
+    """
+    rows = q(conn, sql, args)
+    by = defaultdict(list)
+    for r in rows:
+        by[(r["sess"], r["ticker"])].append(_row_to_scan(r))
+    return by
+
+
+def paper_trades_for_rule(
+    scans_by_day: dict[tuple[str, str], list[dict]],
+    rule: str,
+    *,
+    is_control: bool,
+) -> list[PaperTrade]:
+    """
+    One trade per (rule, session, contract). Re-entries of the same contract
+    the same day collapse — the first entry under the rule wins.
+    """
+    picker = _ENTRY_PICKERS[rule]
+    out: list[PaperTrade] = []
+    seen: set[tuple[str, str, str]] = set()  # session, ticker, contract
+    for (sess, ticker), scans in sorted(scans_by_day.items()):
+        idx = picker(scans)
+        if idx is None:
+            continue
+        s = scans[idx]
+        contract = s["contract"]
+        key = (sess, ticker, contract)
+        if key in seen:
+            continue
+        if s["mark_close"] is None:
+            continue
+        seen.add(key)
+        pnl = (s["mark_close"] - s["mid"]) * 100.0
+        out.append(PaperTrade(
+            rule=rule,
+            session=sess,
+            ticker=ticker,
+            contract=contract,
+            entry_mid=s["mid"],
+            mark_close=s["mark_close"],
+            pnl=pnl,
+            dte_bucket=s["dte_bucket"],
+            persist_scans=_persist_from(scans, idx, contract),
+            is_control=is_control,
+        ))
+    return out
+
+
+def _summarize_pnls(trades: list[PaperTrade]) -> dict:
+    if not trades:
+        return {
+            "n_days": 0, "n": 0, "win": None, "total": None, "mean": None,
+            "median": None, "best": None, "worst": None, "persist": None,
+        }
+    pnls = [t.pnl for t in trades]
+    days = len({t.session for t in trades})
+    wins = sum(1 for p in pnls if p > 0)
+    return {
+        "n_days": days,
+        "n": len(trades),
+        "win": wins / len(pnls),
+        "total": sum(pnls),
+        "mean": statistics.mean(pnls),
+        "median": statistics.median(pnls),
+        "best": max(pnls),
+        "worst": min(pnls),
+        "persist": statistics.mean(t.persist_scans for t in trades),
+    }
+
+
+def _fmt_money(x) -> str:
+    if x is None:
+        return "      -"
+    return f"{x:+8.0f}"
+
+
+def _fmt_win(x) -> str:
+    if x is None:
+        return "    -"
+    return f"{x:5.0%}"
+
+
+def section_paper_strategy(conn, filt: ReportFilter):
+    """
+    Buy-one-contract, hold-to-close under three fixed entry rules.
+
+    Anti-curve-fitting: rules and parameters are locked; do not search over
+    entry times / confirm counts or pick entries using the exit.
+    """
+    hr("PAPER STRATEGY")
+    print(
+        "  three entry rules, fixed in advance — "
+        "do not add, remove, or tune after seeing results"
+    )
+    print(
+        f"  params  ENTRY_TIME_ET={ENTRY_TIME_ET}  CONFIRM_N={CONFIRM_N}  "
+        f"exit=mark_close  pnl=(mark_close-mid)*100"
+    )
+    if (
+        ENTRY_TIME_ET != _LOCKED_ENTRY_TIME_ET
+        or CONFIRM_N != _LOCKED_CONFIRM_N
+    ):
+        print(
+            "  ⚠  ENTRY_TIME_ET/CONFIRM_N differ from locked defaults "
+            f"({_LOCKED_ENTRY_TIME_ET} / {_LOCKED_CONFIRM_N}) — "
+            "results across parameter values are not comparable"
+        )
+
+    where, args = filt.where_sql()
+    engine_scans = _load_paper_scans(conn, where, args, control=False)
+    control_scans = _load_paper_scans(conn, where, args, control=True)
+
+    # Precompute all trades for each rule
+    engine_by_rule = {
+        rule: paper_trades_for_rule(engine_scans, rule, is_control=False)
+        for rule in PAPER_RULES
+    }
+    control_by_rule = {
+        rule: paper_trades_for_rule(control_scans, rule, is_control=True)
+        for rule in PAPER_RULES
+    }
+
+    n_close = q(conn, f"""
+        SELECT COUNT(*) FROM flags
+        WHERE {where} AND mark_close IS NOT NULL
+    """, args)[0][0]
+    if not n_close:
+        print(
+            "\n  no mark_close rows in window — paper P&L empty until "
+            "mark_runner writes session-close marks"
+        )
+
+    header = (
+        f"  {'variant':<8} {'n_days':>6} {'n':>4} {'win%':>6} "
+        f"{'total$':>8} {'mean$':>8} {'med$':>8} "
+        f"{'best':>8} {'worst':>8} {'persist':>7}"
+    )
+
+    for rule in PAPER_RULES:
+        print(f"\n  {rule}")
+        print(header)
+        engine = engine_by_rule[rule]
+        control = control_by_rule[rule]
+        buckets = {
+            "ALL": list(engine),
+            "0DTE": [t for t in engine if t.dte_bucket == "0DTE"],
+            "1DTE+": [t for t in engine if t.dte_bucket == "1DTE+"],
+            "CONTROL": control,
+        }
+
+        for variant in PAPER_VARIANTS:
+            s = _summarize_pnls(buckets[variant])
+            persist = (
+                "      -" if s["persist"] is None else f"{s['persist']:7.1f}"
+            )
+            print(
+                f"  {variant:<8} {s['n_days']:>6} {s['n']:>4} "
+                f"{_fmt_win(s['win'])} "
+                f"{_fmt_money(s['total'])} {_fmt_money(s['mean'])} "
+                f"{_fmt_money(s['median'])} {_fmt_money(s['best'])} "
+                f"{_fmt_money(s['worst'])} {persist}"
+            )
+
+    print(
+        "\n  persist = mean consecutive rank-1 (or control) scans from entry "
+        "(diagnostic only; not extra observations)"
+    )
+    print(
+        "  clustering: one trade per (rule, date, contract) — "
+        "re-entries the same day do not add n"
+    )
+
+
 def section_flags(conn, filt: ReportFilter):
     """Data-quality checks with explicit WHERE per table (no string rewrite)."""
     hr("DATA-QUALITY FLAGS")
@@ -393,6 +713,7 @@ def main(argv: list[str] | None = None) -> int:
     filt, span, span_key = parse_filter(a)
     w, args = filt.where_sql()
     conn = sqlite3.connect(a.db)
+    conn.row_factory = sqlite3.Row
 
     generated = datetime.now()
     out_path = a.out or report_path(
@@ -420,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
         section_buckets(conn, w, args, "t1h")
         section_buckets(conn, w, args, "t1d")
         section_verdict(conn, w, args)
+        section_paper_strategy(conn, filt)
         section_flags(conn, filt)
         print()
         print("── SAVED ─────────────────────────────────────────────────────────")
