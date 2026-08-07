@@ -163,6 +163,16 @@ def should_run_eod(cfg: dict, now_et: datetime | None = None) -> bool:
     return is_eod_slot(now_et or _now_et(), cfg)
 
 # ── Telegram notify ────────────────────────────────────────────────────────────
+# Process-local refusal streak (resets on success; one alert at streak==3).
+_refusal_streak: dict[str, int] = {}
+_refusal_alert_sent: dict[str, bool] = {}
+
+
+def _reset_refusal_streak(ticker: str) -> None:
+    _refusal_streak[ticker] = 0
+    _refusal_alert_sent[ticker] = False
+
+
 def _send_telegram(token: str, chat_id: str, text: str) -> bool:
     url  = f"https://api.telegram.org/bot{token}/sendMessage"
     body = urllib.parse.urlencode({
@@ -177,28 +187,14 @@ def _send_telegram(token: str, chat_id: str, text: str) -> bool:
         return False
 
 
-def _notify(ticker: str, success: bool, env: dict, elapsed: float) -> None:
-    """
-    After a successful scan, send Best Value + Magnets + Volume by Expiry
-    + Changes (spot / P/C) + Catalyst news. No bare "scan complete" message.
-    On failure, send a short failure alert only.
-    """
+def _notify_success(ticker: str, env: dict, elapsed: float) -> None:
+    """After exit 0 only — format from the archive the scan just wrote."""
     token   = env.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = env.get("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
         return
 
-    now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
-    if not success:
-        _send_telegram(
-            token, chat_id,
-            f"⚠️ <b>{ticker}</b> scan <b>FAILED</b>\n"
-            f"<i>{now_et} · {elapsed:.0f}s</i>",
-        )
-        return
-
     try:
-        # Reuse the bot's formatter so notification content matches interactive reports
         from telegram_bot import _fmt_report, _load_latest
         payload, prev = _load_latest(ticker)
         if not payload:
@@ -213,8 +209,8 @@ def _notify(ticker: str, success: bool, env: dict, elapsed: float) -> None:
                 "best_value":    True,
                 "magnets":       True,
                 "volume_expiry": True,
-                "deltas":        True,   # Changes on every notify
-                "catalyst":      True,   # Live news / catalyst sentiment
+                "deltas":        True,
+                "catalyst":      True,
                 "session":       False,
                 "mtf":           False,
                 "orb":           False,
@@ -222,6 +218,9 @@ def _notify(ticker: str, success: bool, env: dict, elapsed: float) -> None:
             },
             expiry_drill=[],
         )
+        if not text or not text.strip():
+            log.info(f"[{ticker}] notify skipped (empty report after gates)")
+            return
         ok = _send_telegram(token, chat_id, text)
         if ok:
             log.info(
@@ -233,13 +232,89 @@ def _notify(ticker: str, success: bool, env: dict, elapsed: float) -> None:
     except Exception as exc:
         log.warning(f"[{ticker}] notify error: {exc}")
 
+
+def _notify_refusal_streak(ticker: str, reason: str | None, env: dict) -> None:
+    """One alert when consecutive refusals hit 3 — then silent until success."""
+    from notify_delivery import REFUSAL_STREAK_ALERT_AT
+
+    token   = env.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = env.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    why = reason or "unknown"
+    now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+    text = (
+        f"⚠️ <b>{ticker}</b> scanner stopped publishing\n"
+        f"{REFUSAL_STREAK_ALERT_AT} consecutive refusals "
+        f"(<code>{why}</code>).\n"
+        f"No Best Value alerts until a scan succeeds.\n"
+        f"<i>{now_et}</i>"
+    )
+    if _send_telegram(token, chat_id, text):
+        log.info(f"[{ticker}] refusal-streak notify sent (reason={why})")
+    else:
+        log.warning(f"[{ticker}] refusal-streak notify failed")
+
+
+def handle_scan_result(
+    ticker: str,
+    exit_code: int,
+    reason: str | None,
+    elapsed: float,
+    *,
+    notify: bool,
+    env: dict,
+) -> None:
+    """
+    Log scan outcome and decide whether to notify.
+
+    exit 0 → OK + notify
+    exit 3 → REFUSED, skip notify (one streak alert at 3 consecutive)
+    else   → FAILED, skip notify
+    """
+    from notify_delivery import REFUSAL_STREAK_ALERT_AT
+
+    if exit_code == 0:
+        _reset_refusal_streak(ticker)
+        log.info(f"[{ticker}] scan OK ({elapsed:.0f}s)")
+        if notify:
+            _notify_success(ticker, env, elapsed)
+        return
+
+    if exit_code == 3:
+        why = reason or "unknown"
+        streak = _refusal_streak.get(ticker, 0) + 1
+        _refusal_streak[ticker] = streak
+        log.info(f"[{ticker}] scan REFUSED ({why}) ({elapsed:.0f}s)")
+        if (
+            notify
+            and streak == REFUSAL_STREAK_ALERT_AT
+            and not _refusal_alert_sent.get(ticker)
+        ):
+            _notify_refusal_streak(ticker, why, env)
+            _refusal_alert_sent[ticker] = True
+        return
+
+    log.error(
+        f"[{ticker}] scan FAILED (rc={exit_code}) ({elapsed:.0f}s)"
+        + (f" reason={reason}" if reason else "")
+    )
+
+
 # ── Scanner runner ─────────────────────────────────────────────────────────────
-def run_scan(ticker: str, timeout: int = 300, *, eod: bool = False) -> tuple[bool, float]:
+def run_scan(
+    ticker: str, timeout: int = 300, *, eod: bool = False,
+) -> tuple[int, str | None, float]:
     """
     Invoke dailyScaner.py <ticker> [--eod].
-    Returns (success, elapsed_seconds).
-    EOD runs may take longer (convergence waits) — default timeout raised by caller.
+
+    Returns (exit_code, abort_reason|None, elapsed_seconds).
+      0 — success
+      3 — deliberate refusal (ABORT_REASON on stderr)
+      1 — failure / timeout / exception
     """
+    from notify_delivery import parse_abort_reason
+
     python = sys.executable
     scanner = os.path.join(BASE_DIR, "dailyScaner.py")
     cmd = [python, scanner, ticker]
@@ -258,21 +333,21 @@ def run_scan(ticker: str, timeout: int = 300, *, eod: bool = False) -> tuple[boo
             env=env,
         )
         elapsed = time.monotonic() - start
-        if result.returncode == 0:
-            log.info(f"[{ticker}] scan OK ({elapsed:.0f}s)")
-            return True, elapsed
-        else:
-            log.error(f"[{ticker}] scan FAILED (rc={result.returncode})\n"
-                      f"  stderr: {result.stderr[-500:]}")
-            return False, elapsed
+        reason = parse_abort_reason(result.stderr)
+        if result.returncode not in (0, 3) and result.stderr:
+            log.error(
+                f"[{ticker}] scan FAILED (rc={result.returncode})\n"
+                f"  stderr: {result.stderr[-500:]}"
+            )
+        return int(result.returncode), reason, elapsed
     except subprocess.TimeoutExpired:
         elapsed = time.monotonic() - start
         log.error(f"[{ticker}] scan TIMED OUT after {elapsed:.0f}s")
-        return False, elapsed
+        return 1, None, elapsed
     except Exception as exc:
         elapsed = time.monotonic() - start
         log.error(f"[{ticker}] scan error: {exc}")
-        return False, elapsed
+        return 1, None, elapsed
 
 # ── PID management ─────────────────────────────────────────────────────────────
 def _write_pid() -> None:
@@ -411,11 +486,15 @@ def main(once: bool = False) -> None:
                 if eod_now and eod_done_day.get(ticker) != today_s and not once:
                     log.info(f"[{ticker}] starting EOD scan @ {now_et}")
                     # Convergence: up to 3 reads with 10 min gaps → ~25 min
-                    ok, elapsed = run_scan(ticker, timeout=2400, eod=True)
+                    code, reason, elapsed = run_scan(
+                        ticker, timeout=2400, eod=True,
+                    )
                     eod_done_day[ticker] = today_s
                     last_scan[ticker] = time.monotonic()
-                    if notify:
-                        _notify(ticker, ok, env, elapsed)
+                    handle_scan_result(
+                        ticker, code, reason, elapsed,
+                        notify=notify, env=env,
+                    )
                     continue
 
                 last = last_scan.get(ticker, 0)
@@ -433,11 +512,12 @@ def main(once: bool = False) -> None:
                         f"[{ticker}] starting scan "
                         f"(interval={interval//60}min, market={mode})"
                     )
-                    ok, elapsed = run_scan(ticker, eod=False)
+                    code, reason, elapsed = run_scan(ticker, eod=False)
                     last_scan[ticker] = time.monotonic()
-                    if notify:
-                        _notify(ticker, ok, env, elapsed)
-
+                    handle_scan_result(
+                        ticker, code, reason, elapsed,
+                        notify=notify, env=env,
+                    )
             if once:
                 break
 

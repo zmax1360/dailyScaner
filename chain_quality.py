@@ -200,11 +200,217 @@ def chain_volume_rolled_over(
     """
     Cumulative session volume cannot decrease. A drop means Yahoo rolled
     prior-session totals off the chain (Task A).
+
+    OR semantics kept for the per-contract / legacy total helpers. The
+    chain-level scan guard uses ``chain_rollover_from_volume_blocks`` instead
+    (both sides + per-contract majority).
     """
     try:
         return int(curr_call) < int(prev_call) or int(curr_put) < int(prev_put)
     except (TypeError, ValueError):
         return False
+
+
+# Guardrail parameters — NOT in config.SCORING (must not move config_hash).
+MIN_CHAIN_ROLLOVER_MATCHES = 10
+# "more than 3 consecutive" → disable on the 4th abort attempt.
+MAX_CONSECUTIVE_CHAIN_ROLLOVER_ABORTS = 3
+
+
+def _contract_vol_key(side: str, strike: Any, expiry: Any) -> tuple | None:
+    try:
+        return (str(side).upper(), float(strike), str(expiry))
+    except (TypeError, ValueError):
+        return None
+
+
+def volume_maps_from_block(
+    volume_block: Mapping[str, Any] | None,
+) -> dict[tuple, int]:
+    """(side, strike, expiry) → volume from top_calls / top_puts."""
+    out: dict[tuple, int] = {}
+    if not volume_block:
+        return out
+    for side, key in (("CALL", "top_calls"), ("PUT", "top_puts")):
+        for c in volume_block.get(key) or []:
+            k = _contract_vol_key(side, c.get("strike"), c.get("expiry"))
+            if k is None:
+                continue
+            try:
+                out[k] = int(float(c.get("volume") or 0))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def matched_chain_volumes(
+    prev_volume: Mapping[str, Any] | None,
+    curr_volume: Mapping[str, Any] | None,
+) -> tuple[int, int, int, int, int]:
+    """
+    Sum call/put volume over contracts present in BOTH snapshots.
+
+    Returns (prev_call, prev_put, curr_call, curr_put, n_matched).
+    Kept for diagnostics; the scan guard no longer aborts on these sums.
+    """
+    prev_m = volume_maps_from_block(prev_volume)
+    curr_m = volume_maps_from_block(curr_volume)
+    common = set(prev_m) & set(curr_m)
+    pc = pp = cc = cp = 0
+    for k in common:
+        side = k[0]
+        if side == "CALL":
+            pc += prev_m[k]
+            cc += curr_m[k]
+        elif side == "PUT":
+            pp += prev_m[k]
+            cp += curr_m[k]
+    return pc, pp, cc, cp, len(common)
+
+
+def _side_majority_decreased(
+    prev_m: Mapping[tuple, int],
+    curr_m: Mapping[tuple, int],
+    common: set[tuple],
+    side: str,
+) -> tuple[bool, int, int]:
+    """
+    True when a strict majority of matched contracts on *side* each fell.
+
+    Returns (majority_decreased, n_side_matched, n_decreased).
+    """
+    keys = [k for k in common if k[0] == side]
+    n = len(keys)
+    if n == 0:
+        return False, 0, 0
+    dec = sum(1 for k in keys if curr_m[k] < prev_m[k])
+    return dec > (n / 2.0), n, dec
+
+
+def chain_rollover_from_volume_blocks(
+    prev_volume: Mapping[str, Any] | None,
+    curr_volume: Mapping[str, Any] | None,
+    *,
+    min_matched: int = MIN_CHAIN_ROLLOVER_MATCHES,
+) -> tuple[bool | None, dict[str, Any]]:
+    """
+    Chain-level session-rollover decision from two volume blocks.
+
+    Abort only when ALL of:
+      * at least ``min_matched`` contracts share (side, strike, expiry)
+      * at least one matched CALL and one matched PUT exist
+      * a strict majority of matched CALLs each decreased, AND
+      * a strict majority of matched PUTs each decreased
+
+    One-sided drops and shifting top-N membership are NOT rollovers.
+    Sums over matched contracts are NOT used for the abort decision.
+
+    Returns (rolled_over, detail):
+      True/False when evaluated; None when skipped (caller must not abort).
+    """
+    detail: dict[str, Any] = {
+        "min_matched": int(min_matched),
+        "n_matched": 0,
+        "n_call": 0,
+        "n_put": 0,
+        "n_call_decreased": 0,
+        "n_put_decreased": 0,
+        "reason": "",
+    }
+    prev_m = volume_maps_from_block(prev_volume)
+    curr_m = volume_maps_from_block(curr_volume)
+    common = set(prev_m) & set(curr_m)
+    n = len(common)
+    detail["n_matched"] = n
+    if n < int(min_matched):
+        detail["reason"] = f"insufficient_overlap:{n}<{int(min_matched)}"
+        return None, detail
+
+    call_maj, n_call, n_call_dec = _side_majority_decreased(
+        prev_m, curr_m, common, "CALL",
+    )
+    put_maj, n_put, n_put_dec = _side_majority_decreased(
+        prev_m, curr_m, common, "PUT",
+    )
+    detail.update(
+        n_call=n_call,
+        n_put=n_put,
+        n_call_decreased=n_call_dec,
+        n_put_decreased=n_put_dec,
+    )
+    if n_call < 1 or n_put < 1:
+        detail["reason"] = "missing_side_overlap"
+        return None, detail
+
+    # BOTH sides must show a per-contract majority decrease.
+    rolled = bool(call_maj and put_maj)
+    detail["reason"] = "per_contract_majority_both_sides" if rolled else "ok"
+    return rolled, detail
+
+
+# ── Session circuit breaker (process-local) ──────────────────────────────────
+
+_CHAIN_ROLLOVER_GUARD: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _guard_key(ticker: str, session_date: date | str) -> tuple[str, str]:
+    d = session_date.isoformat() if isinstance(session_date, date) else str(session_date)
+    return (str(ticker).upper(), d)
+
+
+def reset_chain_rollover_guard_state() -> None:
+    """Test helper — clear process-local circuit-breaker state."""
+    _CHAIN_ROLLOVER_GUARD.clear()
+
+
+def chain_rollover_guard_disabled(ticker: str, session_date: date | str) -> bool:
+    st = _CHAIN_ROLLOVER_GUARD.get(_guard_key(ticker, session_date))
+    return bool(st and st.get("disabled"))
+
+
+def note_chain_rollover_clean(ticker: str, session_date: date | str) -> None:
+    """Successful non-rollover scan — reset consecutive abort streak."""
+    key = _guard_key(ticker, session_date)
+    st = _CHAIN_ROLLOVER_GUARD.setdefault(
+        key, {"consecutive": 0, "disabled": False, "reason": ""},
+    )
+    if not st.get("disabled"):
+        st["consecutive"] = 0
+        st["reason"] = ""
+
+
+def note_chain_rollover_abort(
+    ticker: str,
+    session_date: date | str,
+    reason: str,
+    *,
+    max_consecutive: int = MAX_CONSECUTIVE_CHAIN_ROLLOVER_ABORTS,
+) -> tuple[bool, dict[str, Any]]:
+    """
+    Record a chain-rollover abort.
+
+    Returns (should_abort, state).
+    When consecutive aborts exceed ``max_consecutive``, the guard is disabled
+    for the rest of the session: should_abort is False and state['disabled']
+    is True (caller must proceed and log ERROR).
+    """
+    key = _guard_key(ticker, session_date)
+    st = _CHAIN_ROLLOVER_GUARD.setdefault(
+        key, {"consecutive": 0, "disabled": False, "reason": ""},
+    )
+    if st.get("disabled"):
+        return False, dict(st)
+
+    if st.get("reason") and st["reason"] != reason:
+        # Different reason — restart the streak for this reason.
+        st["consecutive"] = 0
+    st["reason"] = reason
+    st["consecutive"] = int(st.get("consecutive") or 0) + 1
+
+    if st["consecutive"] > int(max_consecutive):
+        st["disabled"] = True
+        return False, dict(st)
+    return True, dict(st)
 
 
 def rollover_detectors_active(volume_is_session_scoped: bool) -> bool:

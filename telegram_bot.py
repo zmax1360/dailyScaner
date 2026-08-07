@@ -23,11 +23,13 @@ import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import pandas as pd
-
 from news_service import get_news_sentiment, get_market_news
-from best_value import build_best_value_df, resolve_biases_for_ticker
-from cost_distribution import calculate_cost_distribution, BLUE_SKY_TAG, is_blue_sky_breakout
+from notify_delivery import (
+    ARCHIVE_MAX_AGE_MIN,
+    archive_is_fresh,
+    provenance_line,
+    ranking_has_signal,
+)
 
 from logging_config import LOG_DIR, setup_logging
 
@@ -391,6 +393,12 @@ def _fmt_report(
 
     L.append(f"<b>📊 {ticker} Options Scanner</b>")
     L.append(f"<i>{ts_et}</i>")
+    if not archive_is_fresh(payload):
+        L.append(
+            f"<i>Last successful scan {ts_et} — sections below may be stale "
+            f"(>{ARCHIVE_MAX_AGE_MIN} min).</i>"
+        )
+
     L.append("")
 
     # ── Session ──────────────────────────────────────────────────────────────
@@ -547,103 +555,88 @@ def _fmt_report(
             L.extend(delta_lines)
             L.append("")
 
-    # ── Best Value Option (shared engine with dashboard) ──────────────────────
+    # ── Best Value Option (read from scan archive — never re-score here) ───────
     if include.get("best_value"):
-        prev_vol = (prev.get("volume") or {}) if prev else None
-        try:
-            news_bias = (get_news_sentiment(ticker) or {}).get("news_bias")
-        except Exception:
-            news_bias = None
-        daily_bias, market_state = resolve_biases_for_ticker(
-            ticker, payload.get("session") or {}, spot,
-        )
-        try:
-            cost = calculate_cost_distribution(ticker, days=180, spot=spot)
-            profited_pct = cost.get("Profited_Shares_Pct")
-        except Exception:
-            profited_pct = None
-            cost = {}
-        from strategy_engine import (
-            ticker_expected_range,
-            recommend_strategy,
-            resolve_has_catalyst,
-            resolve_spot_below_support,
-        )
-        em = ticker_expected_range(spot, vol)
-        has_cat = resolve_has_catalyst(news_bias)
-        below = resolve_spot_below_support(
-            spot,
-            cost_info=cost if isinstance(cost, dict) else None,
-        )
-        opt = recommend_strategy(
-            daily_bias, em.get("IV"), profited_pct, has_cat,
-            spot_below_support=below,
-        )
-        bv_df = build_best_value_df(
-            vol, spot, prev_vol,
-            min_volume=500,
-            daily_bias=daily_bias,
-            market_state=market_state,
-            news_bias=news_bias,
-            profited_shares_pct=profited_pct,
-            upper_1sd=em.get("Upper_1SD"),
-            lower_1sd=em.get("Lower_1SD"),
-            optimal_strategy=opt,
-            has_catalyst=has_cat,
-            spot_below_support=below,
-        )
-        if not bv_df.empty and bv_df["Status"].astype(str).str.contains("BEST VALUE", na=False).any():
-            has_dvol = "dVol" in bv_df.columns
-            L.append("⭐ <b>BEST VALUE OPTION</b>")
-            notes = []
-            if news_bias and news_bias != "NEUTRAL":
-                notes.append(
-                    f"News {news_bias}: "
-                    f"{'CALL ×1.2 · PUT ×0.8' if news_bias == 'BULLISH' else 'CALL ×0.8 · PUT ×1.2'}"
-                )
-            if daily_bias in ("HEAVY BEARISH", "HEAVY BULLISH"):
-                notes.append(f"Daily {daily_bias}")
-            if market_state in ("BEARISH DRAG", "BULLISH TAILWIND"):
-                notes.append(f"Macro {market_state}")
-            if is_blue_sky_breakout(profited_pct, daily_bias):
-                notes.append(BLUE_SKY_TAG)
-            if notes:
-                L.append("<i>" + " · ".join(notes) + "</i>")
-            # Show top 3 by score (filtered rows only)
-            ranked = (
-                bv_df[bv_df["Value_Score"].notna()]
-                .sort_values("Value_Score", ascending=False)
-                .head(3)
+        bv = payload.get("best_value")
+        fresh = archive_is_fresh(payload)
+        if not fresh:
+            log.info(
+                "Best Value omitted for %s — archive stale/missing "
+                "(>%s min or rollover-flagged)",
+                ticker, ARCHIVE_MAX_AGE_MIN,
             )
-            hdr = "Side  Strike   Exp    Score  Price  VOI"
-            if has_dvol:
-                hdr += "    ΔVol"
-            rows = [f"<pre>{hdr}"]
-            for _, r in ranked.iterrows():
-                voi  = r["volume"] / max(int(r["openInterest"]), 1)
-                star = " ⭐" if "BEST VALUE" in str(r.get("Status") or "") else ""
-                exp_s = r["expiry"][5:] if len(r["expiry"]) >= 7 else r["expiry"]
-                line = (
-                    f"{r['side']:<5} ${r['strike']:<7.1f} {exp_s:<6} "
-                    f"{r['Value_Score']:.4f} ${r['last']:.2f}  {voi:.1f}x"
-                )
-                if has_dvol and pd.notna(r.get("dVol")):
-                    line += f"  {int(r['dVol']):+,}"
-                elif has_dvol:
-                    line += "      —"
-                line += star
-                rows.append(line)
-            rows.append("</pre>")
-            L.extend(rows)
-            # One-liner callout for the winner
-            best = bv_df[bv_df["Status"].astype(str).str.contains("BEST VALUE", na=False)].iloc[0]
-            voi_b = best["volume"] / max(int(best["openInterest"]), 1)
             L.append(
-                f"→ <b>{best['side']} ${best['strike']:.1f}</b> "
-                f"exp {best['expiry']} · score {best['Value_Score']:.4f} · "
-                f"${best['last']:.2f} · {voi_b:.1f}×"
+                "<i>⭐ Best Value omitted — no fresh gated scan "
+                f"(archive older than {ARCHIVE_MAX_AGE_MIN} min or "
+                "rollover-flagged).</i>"
             )
             L.append("")
+        else:
+            ok_sig, why_sig = ranking_has_signal(bv)
+            prov = provenance_line(bv, payload)
+            if not ok_sig:
+                log.info("Best Value omitted for %s — no signal (%s)", ticker, why_sig)
+                L.append(
+                    f"<i>⭐ Best Value omitted — ranking has no signal "
+                    f"({why_sig}).</i>"
+                )
+                L.append("")
+            elif not prov:
+                log.info("Best Value omitted for %s — provenance incomplete", ticker)
+                L.append(
+                    "<i>⭐ Best Value omitted — provenance incomplete.</i>"
+                )
+                L.append("")
+            else:
+                rows = list((bv or {}).get("rows") or [])
+                L.append("⭐ <b>BEST VALUE OPTION</b>")
+                hdr = "Side  Strike   Exp    Score  Price  VOI    ΔVol"
+                lines = [f"<pre>{hdr}"]
+                for r in rows[:3]:
+                    try:
+                        vol = float(r.get("volume") or 0)
+                        oi = max(int(float(r.get("openInterest") or 0)), 1)
+                        voi = vol / oi
+                        strike = float(r.get("strike") or 0)
+                        score = float(r.get("Value_Score") or 0)
+                        last = float(r.get("last") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    exp = str(r.get("expiry") or "")
+                    exp_s = exp[5:] if len(exp) >= 7 else exp
+                    star = " ⭐" if "BEST VALUE" in str(r.get("Status") or "") else ""
+                    dvol = r.get("dVol")
+                    if dvol is None:
+                        dvol_s = "     —"
+                    else:
+                        try:
+                            dvol_s = f" {int(float(dvol)):+,}"
+                        except (TypeError, ValueError):
+                            dvol_s = "     —"
+                    lines.append(
+                        f"{str(r.get('side') or ''):<5} ${strike:<7.1f} {exp_s:<6} "
+                        f"{score:.4f} ${last:.2f}  {voi:.1f}x{dvol_s}{star}"
+                    )
+                lines.append("</pre>")
+                L.extend(lines)
+                best = next(
+                    (r for r in rows if "BEST VALUE" in str(r.get("Status") or "")),
+                    rows[0] if rows else None,
+                )
+                if best is not None:
+                    try:
+                        b_vol = float(best.get("volume") or 0)
+                        b_oi = max(int(float(best.get("openInterest") or 0)), 1)
+                        L.append(
+                            f"→ <b>{best.get('side')} ${float(best['strike']):.1f}</b> "
+                            f"exp {best.get('expiry')} · "
+                            f"score {float(best['Value_Score']):.4f} · "
+                            f"${float(best['last']):.2f} · {b_vol / b_oi:.1f}×"
+                        )
+                    except (TypeError, ValueError, KeyError):
+                        pass
+                L.append(f"<i>{prov}</i>")
+                L.append("")
 
     # ── Live Catalyst Sentiment ───────────────────────────────────────────────
     if include.get("catalyst"):

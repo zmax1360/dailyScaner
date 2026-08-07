@@ -29,6 +29,7 @@ from spread_gate import evaluate_spread_gate
 from dailyScaner import market_is_open, proximity_filter, MIN_OI_FOR_MAGNET
 from news_service import get_news_sentiment, get_market_news
 from best_value import calculate_best_value, build_best_value_df
+from distribution import expiry_distribution, prob_beyond_strike
 from best_value_archive import (
     ensure_archive_loaded,
     log_best_value_run,
@@ -2666,6 +2667,227 @@ def _render_best_value_panel(
             f"{tgt_part}"
             f"{sky_part}",
             icon="⭐",
+        )
+
+    # Charts sit below the scanner table/callout so the table layout stays untouched.
+    _render_expiry_distribution_charts(top5, spot)
+
+
+def _expiry_dist_degenerate_reason(iv, dte_days) -> str:
+    """Short caption when expiry_distribution refuses to draw."""
+    if iv is None:
+        return "no chart: implied volatility unavailable"
+    try:
+        iv_f = float(iv)
+    except (TypeError, ValueError):
+        return "no chart: implied volatility unavailable"
+    if iv_f < 0.01:
+        return "no chart: implied volatility unavailable below 1%"
+    try:
+        dte_f = float(dte_days)
+    except (TypeError, ValueError):
+        return "no chart: DTE missing (no fabricated time-to-expiry)"
+    if dte_f <= 0:
+        return "no chart: DTE is zero (no fabricated time-to-expiry)"
+    return "no chart: distribution inputs unusable"
+
+
+def _render_expiry_distribution_charts(top_df: pd.DataFrame, spot) -> None:
+    """
+    One lognormal density chart per expiry among the displayed Best Value rows.
+    Most-populated expiries first; max 2 charts. Display aid only — not scored.
+    """
+    import plotly.graph_objects as go
+
+    if top_df is None or top_df.empty or spot is None:
+        return
+    try:
+        spot_f = float(spot)
+    except (TypeError, ValueError):
+        return
+    if spot_f <= 0:
+        return
+
+    need = {"expiry", "dte", "strike", "side", "iv"}
+    if not need.issubset(set(top_df.columns)):
+        return
+
+    work = top_df.reset_index(drop=True).copy()
+    if "Value_Score" in work.columns:
+        work = work.sort_values("Value_Score", ascending=False, kind="mergesort")
+
+    grouped: list[tuple[str, pd.DataFrame]] = []
+    for expiry, g in work.groupby("expiry", sort=False):
+        grouped.append((str(expiry), g.reset_index(drop=True)))
+    grouped.sort(key=lambda item: len(item[1]), reverse=True)
+
+    if not grouped:
+        return
+
+    omitted_groups = grouped[2:]
+    show = grouped[:2]
+    omitted_n = sum(len(g) for _, g in omitted_groups)
+
+    st.markdown("#### Expiry distribution")
+    if omitted_n:
+        st.caption(
+            f"Showing the {len(show)} most-populated expir"
+            f"{'y' if len(show) == 1 else 'ies'}; "
+            f"{omitted_n} contract(s) in {len(omitted_groups)} other "
+            f"expir{'y' if len(omitted_groups) == 1 else 'ies'} omitted "
+            f"(0DTE and longer-dated curves must not share a plot)."
+        )
+
+    any_chart = False
+    for expiry, g in show:
+        # Curve IV = nearest-to-spot contract in this expiry group only.
+        nearest_i = (g["strike"].astype(float) - spot_f).abs().idxmin()
+        nearest = g.loc[nearest_i]
+        curve_iv = nearest.get("iv")
+        try:
+            dte_days = float(nearest["dte"])
+        except (TypeError, ValueError):
+            dte_days = None
+        # Prefer a representative DTE from the group (same expiry → same dte).
+        if dte_days is None or (isinstance(dte_days, float) and dte_days != dte_days):
+            dte_days = pd.to_numeric(g["dte"], errors="coerce").dropna()
+            dte_days = float(dte_days.iloc[0]) if len(dte_days) else None
+
+        dist = expiry_distribution(spot_f, curve_iv, dte_days)
+        if dist is None:
+            st.caption(_expiry_dist_degenerate_reason(curve_iv, dte_days))
+            continue
+
+        prices, density = dist
+        try:
+            curve_k = float(nearest["strike"])
+            dte_label = int(dte_days) if dte_days is not None else "?"
+        except (TypeError, ValueError):
+            curve_k, dte_label = float("nan"), "?"
+
+        st.markdown(
+            f"spot ${spot_f:.2f} · expiry {expiry} ({dte_label}d) · "
+            f"curve uses IV from the ${curve_k:.1f} contract"
+        )
+
+        # Strike lines: top 5 by rank (Value_Score order already applied).
+        line_rows = g.head(5)
+        # Shade selectbox: all contracts in the group, default top-ranked.
+        shade_labels = []
+        shade_meta = []
+        for _, row in g.iterrows():
+            try:
+                k = float(row["strike"])
+                side = str(row["side"]).upper()
+                iv = row.get("iv")
+                dte = float(row["dte"])
+            except (TypeError, ValueError):
+                continue
+            pr = prob_beyond_strike(spot_f, k, iv, dte, side)
+            label = (
+                f"{side} ${k:.1f}"
+                + (f" · P={pr:.0%}" if pr is not None else " · P=—")
+            )
+            shade_labels.append(label)
+            shade_meta.append((k, side, pr, iv, dte))
+
+        if not shade_labels:
+            st.caption("no chart: no usable strikes in this expiry group")
+            continue
+
+        pick = st.selectbox(
+            f"Shade payoff beyond strike ({expiry})",
+            options=list(range(len(shade_labels))),
+            format_func=lambda i, labels=shade_labels: labels[i],
+            index=0,
+            key=f"exp_dist_shade_{expiry}",
+        )
+        shade_k, shade_side, shade_pr, _, _ = shade_meta[pick]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=prices,
+            y=density,
+            mode="lines",
+            name="density",
+            line=dict(color="#4FC3F7", width=2),
+            hovertemplate="S=%{x:.2f}<br>dens=%{y:.4g}<extra></extra>",
+        ))
+
+        # Shade: CALL → right of strike; PUT → left of strike.
+        shade_x: list[float] = []
+        shade_y: list[float] = []
+        for px, dens in zip(prices, density):
+            if shade_side in ("CALL", "C") and px >= shade_k:
+                shade_x.append(px)
+                shade_y.append(dens)
+            elif shade_side in ("PUT", "P") and px <= shade_k:
+                shade_x.append(px)
+                shade_y.append(dens)
+        if shade_x:
+            fig.add_trace(go.Scatter(
+                x=[shade_x[0]] + shade_x + [shade_x[-1]],
+                y=[0.0] + shade_y + [0.0],
+                fill="toself",
+                fillcolor="rgba(255, 193, 7, 0.25)",
+                line=dict(width=0),
+                name=(
+                    f"P(beyond ${shade_k:.1f})"
+                    + (f"={shade_pr:.0%}" if shade_pr is not None else "")
+                ),
+                hoverinfo="skip",
+            ))
+
+        fig.add_vline(
+            x=spot_f,
+            line_width=1.5,
+            line_dash="solid",
+            line_color="#FFFFFF",
+            annotation_text="spot",
+            annotation_position="top",
+        )
+
+        for _, row in line_rows.iterrows():
+            try:
+                k = float(row["strike"])
+                side = str(row["side"]).upper()
+                iv = row.get("iv")
+                dte = float(row["dte"])
+            except (TypeError, ValueError):
+                continue
+            pr = prob_beyond_strike(spot_f, k, iv, dte, side)
+            pr_txt = f"{pr:.0%}" if pr is not None else "—"
+            fig.add_vline(
+                x=k,
+                line_width=1,
+                line_dash="dot",
+                line_color="#FF8A65",
+                annotation_text=f"${k:.1f} · {pr_txt}",
+                annotation_position="top right",
+                annotation_font_size=10,
+            )
+
+        fig.update_layout(
+            height=320,
+            margin=dict(l=40, r=20, t=30, b=40),
+            xaxis_title="Underlying price at expiry",
+            yaxis_title="Density",
+            showlegend=False,
+            template="plotly_dark",
+        )
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"exp_dist_chart_{expiry}",
+        )
+        any_chart = True
+
+    if any_chart:
+        st.caption(
+            "Lognormal distribution implied by the contract's own IV. "
+            "Probabilities are risk-neutral, not a forecast, and say nothing "
+            "about whether the option is fairly priced."
         )
 
 

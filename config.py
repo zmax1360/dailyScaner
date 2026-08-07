@@ -9,9 +9,10 @@ from __future__ import annotations
 
 
 # Fingerprint of the scoring engine — hashed into every attribution run.
-# Pre-delta / pre-quality-gate logs are engine v1; runs after this dict
-# changes are engine v2 and must not be pooled in analysis.
+# Segment analysis by config_hash / engine_tag — never pool across versions.
 SCORING: dict[str, float | int | str] = {
+    # engine-v1.1: leverage uses abs(delta). Prior hash dc2906741dbb2b15 = engine-v1.
+    "engine_tag": "engine-v1.1",
     # Base blend
     "w_lev": 0.4,
     "w_flow": 0.6,

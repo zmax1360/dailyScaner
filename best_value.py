@@ -196,7 +196,8 @@ def calculate_best_value(
     Pure function — no Streamlit, no IO.
 
     Appends Value_Score, Status, Optimal_Strategy, Strategy_Tag,
-    _nlev, _nflow, _multipliers (per-row factor breakdown for attribution).
+    delta, _lev, _flow, _nlev, _nflow, _base_score, _multipliers, extrinsic
+    (per-row scoring inputs for attribution pass-through).
     Expired contracts are always dropped; after 16:15 ET, same-day 0DTE
     is also dropped.
 
@@ -245,7 +246,12 @@ def calculate_best_value(
     df["Strategy_Tag"] = ""
     df["_nlev"] = float("nan")
     df["_nflow"] = float("nan")
+    df["_lev"] = float("nan")
+    df["_flow"] = float("nan")
+    df["_base_score"] = float("nan")
     df["_multipliers"] = None
+    df["delta"] = float("nan")
+    df["extrinsic"] = float("nan")
 
     mask = (df["volume"] >= mv) & (df["last"] > min_last)
     work = df[mask].copy()
@@ -311,13 +317,15 @@ def calculate_best_value(
         deltas.append(float("nan") if d is None else float(d))
     work["delta"] = deltas
 
-    # Leverage: exclude null-delta rows from the leg; renormalise over survivors.
-    # Do NOT substitute 0.5 / median / any default (F-01).
+    # Leverage: magnitude of exposure per premium dollar. Direction is carried
+    # by side + directional multipliers — signed put delta must not floor the
+    # put universe at _minmax min (engine-v1.1 / abs-delta).
+    # Exclude null-delta rows; renormalise over survivors. No default (F-01).
     work["_lev"] = float("nan")
     has_delta = work["delta"].notna()
     if has_delta.any():
         lev = (
-            work.loc[has_delta, "delta"] * spot_price
+            work.loc[has_delta, "delta"].abs() * spot_price
         ) / work.loc[has_delta, "last"].replace(0, float("nan"))
         work.loc[has_delta, "_lev"] = lev
 
@@ -360,6 +368,40 @@ def calculate_best_value(
         work.loc[scored_mask, "_nlev"] * w_lev
         + work.loc[scored_mask, "_nflow"] * w_flow
     )
+    # Pre-multiplier blend — persisted as base_score (do not recompute in log_run)
+    work["_base_score"] = work["Value_Score"].copy()
+
+    # Extrinsic value (instrumentation): mid - intrinsic
+    work["extrinsic"] = float("nan")
+    for idx, r in work.iterrows():
+        side = str(r.get("side") or r.get("Side") or "").upper()
+        strike = r.get("strike") if "strike" in r.index else r.get("Strike")
+        try:
+            strike_f = float(strike)
+        except (TypeError, ValueError):
+            continue
+        bid = r.get("bid")
+        ask = r.get("ask")
+        last = r.get("last", r.get("lastPrice"))
+        mid = None
+        try:
+            b = float(bid) if bid is not None and pd.notna(bid) else 0.0
+            a = float(ask) if ask is not None and pd.notna(ask) else 0.0
+            if b > 0 and a > 0:
+                mid = (b + a) / 2.0
+            elif last is not None and pd.notna(last) and float(last) > 0:
+                mid = float(last)
+        except (TypeError, ValueError):
+            mid = None
+        if mid is None:
+            continue
+        if side == "CALL":
+            intrinsic = max(float(spot_price) - strike_f, 0.0)
+        elif side == "PUT":
+            intrinsic = max(strike_f - float(spot_price), 0.0)
+        else:
+            continue
+        work.at[idx, "extrinsic"] = mid - intrinsic
 
     # Per-row multiplier breakdown (product must reproduce Value_Score)
     mults: dict[Any, dict[str, float]] = {
@@ -601,6 +643,11 @@ def calculate_best_value(
     df.loc[work.index, "_nflow"] = work["_nflow"]
     df.loc[work.index, "_multipliers"] = work["_multipliers"]
     df.loc[work.index, "delta"] = work["delta"]
+    # Pass-through scoring inputs for attribution (do not recompute in log_run)
+    df.loc[work.index, "_lev"] = work["_lev"]
+    df.loc[work.index, "_flow"] = work["_flow"]
+    df.loc[work.index, "_base_score"] = work["_base_score"]
+    df.loc[work.index, "extrinsic"] = work["extrinsic"]
     if "_bias_unknown" in work.columns:
         df.loc[work.index, "_bias_unknown"] = work["_bias_unknown"]
     if "dvol_suspect" in work.columns:

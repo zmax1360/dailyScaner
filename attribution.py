@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import subprocess
@@ -180,10 +181,21 @@ _FLAG_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
     ("mark_close", "REAL"),
     ("marked_close_at", "TEXT"),
     ("close_method", "TEXT"),
+    # Scoring-input pass-through (instrumentation — does not change ranking)
+    ("delta", "REAL"),
+    ("leverage_raw", "REAL"),
+    ("flow_raw", "REAL"),
+    ("leverage_norm", "REAL"),
+    ("flow_norm", "REAL"),
+    ("extrinsic", "REAL"),
+    ("realized_vol_20d", "REAL"),
+    ("iv_premium", "REAL"),
 )
 
 _RUN_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
     ("run_kind", "TEXT"),
+    ("optimal_strategy", "TEXT"),
+    ("strategy_outlook", "INTEGER"),
 )
 
 _MARK_AT_COL = {
@@ -513,10 +525,22 @@ def log_run(
     db_path: str | None = None,
     ts_et: datetime | None = None,
     run_kind: str = "intraday",
+    daily_closes: list[float] | None = None,
 ) -> str:
     """
     Append one run + every scored contract + control rows.
     Returns run_id. Raises on DB errors (callers should fail-soft).
+
+    Scoring inputs (delta, leverage/flow legs, base_score, multipliers,
+    extrinsic, Optimal_Strategy) are pass-through from calculate_best_value —
+    never recomputed here.
+
+    vwap_state is accepted for schema compatibility but left empty on the
+    scan path: VWAP is computed only in app.py. Moving it into the scanner
+    would change what the engine sees and is out of scope for instrumentation.
+
+    realized_vol_20d / iv_premium are recorded only (not scored). Sourced from
+    daily_closes already fetched by the scan — no extra network call.
 
     run_kind: 'intraday' | 'eod'
       EOD recommendation: insert the run row for audit, but skip flag rows.
@@ -546,19 +570,49 @@ def log_run(
     ch = config_hash(cfg)
     sha = engine_sha_val if engine_sha_val is not None else engine_sha()
 
+    # Optimal strategy / outlook — same for every row in the run
+    opt_strat: str | None = None
+    strat_outlook: int | None = None
+    if not scored.empty and "Optimal_Strategy" in scored.columns:
+        raw = scored["Optimal_Strategy"].iloc[0]
+        if raw is not None and str(raw).strip():
+            opt_strat = str(raw).strip()
+            try:
+                from strategy_engine import strategy_outlook as _outlook
+                strat_outlook = _outlook(opt_strat)
+            except Exception:
+                strat_outlook = None
+
+    # IV vs realized — once per run from scan's daily closes (instrumentation)
+    rv_20d: float | None = None
+    if daily_closes is not None:
+        try:
+            from features.realized_vol import realized_vol as _rv
+            rv_20d = _rv(list(daily_closes), window=20)
+        except Exception as exc:
+            log.info("realized_vol_20d unavailable: %s", exc)
+            rv_20d = None
+        if rv_20d is None:
+            log.info(
+                "realized_vol_20d unavailable: need 21 positive closes (got %d)",
+                len(daily_closes),
+            )
+
     with _db(db_path) as conn:
         conn.execute(
             """
             INSERT INTO runs (
                 run_id, ts_et, ticker, n_scored, config_hash, engine_sha,
-                daily_bias, market_state, news_bias, spot, vwap_state, run_kind
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                daily_bias, market_state, news_bias, spot, vwap_state, run_kind,
+                optimal_strategy, strategy_outlook
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id, ts_iso, ticker.upper(), n_scored, ch, sha,
                 daily_bias, market_state, news_bias,
                 float(spot) if spot else None,
                 vwap_state, kind,
+                opt_strat, strat_outlook,
             ),
         )
 
@@ -566,8 +620,7 @@ def log_run(
         if kind == "eod":
             return run_id
 
-        w_lev = float(cfg.get("w_lev", 0.4))
-        w_flow = float(cfg.get("w_flow", 0.6))
+        from features.realized_vol import iv_premium as _iv_premium
 
         flag_rows: list[tuple] = []
         for _, r in scored.iterrows():
@@ -596,19 +649,20 @@ def log_run(
             except (TypeError, ValueError):
                 ask_f = None
 
-            try:
-                nlev_f = float(r["_nlev"]) if pd.notna(r.get("_nlev")) else None
-            except (TypeError, ValueError, KeyError):
-                nlev_f = None
-            try:
-                nflow_f = float(r["_nflow"]) if pd.notna(r.get("_nflow")) else None
-            except (TypeError, ValueError, KeyError):
-                nflow_f = None
-            base_f = None
-            if nlev_f is not None and nflow_f is not None:
-                base_f = float(nlev_f) * w_lev + float(nflow_f) * w_flow
+            # Pass-through from engine — never recompute (avoids audit drift)
+            nlev_f = _row_float(r, "_nlev")
+            nflow_f = _row_float(r, "_nflow")
+            base_f = _row_float(r, "_base_score")
+            lev_raw = _row_float(r, "_lev")
+            flow_raw = _row_float(r, "_flow")
+            delta_f = _row_float(r, "delta")
+            extrinsic_f = _row_float(r, "extrinsic")
+            # leverage_norm / flow_norm are the post-minmax legs
+            lev_norm = nlev_f
+            flow_norm = nflow_f
 
             dte_i, vol_i, oi_i, iv_f = _flag_state_from_row(r)
+            ivp = _iv_premium(iv_f, rv_20d)
 
             flag_rows.append((
                 run_id, ts_iso, ticker.upper(), side, strike, expiry,
@@ -616,6 +670,8 @@ def log_run(
                 nlev_f, nflow_f, base_f, mult_json,
                 mid, bid_f, ask_f, float(spot) if spot else None, 0, None,
                 dte_i, vol_i, oi_i, iv_f,
+                delta_f, lev_raw, flow_raw, lev_norm, flow_norm, extrinsic_f,
+                rv_20d, ivp,
             ))
 
         ctrl = control_rows if control_rows is not None else pd.DataFrame()
@@ -632,6 +688,7 @@ def log_run(
             except (TypeError, ValueError):
                 ask_f = None
             dte_i, vol_i, oi_i, iv_f = _flag_state_from_row(r)
+            ivp = _iv_premium(iv_f, rv_20d)
             flag_rows.append((
                 run_id, ts_iso, ticker.upper(),
                 str(r.get("side", "")).upper(),
@@ -645,6 +702,8 @@ def log_run(
                 json.dumps({"control": 1.0}),
                 mid, bid_f, ask_f, float(spot) if spot else None, 1, None,
                 dte_i, vol_i, oi_i, iv_f,
+                None, None, None, None, None, None,  # delta..extrinsic
+                rv_20d, ivp,
             ))
 
         conn.executemany(
@@ -653,13 +712,44 @@ def log_run(
                 run_id, ts_et, ticker, side, strike, expiry,
                 score, rank, nlev, nflow, base_score, multipliers,
                 mid, bid, ask, spot, is_control, notes,
-                dte, volume, open_interest, iv
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                dte, volume, open_interest, iv,
+                delta, leverage_raw, flow_raw, leverage_norm, flow_norm,
+                extrinsic, realized_vol_20d, iv_premium
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?
+            )
             """,
             flag_rows,
         )
 
     return run_id
+
+
+def _row_float(r: pd.Series, *keys: str) -> float | None:
+    for k in keys:
+        if k not in r.index:
+            continue
+        v = r.get(k)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        try:
+            if pd.isna(v):
+                return None
+        except (TypeError, ValueError):
+            pass
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(f):
+            return None
+        return f
+    return None
 
 
 def due_for_marking(

@@ -21,6 +21,21 @@ from config import SCORING
 
 log = logging.getLogger("dailyScaner")
 
+
+class ScanRefused(Exception):
+    """Scan ran correctly but deliberately produced nothing (exit code 3)."""
+
+    def __init__(self, reason: str):
+        self.reason = str(reason)
+        super().__init__(self.reason)
+
+
+def abort_scan(reason: str) -> None:
+    """Signal a deliberate refusal: stderr marker + ScanRefused (exit 3)."""
+    print(f"ABORT_REASON={reason}", file=sys.stderr, flush=True)
+    raise ScanRefused(reason)
+
+
 def _parse_ticker() -> str:
     """Read ticker from argv[1], ignoring pytest/script paths (must be 1-5 alpha chars)."""
     for candidate in sys.argv[1:]:
@@ -66,6 +81,7 @@ def _log_scan_attribution(
     current_source: str = "yahoo",
     prev_archive_source: str | None = None,
     eod_archive_source: str | None = None,
+    daily_closes: list[float] | None = None,
 ) -> None:
     """
     Score + append attribution rows. Fail-soft: never abort a scan.
@@ -121,6 +137,8 @@ def _log_scan_attribution(
             else build_control_rows(pd.DataFrame(), spot, "")
         )
 
+        # vwap_state intentionally omitted (None): VWAP lives in app.py only.
+        # Passing it here would change what the engine sees - leave column empty.
         run_id = log_run(
             ticker=ticker,
             scored_df=bv_df,
@@ -132,6 +150,7 @@ def _log_scan_attribution(
             control_rows=ctrl,
             engine_sha_val=engine_sha(),
             run_kind=run_kind,
+            daily_closes=daily_closes,
         )
         if (run_kind or "").lower() == "eod":
             log.info(
@@ -852,7 +871,7 @@ def print_report(spot, tf_data, calls_all, puts_all, or_data=None, changes=None,
     log.info(f"{C.GRAY}  Yahoo Finance  ?  Not financial advice.{C.RESET}\n")
 
 # ?? ARCHIVE ???????????????????????????????????????????????????????????????????
-def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None, *, is_eod=False, settlement_converged=None, source_name: str = "yahoo", quote_source: str = "nbbo"):
+def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=None, session=None, *, is_eod=False, settlement_converged=None, source_name: str = "yahoo", quote_source: str = "nbbo", chain_volume_rollover: bool = False, best_value=None):
     os.makedirs("archive", exist_ok=True)
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -868,6 +887,8 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
         "settlement_converged": (
             None if settlement_converged is None else bool(settlement_converged)
         ),
+        "chain_volume_rollover": bool(chain_volume_rollover),
+        "best_value": best_value,
         "spot": spot,
         "or_data": or_data,        # dashboard: OR band + breakout state per run
         "direction": direction,    # dashboard: scanner's direction verdict per run
@@ -1006,11 +1027,14 @@ def run(source=None):
     from chain_quality import (
         archive_source_name,
         chain_fails_quality_gate,
-        chain_volume_rolled_over,
+        chain_rollover_from_volume_blocks,
+        chain_rollover_guard_disabled,
         eod_volume_lookup,
         find_prior_eod_archive,
         flag_stale_vs_eod,
         majority_stale_abort,
+        note_chain_rollover_abort,
+        note_chain_rollover_clean,
         rollover_detectors_active,
         should_apply_chain_rollover_check,
         stale_check_active,
@@ -1026,12 +1050,31 @@ def run(source=None):
     _prev_archive_source = None
     if prev_result:
         _prev_archive_source = archive_source_name(prev_result[0])
+
+    # Top-30 shaped volume block -- quality gate + per-contract rollover check.
+    _vol_gate = {
+        "top_calls": calls_all[calls_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+        "top_puts": puts_all[puts_all["volume"] > 0].head(30)[
+            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
+             "volume", "openInterest", "impliedVolatility"]
+        ].to_dict(orient="records"),
+        "total_call_vol": total_cv0,
+        "total_put_vol": total_pv0,
+    }
+
     if not rollover_detectors_active(_session_scoped):
         log.info(
             f"{C.GRAY}  Rollover/stale-volume detectors DORMANT "
             f"(source={_curr_source} is session-scoped).{C.RESET}"
         )
-    if prev_result and rollover_detectors_active(_session_scoped):
+    if (
+        prev_result
+        and rollover_detectors_active(_session_scoped)
+        and not chain_rollover_guard_disabled(TICKER, _today_et)
+    ):
         _prev_data, _prev_file = prev_result
         _apply, _why = should_apply_chain_rollover_check(
             _prev_data, _curr_source, _today_et,
@@ -1046,31 +1089,73 @@ def run(source=None):
             log.warning(f"{C.YELLOW}WARN: {_msg}{C.RESET}")
         elif _apply:
             _pv = (_prev_data or {}).get("volume") or {}
-            _pc = int(_pv.get("total_call_vol") or 0)
-            _pp = int(_pv.get("total_put_vol") or 0)
-            if chain_volume_rolled_over(_pc, _pp, total_cv0, total_pv0):
-                log.info(
-                    f"{C.YELLOW}ABORT: chain volume rollover detected "
-                    f"(same ET session {_today_et}). "
-                    f"prev call/put={_pc:,}/{_pp:,}  "
-                    f"curr call/put={total_cv0:,}/{total_pv0:,}. "
-                    f"No archive, no attribution.{C.RESET}"
+            _rolled, _rd = chain_rollover_from_volume_blocks(_pv, _vol_gate)
+            if _rolled is None:
+                _msg = (
+                    f"chain rollover check skipped "
+                    f"({_rd.get('reason')}; need matched CALL+PUT contracts "
+                    f"in both top-N snapshots)"
                 )
-                return
+                _scan_log.info(_msg)
+                log.info(f"{C.GRAY}  {_msg}{C.RESET}")
+                note_chain_rollover_clean(TICKER, _today_et)
+            elif _rolled:
+                _abort_reason = str(_rd.get("reason") or "chain_rollover")
+                _do_abort, _gst = note_chain_rollover_abort(
+                    TICKER, _today_et, _abort_reason,
+                )
+                if not _do_abort and _gst.get("disabled"):
+                    _msg = (
+                        f"chain rollover guard DISABLED for session "
+                        f"{_today_et} after {_gst.get('consecutive')} "
+                        f"consecutive aborts (reason={_abort_reason}). "
+                        f"Proceeding without abort so the session can recover."
+                    )
+                    _scan_log.error(_msg)
+                    log.info(f"{C.YELLOW}ERROR: {_msg}{C.RESET}")
+                elif _do_abort:
+                    # Write archive with flag so the next scan compares against
+                    # this snapshot -- not a frozen pre-abort baseline.
+                    _fname, _ftxt = save_archive(
+                        spot, tf_data, calls_all, puts_all,
+                        or_data=or_data, direction=direction0,
+                        session=None,
+                        is_eod=IS_EOD,
+                        settlement_converged=(
+                            settlement_converged if IS_EOD else None
+                        ),
+                        source_name=_curr_source,
+                        quote_source=_quote_source,
+                        chain_volume_rollover=True,
+                    )
+                    with open(_ftxt, "w") as _tf:
+                        _tf.write(
+                            "CHAIN VOLUME ROLLOVER - attribution skipped\n"
+                            f"archive={_fname}\n"
+                            f"detail={_rd}\n"
+                        )
+                    log.info(
+                        f"{C.YELLOW}ABORT: chain volume rollover detected "
+                        f"(same ET session {_today_et}). "
+                        f"calls decreased {_rd['n_call_decreased']}/"
+                        f"{_rd['n_call']} matched; "
+                        f"puts decreased {_rd['n_put_decreased']}/"
+                        f"{_rd['n_put']} matched "
+                        f"(n_matched={_rd['n_matched']}, "
+                        f"reason={_rd['reason']}, "
+                        f"streak={_gst.get('consecutive')}). "
+                        f"Wrote flagged archive {_fname}; "
+                        f"no attribution.{C.RESET}"
+                    )
+                    abort_scan("volume_rollover")
+            else:
+                note_chain_rollover_clean(TICKER, _today_et)
+    elif chain_rollover_guard_disabled(TICKER, _today_et):
+        log.info(
+            f"{C.GRAY}  Chain rollover guard disabled for session "
+            f"{_today_et} (circuit breaker).{C.RESET}"
+        )
 
-    # Build a provisional volume block for the quality gate (top-30 shape)
-    _vol_gate = {
-        "top_calls": calls_all[calls_all["volume"] > 0].head(30)[
-            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
-             "volume", "openInterest", "impliedVolatility"]
-        ].to_dict(orient="records"),
-        "top_puts": puts_all[puts_all["volume"] > 0].head(30)[
-            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
-             "volume", "openInterest", "impliedVolatility"]
-        ].to_dict(orient="records"),
-        "total_call_vol": total_cv0,
-        "total_put_vol": total_pv0,
-    }
     _q_fail, _q_detail = chain_fails_quality_gate(
         _vol_gate, provides_quotes=_provides_quotes,
     )
@@ -1084,7 +1169,7 @@ def run(source=None):
             f"low_iv={_cs.get('low_iv', 0)}). "
             f"No archive, no attribution.{C.RESET}"
         )
-        return
+        abort_scan("quality_gate")
 
     # ?? Stale volume vs prior EOD (CURSOR_STALE_VOLUME_FIX) ????????????????
     _eod_lookup = None
@@ -1128,7 +1213,7 @@ def run(source=None):
                 f"({_n_stale}/{_n_tot} > 50%). "
                 f"No archive, no attribution.{C.RESET}"
             )
-            return
+            abort_scan("majority_stale")
 
 
     # -- Session block: open, prev_close, day_high, day_low ------------------
@@ -1171,6 +1256,38 @@ def run(source=None):
         session = None
     # ------------------------------------------------------------------------
 
+    # Snapshot Best Value into the archive so Telegram reads scan output
+    # (one gated path) instead of re-scoring independently.
+    _bv_payload = None
+    try:
+        from best_value import build_best_value_df, resolve_biases_for_ticker
+        from notify_delivery import serialize_best_value_rows
+        _vol_bv = {
+            "top_calls": _vol_gate.get("top_calls") or [],
+            "top_puts": _vol_gate.get("top_puts") or [],
+        }
+        _prev_vol_bv = None
+        if prev_result:
+            _prev_vol_bv = (prev_result[0] or {}).get("volume")
+        _daily_bias, _market_state = resolve_biases_for_ticker(
+            TICKER, session or {}, spot,
+        )
+        _bv_df = build_best_value_df(
+            _vol_bv, spot, _prev_vol_bv,
+            min_volume=int(SCORING.get("min_volume", 500)),
+            daily_bias=_daily_bias,
+            market_state=_market_state,
+            eod_vol_lookup=_eod_lookup,
+            volume_is_session_scoped=_session_scoped,
+            current_source=_curr_source,
+            prev_archive_source=_prev_archive_source,
+            eod_archive_source=_eod_archive_source,
+        )
+        _bv_payload = serialize_best_value_rows(_bv_df)
+    except Exception as _bv_exc:
+        log.warning(f"best_value archive snapshot failed: {_bv_exc}")
+        _bv_payload = None
+
     fname_json, fname_txt = save_archive(
         spot, tf_data, calls_all, puts_all,
         or_data=or_data, direction=direction0,
@@ -1179,6 +1296,7 @@ def run(source=None):
         settlement_converged=settlement_converged if IS_EOD else None,
         source_name=_curr_source,
         quote_source=_quote_source,
+        best_value=_bv_payload,
     )
 
     # Attribution: every scored contract + ATM controls (fail-soft)
@@ -1195,6 +1313,15 @@ def run(source=None):
     vol_prev_bv = None
     if prev_result:
         vol_prev_bv = (prev_result[0] or {}).get("volume")
+    # Daily closes already on frames["1D"] - no extra network call for RV/IV.
+    _daily_closes: list[float] | None = None
+    try:
+        _dfd = frames.get("1D")
+        if _dfd is not None and not _dfd.empty and "Close" in _dfd.columns:
+            _daily_closes = [float(x) for x in _dfd["Close"].tolist()]
+    except Exception:
+        _daily_closes = None
+
     _log_scan_attribution(
         ticker=TICKER,
         spot=spot,
@@ -1209,6 +1336,7 @@ def run(source=None):
         current_source=_curr_source,
         prev_archive_source=_prev_archive_source,
         eod_archive_source=_eod_archive_source,
+        daily_closes=_daily_closes,
     )
 
     # Capture report via a temporary logging handler (print_report uses log.*).
@@ -1247,6 +1375,9 @@ if __name__ == "__main__":
         _src_name = _parse_source_name()
         _source = get_source(_src_name) if _src_name else None
         run(source=_source)
+    except ScanRefused as e:
+        # Deliberate refusal - distinct from crash (exit 1).
+        sys.exit(3)
     except MassiveChainTruncatedError as e:
         log.error(f"{C.YELLOW}ABORT: {e}{C.RESET}")
         sys.exit(1)
