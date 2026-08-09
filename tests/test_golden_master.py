@@ -22,7 +22,7 @@ ET = pytz.timezone("US/Eastern")
 _COMPARE_COLS = [
     "side", "strike", "expiry", "dte", "last", "volume", "openInterest",
     "iv", "delta", "Value_Score", "Status", "Optimal_Strategy", "Strategy_Tag",
-    "_nlev", "_nflow",
+    "_nlev", "_nflow", "pool",
 ]
 
 

@@ -100,6 +100,7 @@ SELECT
     f.strike,
     f.expiry,
     f.dte,
+    f.pool,
     f.score,
     f.rank,
     f.nlev,
@@ -190,6 +191,7 @@ _FLAG_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
     ("extrinsic", "REAL"),
     ("realized_vol_20d", "REAL"),
     ("iv_premium", "REAL"),
+    ("pool", "TEXT"),  # '0DTE' | '1DTE+' — rank is within-pool (engine-v1.2)
 )
 
 _RUN_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
@@ -441,6 +443,48 @@ def build_control_rows(
     return pd.DataFrame(rows)
 
 
+def build_control_rows_per_pool(
+    chain_df: pd.DataFrame,
+    spot: float,
+) -> pd.DataFrame:
+    """
+    One ATM CALL+PUT control pair per scoring pool (0DTE / 1DTE+).
+
+    Expiry is the modal expiry within that pool's chain slice. Pools with no
+    chain contracts are skipped (no merge into the other pool).
+    """
+    from scoring_pool import POOL_0DTE, POOL_1DTE, scoring_pool as _sp
+
+    if chain_df is None or getattr(chain_df, "empty", True) or spot <= 0:
+        return pd.DataFrame()
+
+    df = chain_df.copy()
+    if "dte" not in df.columns and "DTE" in df.columns:
+        df = df.rename(columns={"DTE": "dte"})
+    if "dte" not in df.columns:
+        return pd.DataFrame()
+    df["_pool"] = [_sp(v) for v in df["dte"].tolist()]
+
+    out_parts: list[pd.DataFrame] = []
+    for pool_name in (POOL_0DTE, POOL_1DTE):
+        sub = df[df["_pool"] == pool_name]
+        if sub.empty or "expiry" not in sub.columns:
+            continue
+        exp = str(sub["expiry"].astype(str).mode().iloc[0])
+        ctrl = build_control_rows(sub, spot, exp)
+        if ctrl.empty:
+            continue
+        ctrl = ctrl.copy()
+        ctrl["pool"] = pool_name
+        # Ensure control dte matches pool when synthesised shells have dte=None
+        if pool_name == POOL_0DTE:
+            ctrl["dte"] = ctrl["dte"].fillna(0).astype(int)
+        out_parts.append(ctrl)
+    if not out_parts:
+        return pd.DataFrame()
+    return pd.concat(out_parts, ignore_index=True)
+
+
 def modal_flagged_expiry(scored: pd.DataFrame) -> str | None:
     """Modal expiry among scored (non-null Value_Score) contracts."""
     if scored is None or scored.empty or "Value_Score" not in scored.columns:
@@ -560,8 +604,21 @@ def log_run(
     scored = scored_df
     if scored is not None and not scored.empty and "Value_Score" in scored.columns:
         scored = scored[scored["Value_Score"].notna()].copy()
-        scored = scored.sort_values("Value_Score", ascending=False)
-        scored["_rank"] = range(1, len(scored) + 1)
+        # Rank is within-pool (set by calculate_best_value). Fall back only
+        # if an older caller omitted _rank — never re-rank across pools.
+        if "_rank" not in scored.columns or scored["_rank"].isna().all():
+            if "pool" in scored.columns:
+                scored["_rank"] = pd.NA
+                for _p, g in scored.groupby(scored["pool"], dropna=False):
+                    order = g["Value_Score"].sort_values(ascending=False).index
+                    scored.loc[order, "_rank"] = range(1, len(order) + 1)
+            else:
+                scored = scored.sort_values("Value_Score", ascending=False)
+                scored["_rank"] = range(1, len(scored) + 1)
+        scored = scored.sort_values(
+            ["pool", "_rank"] if "pool" in scored.columns else ["_rank"],
+            ascending=True,
+        )
     else:
         scored = pd.DataFrame()
 
@@ -663,15 +720,24 @@ def log_run(
 
             dte_i, vol_i, oi_i, iv_f = _flag_state_from_row(r)
             ivp = _iv_premium(iv_f, rv_20d)
+            pool_s = r.get("pool")
+            if pool_s is not None and (not isinstance(pool_s, float) or pd.notna(pool_s)):
+                pool_s = str(pool_s)
+            else:
+                pool_s = None
+            try:
+                rank_i = int(r["_rank"]) if pd.notna(r.get("_rank")) else None
+            except (TypeError, ValueError):
+                rank_i = None
 
             flag_rows.append((
                 run_id, ts_iso, ticker.upper(), side, strike, expiry,
-                float(r["Value_Score"]), int(r["_rank"]),
+                float(r["Value_Score"]), rank_i,
                 nlev_f, nflow_f, base_f, mult_json,
                 mid, bid_f, ask_f, float(spot) if spot else None, 0, None,
                 dte_i, vol_i, oi_i, iv_f,
                 delta_f, lev_raw, flow_raw, lev_norm, flow_norm, extrinsic_f,
-                rv_20d, ivp,
+                rv_20d, ivp, pool_s,
             ))
 
         ctrl = control_rows if control_rows is not None else pd.DataFrame()
@@ -689,6 +755,12 @@ def log_run(
                 ask_f = None
             dte_i, vol_i, oi_i, iv_f = _flag_state_from_row(r)
             ivp = _iv_premium(iv_f, rv_20d)
+            pool_s = r.get("pool")
+            if pool_s is not None and (not isinstance(pool_s, float) or pd.notna(pool_s)):
+                pool_s = str(pool_s)
+            else:
+                from scoring_pool import scoring_pool as _sp
+                pool_s = _sp(dte_i)
             flag_rows.append((
                 run_id, ts_iso, ticker.upper(),
                 str(r.get("side", "")).upper(),
@@ -703,7 +775,7 @@ def log_run(
                 mid, bid_f, ask_f, float(spot) if spot else None, 1, None,
                 dte_i, vol_i, oi_i, iv_f,
                 None, None, None, None, None, None,  # delta..extrinsic
-                rv_20d, ivp,
+                rv_20d, ivp, pool_s,
             ))
 
         conn.executemany(
@@ -714,14 +786,14 @@ def log_run(
                 mid, bid, ask, spot, is_control, notes,
                 dte, volume, open_interest, iv,
                 delta, leverage_raw, flow_raw, leverage_norm, flow_norm,
-                extrinsic, realized_vol_20d, iv_premium
+                extrinsic, realized_vol_20d, iv_premium, pool
             ) VALUES (
                 ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
-                ?, ?, ?
+                ?, ?, ?, ?
             )
             """,
             flag_rows,

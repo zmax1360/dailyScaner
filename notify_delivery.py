@@ -83,15 +83,26 @@ def ranking_has_signal(
     min_scored: int = MIN_SCORED_FOR_RANKING,
     min_dvol: int = MIN_NONNULL_DVOL,
     min_flow_iqr: float = MIN_FLOW_IQR,
+    pool: str | None = None,
 ) -> tuple[bool, str]:
     """
     Refuse to publish a ranking when the flow leg is flat / missing.
+
+    When ``pool`` is set, only rows in that pool are evaluated (engine-v1.2).
 
     Returns (ok, reason). reason is 'ok' when publishable.
     """
     if not best_value:
         return False, "no_best_value_payload"
     rows = list(best_value.get("rows") or [])
+    if pool is not None:
+        rows = [r for r in rows if str(r.get("pool") or "") == pool]
+        if not rows:
+            # Explicit: pool absent from payload vs failed gates
+            skipped = (best_value.get("pools_skipped") or {}).get(pool)
+            if skipped:
+                return False, f"pool_not_ranked:{pool}:{skipped}"
+            return False, f"pool_empty:{pool}"
     if len(rows) < int(min_scored):
         return False, f"too_few_scored:{len(rows)}<{int(min_scored)}"
 
@@ -168,9 +179,13 @@ def serialize_best_value_rows(df, *, top_n: int = 30) -> dict[str, Any]:
             "engine_sha": config_hash(SCORING),
         }
 
-    scored = df[df["Value_Score"].notna()].sort_values(
-        "Value_Score", ascending=False,
-    )
+    scored = df[df["Value_Score"].notna()].copy()
+    if "pool" in scored.columns:
+        scored = scored.sort_values(
+            ["pool", "Value_Score"], ascending=[True, False],
+        )
+    else:
+        scored = scored.sort_values("Value_Score", ascending=False)
     n_scored = int(len(scored))
     nflows = []
     if "_nflow" in scored.columns:
@@ -182,6 +197,25 @@ def serialize_best_value_rows(df, *, top_n: int = 30) -> dict[str, Any]:
             if f == f:
                 nflows.append(f)
     disp = flow_dispersion_iqr(nflows)
+
+    # Pools present vs skipped (too few survivors)
+    from scoring_pool import POOL_0DTE, POOL_1DTE, DEFAULT_MIN_POOL_SIZE
+    pools_skipped: dict[str, str] = {}
+    min_pool = int(SCORING.get("min_pool_size", DEFAULT_MIN_POOL_SIZE))
+    if "pool" in df.columns:
+        for pname in (POOL_0DTE, POOL_1DTE):
+            n_p = int(
+                ((df.get("pool") == pname) & df["Value_Score"].notna()).sum()
+            )
+            if n_p == 0:
+                # Distinguish "no contracts" vs "had rows but unscored"
+                n_any = int((df.get("pool") == pname).sum()) if "pool" in df.columns else 0
+                if n_any > 0 and n_any < min_pool:
+                    pools_skipped[pname] = f"too_few_survivors:{n_any}<{min_pool}"
+                elif n_any == 0:
+                    pools_skipped[pname] = "no_contracts_in_pool"
+                else:
+                    pools_skipped[pname] = "unscored"
 
     rows: list[dict[str, Any]] = []
     for _, r in scored.head(int(top_n)).iterrows():
@@ -198,12 +232,18 @@ def serialize_best_value_rows(df, *, top_n: int = 30) -> dict[str, Any]:
             "side": str(r.get("side") or ""),
             "strike": _num(r.get("strike")),
             "expiry": str(r.get("expiry") or ""),
+            "dte": _num(r.get("dte")),
             "last": _num(r.get("last")),
             "volume": _num(r.get("volume")),
             "openInterest": _num(r.get("openInterest")),
             "dVol": _num(r.get("dVol")),
             "Value_Score": _num(r.get("Value_Score")),
             "Status": str(r.get("Status") or ""),
+            "pool": (
+                str(r.get("pool"))
+                if r.get("pool") is not None and str(r.get("pool")) != "nan"
+                else None
+            ),
             "_nflow": _num(r.get("_nflow")),
             "_nlev": _num(r.get("_nlev")),
         })
@@ -213,4 +253,5 @@ def serialize_best_value_rows(df, *, top_n: int = 30) -> dict[str, Any]:
         "n_scored": n_scored,
         "flow_dispersion": None if disp is None else round(float(disp), 4),
         "engine_sha": config_hash(SCORING),
+        "pools_skipped": pools_skipped,
     }

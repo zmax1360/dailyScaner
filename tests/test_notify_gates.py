@@ -133,12 +133,14 @@ def _fresh_payload_with_bv(*, signal: bool = True) -> dict:
             "side": "PUT",
             "strike": 300.0 - i,
             "expiry": "2026-08-15",
+            "dte": 7,
+            "pool": "1DTE+",
             "last": 1.0 + i * 0.1,
             "volume": 5000,
             "openInterest": 1000,
             "dVol": 100.0 * (i + 1) if signal else None,
             "Value_Score": 0.5 - i * 0.01,
-            "Status": "⭐ BEST VALUE" if i == 0 else "",
+            "Status": "⭐ BEST VALUE · 1DTE+" if i == 0 else "",
             "_nflow": 0.1 * i if signal else 0.5,
             "_nlev": 0.5,
         })
@@ -156,6 +158,7 @@ def _fresh_payload_with_bv(*, signal: bool = True) -> dict:
             "n_scored": len(rows),
             "flow_dispersion": 0.5 if signal else 0.01,
             "engine_sha": "dc2906741dbb2b15",
+            "pools_skipped": {"0DTE": "no_contracts_in_pool"},
         },
     }
 
@@ -170,7 +173,8 @@ def test_bot_does_not_recompute_best_value():
             expiry_drill=[],
         )
         bv.assert_not_called()
-    assert "BEST VALUE OPTION" in text
+    assert "BEST VALUE" in text
+    assert "1DTE+" in text
     assert "engine dc290674" in text
 
 
@@ -183,7 +187,7 @@ def test_bot_omits_best_value_when_archive_stale():
         include={"best_value": True},
         expiry_drill=[],
     )
-    assert "BEST VALUE OPTION" not in text
+    assert "per DTE pool" not in text
     assert "omitted" in text.lower()
 
 
@@ -194,15 +198,16 @@ def test_no_signal_ranking_is_not_published():
         r["dVol"] = None
         r["_nflow"] = 0.5
     payload["best_value"]["flow_dispersion"] = 0.0
-    ok, why = ranking_has_signal(payload["best_value"])
+    ok, why = ranking_has_signal(payload["best_value"], pool="1DTE+")
     assert ok is False
     text = _fmt_report(
         payload, None, "AAPL", 5,
         include={"best_value": True},
         expiry_drill=[],
     )
-    assert "BEST VALUE OPTION" not in text
-    assert "no signal" in text.lower() or "omitted" in text.lower()
+    # Per-pool lines stay visible with an explicit not-ranked reason
+    assert "not ranked" in text.lower()
+    assert "PUT $" not in text  # no published top-pick contract line
 
 
 def test_provenance_line_present_on_every_best_value_message():
@@ -212,7 +217,7 @@ def test_provenance_line_present_on_every_best_value_message():
         include={"best_value": True},
         expiry_drill=[],
     )
-    assert "BEST VALUE OPTION" in text
+    assert "BEST VALUE" in text and "1DTE+" in text
     assert "contracts scored" in text
     assert "flow dispersion" in text
     assert "engine dc290674" in text
@@ -224,26 +229,29 @@ def test_provenance_line_present_on_every_best_value_message():
         include={"best_value": True},
         expiry_drill=[],
     )
-    assert "BEST VALUE OPTION" not in text2
+    assert "per DTE pool" not in text2
 
 
 def test_serialize_and_freshness_helpers():
     df = pd.DataFrame([
         {
-            "side": "CALL", "strike": 310.0, "expiry": "2026-08-15",
+            "side": "CALL", "strike": 310.0, "expiry": "2026-08-15", "dte": 7,
+            "pool": "1DTE+",
             "last": 1.5, "volume": 2000, "openInterest": 500,
-            "dVol": 100.0, "Value_Score": 0.4, "Status": "⭐ BEST VALUE",
+            "dVol": 100.0, "Value_Score": 0.4, "Status": "⭐ BEST VALUE · 1DTE+",
             "_nflow": 0.1, "_nlev": 0.5,
         },
         {
-            "side": "PUT", "strike": 300.0, "expiry": "2026-08-15",
+            "side": "PUT", "strike": 300.0, "expiry": "2026-08-15", "dte": 7,
+            "pool": "1DTE+",
             "last": 2.0, "volume": 3000, "openInterest": 800,
             "dVol": 200.0, "Value_Score": 0.3, "Status": "",
             "_nflow": 0.9, "_nlev": 0.4,
         },
     ] + [
         {
-            "side": "PUT", "strike": 295.0 - i, "expiry": "2026-08-15",
+            "side": "PUT", "strike": 295.0 - i, "expiry": "2026-08-15", "dte": 7,
+            "pool": "1DTE+",
             "last": 1.0, "volume": 1000, "openInterest": 500,
             "dVol": 50.0, "Value_Score": 0.2 - i * 0.01, "Status": "",
             "_nflow": 0.2 + i * 0.1, "_nlev": 0.3,

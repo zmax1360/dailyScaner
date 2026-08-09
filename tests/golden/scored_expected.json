@@ -11,11 +11,12 @@
       "iv": 0.28,
       "delta": 0.5354747330671635,
       "Value_Score": 0.7901,
-      "Status": "\u2b50 BEST VALUE",
+      "Status": "\u2b50 BEST VALUE \u00b7 1DTE+",
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 1.0,
-      "_nflow": 0.6502412492720413
+      "_nflow": 0.6502412492720413,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -32,7 +33,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.97182390431049,
-      "_nflow": 0.6261222496171477
+      "_nflow": 0.6261222496171477,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -49,7 +51,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.9559456078832806,
-      "_nflow": 0.6185297974472449
+      "_nflow": 0.6185297974472449,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -66,7 +69,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.46437147884487656,
-      "_nflow": 0.765961464564379
+      "_nflow": 0.765961464564379,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -83,7 +87,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.8433581341457541,
-      "_nflow": 0.5019520470384933
+      "_nflow": 0.5019520470384933,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -100,7 +105,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.2596993194153154,
-      "_nflow": 0.8826029936336475
+      "_nflow": 0.8826029936336475,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -117,7 +123,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.7502405434325328,
-      "_nflow": 0.5100652466903088
+      "_nflow": 0.5100652466903088,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -134,7 +141,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.6968008270757307,
-      "_nflow": 0.5356605536511716
+      "_nflow": 0.5356605536511716,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -151,7 +159,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.3811837089948262,
-      "_nflow": 0.7431985370306227
+      "_nflow": 0.7431985370306227,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -168,7 +177,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.16971831813473365,
-      "_nflow": 0.8610832224852227
+      "_nflow": 0.8610832224852227,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -185,7 +195,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.5075465841983352,
-      "_nflow": 0.6312167373877051
+      "_nflow": 0.6312167373877051,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -202,7 +213,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.4360017050357032,
-      "_nflow": 0.6406003484552258
+      "_nflow": 0.6406003484552258,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -219,7 +231,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.6027272088583241,
-      "_nflow": 0.5197301110977673
+      "_nflow": 0.5197301110977673,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -236,7 +249,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.2741261666919004,
-      "_nflow": 0.7360776293005036
+      "_nflow": 0.7360776293005036,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -253,7 +267,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.3587827233055781,
-      "_nflow": 0.6693498045455063
+      "_nflow": 0.6693498045455063,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -270,7 +285,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.06940556886737376,
-      "_nflow": 0.8543893048108546
+      "_nflow": 0.8543893048108546,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -287,7 +303,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.7028975563972727,
-      "_nflow": 0.4099901784060541
+      "_nflow": 0.4099901784060541,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -304,7 +321,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.5083923504116119,
-      "_nflow": 0.5295137134299676
+      "_nflow": 0.5295137134299676,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -321,7 +339,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.7167454300624322,
-      "_nflow": 0.386632204436905
+      "_nflow": 0.386632204436905,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -338,7 +357,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.7607282491155422,
-      "_nflow": 0.345140971791368
+      "_nflow": 0.345140971791368,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -355,7 +375,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.426014893534311,
-      "_nflow": 0.5593822069516833
+      "_nflow": 0.5593822069516833,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -372,7 +393,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.7855943533787425,
-      "_nflow": 0.3130287017089104
+      "_nflow": 0.3130287017089104,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -389,7 +411,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.7996072342091953,
-      "_nflow": 0.3024296065341441
+      "_nflow": 0.3024296065341441,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -406,7 +429,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.6076837921685234,
-      "_nflow": 0.4201827136915794
+      "_nflow": 0.4201827136915794,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -423,7 +447,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.6249891113446369,
-      "_nflow": 0.3953187523891451
+      "_nflow": 0.3953187523891451,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -440,7 +465,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.5338699649991553,
-      "_nflow": 0.4511831878511977
+      "_nflow": 0.4511831878511977,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -457,7 +483,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.5532895471032118,
-      "_nflow": 0.4225123970458613
+      "_nflow": 0.4225123970458613,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -474,7 +501,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.5959155205370914,
-      "_nflow": 0.27298445879849725
+      "_nflow": 0.27298445879849725,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -491,7 +519,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.5327605667854454,
-      "_nflow": 0.28229661154281666
+      "_nflow": 0.28229661154281666,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -508,7 +537,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.46437687401098626,
-      "_nflow": 0.31119968105423623
+      "_nflow": 0.31119968105423623,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -525,7 +555,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.3817814374114324,
-      "_nflow": 0.24176638054498079
+      "_nflow": 0.24176638054498079,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -542,7 +573,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.3359729333557061,
-      "_nflow": 0.20861958733127864
+      "_nflow": 0.20861958733127864,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -559,7 +591,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.2541312792191778,
-      "_nflow": 0.19763682290338416
+      "_nflow": 0.19763682290338416,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -576,7 +609,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.2156543459012445,
-      "_nflow": 0.1417453747783499
+      "_nflow": 0.1417453747783499,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -593,7 +627,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f Strike Outside 1SD \u00b7 \u26a0\ufe0f bias unavailable",
       "_nlev": 0.15727859948355763,
-      "_nflow": 1.0
+      "_nflow": 1.0,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -610,7 +645,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.15100518296483412,
-      "_nflow": 0.10773962701726612
+      "_nflow": 0.10773962701726612,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -627,7 +663,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f Strike Outside 1SD \u00b7 \u26a0\ufe0f bias unavailable",
       "_nlev": 0.07521388895034463,
-      "_nflow": 0.979619841843956
+      "_nflow": 0.979619841843956,
+      "pool": "1DTE+"
     },
     {
       "side": "CALL",
@@ -644,7 +681,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f Strike Outside 1SD \u00b7 \u26a0\ufe0f bias unavailable",
       "_nlev": 0.003059424346063994,
-      "_nflow": 0.9733131785463754
+      "_nflow": 0.9733131785463754,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -661,7 +699,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f bias unavailable",
       "_nlev": 0.06485391513375582,
-      "_nflow": 0.0964330394095002
+      "_nflow": 0.0964330394095002,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -678,7 +717,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f Strike Outside 1SD \u00b7 \u26a0\ufe0f bias unavailable",
       "_nlev": 0.1270877550539294,
-      "_nflow": 0.04602115040765677
+      "_nflow": 0.04602115040765677,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -695,7 +735,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f Strike Outside 1SD \u00b7 \u26a0\ufe0f bias unavailable",
       "_nlev": 0.06313129505422985,
-      "_nflow": 0.011503290471173546
+      "_nflow": 0.011503290471173546,
+      "pool": "1DTE+"
     },
     {
       "side": "PUT",
@@ -712,7 +753,8 @@
       "Optimal_Strategy": "\u2014",
       "Strategy_Tag": "\u26a0\ufe0f Strike Outside 1SD \u00b7 \u26a0\ufe0f bias unavailable",
       "_nlev": 0.0,
-      "_nflow": 0.0
+      "_nflow": 0.0,
+      "pool": "1DTE+"
     }
   ]
 }

@@ -11,8 +11,11 @@ from __future__ import annotations
 # Fingerprint of the scoring engine — hashed into every attribution run.
 # Segment analysis by config_hash / engine_tag — never pool across versions.
 SCORING: dict[str, float | int | str] = {
-    # engine-v1.1: leverage uses abs(delta). Prior hash dc2906741dbb2b15 = engine-v1.
-    "engine_tag": "engine-v1.1",
+    # engine-v1.2: separate 0DTE / 1DTE+ normalisation pools.
+    # Prior: v1.1 = 1e191ea1832c2c9a (abs-delta); v1 = dc2906741dbb2b15.
+    "engine_tag": "engine-v1.2",
+    # Min survivors (delta+flow) to rank a DTE pool; below → no picks (not merged).
+    "min_pool_size": 5,
     # Base blend
     "w_lev": 0.4,
     "w_flow": 0.6,

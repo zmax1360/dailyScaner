@@ -61,12 +61,8 @@ PAPER_RULES = ("FIRST_SEEN", "CLOCK_1000", "CONFIRM_5")
 PAPER_VARIANTS = ("ALL", "0DTE", "1DTE+", "CONTROL")
 
 # Shared by section_buckets and section_verdict — must never diverge.
-# NULL dte (pre-migration rows) is UNKNOWN, never silently pooled into 1DTE+.
-DTE_BUCKET_SQL = """CASE
-    WHEN dte IS NULL THEN 'UNKNOWN'
-    WHEN dte = 0 THEN '0DTE'
-    ELSE '1DTE+'
-END"""
+# Single definition lives in scoring_pool.py (also used by the scorer).
+from scoring_pool import DTE_BUCKET_SQL, dte_bucket as _dte_bucket_fn  # noqa: E402
 
 # SQLite date()/time()/strftime() reinterpret offset-aware ISO strings
 # (…T16:19:37-04:00 → 20:19:37 UTC wall). Read the stored ET fields instead.
@@ -338,12 +334,7 @@ class PaperTrade:
 
 
 def _dte_bucket(dte) -> str:
-    if dte is None:
-        return "UNKNOWN"
-    try:
-        return "0DTE" if int(dte) == 0 else "1DTE+"
-    except (TypeError, ValueError):
-        return "UNKNOWN"
+    return _dte_bucket_fn(dte)
 
 
 def _persist_from(scans: list, start_idx: int, contract: str) -> int:
@@ -413,9 +404,11 @@ def _load_paper_scans(
     """
     Scans keyed by (session, ticker), ordered by ts_et.
 
-    Engine path: rank = 1, is_control = 0.
-    Control path: is_control = 1 (rank is NULL on controls); one row per run
-    (prefer CALL when both sides exist).
+    Engine path: rank = 1 within pool, is_control = 0.
+    Post-v1.2: both pools may have rank=1 in one run — load both; variants
+    filter by dte_bucket. Pre-migration (pool NULL): treat as 1DTE+ timeline.
+
+    Control path: is_control = 1; one row per (run_id, pool) (prefer CALL).
 
     Requires conn.row_factory = sqlite3.Row.
     """
@@ -424,20 +417,24 @@ def _load_paper_scans(
             SELECT {session_date_sql("ts_et")} AS sess,
                    {et_clock_sql("ts_et")} AS clock,
                    ts_et, run_id, ticker, side, strike, expiry, dte,
-                   mid, mark_close,
+                   mid, mark_close, pool,
                    ticker || side || strike || expiry AS contract
             FROM flags
             WHERE {where}
               AND is_control = 1
               AND mid IS NOT NULL AND mid > 0
-            ORDER BY sess, ticker, ts_et, CASE side WHEN 'CALL' THEN 0 ELSE 1 END
+            ORDER BY sess, ticker, ts_et,
+                     CASE pool WHEN '1DTE+' THEN 0 WHEN '0DTE' THEN 1 ELSE 2 END,
+                     CASE side WHEN 'CALL' THEN 0 ELSE 1 END
         """
         rows = q(conn, sql, args)
         by: dict[tuple[str, str], list[dict]] = defaultdict(list)
-        seen_run: set[tuple[str, str, str]] = set()
+        # One control per (run, pool) — not one per run (two pools now)
+        seen_run: set[tuple[str, str, str, str]] = set()
         for r in rows:
             key = (r["sess"], r["ticker"])
-            run_key = (r["sess"], r["ticker"], r["run_id"])
+            pool_k = r["pool"] if r["pool"] is not None else ""
+            run_key = (r["sess"], r["ticker"], r["run_id"], pool_k)
             if run_key in seen_run:
                 continue
             seen_run.add(run_key)
@@ -448,14 +445,15 @@ def _load_paper_scans(
         SELECT {session_date_sql("ts_et")} AS sess,
                {et_clock_sql("ts_et")} AS clock,
                ts_et, ticker, side, strike, expiry, dte,
-               mid, mark_close,
+               mid, mark_close, pool,
                ticker || side || strike || expiry AS contract
         FROM flags
         WHERE {where}
           AND is_control = 0
           AND rank = 1
           AND mid IS NOT NULL AND mid > 0
-        ORDER BY sess, ticker, ts_et
+        ORDER BY sess, ticker, ts_et,
+                 CASE pool WHEN '1DTE+' THEN 0 WHEN '0DTE' THEN 1 ELSE 2 END
     """
     rows = q(conn, sql, args)
     by = defaultdict(list)

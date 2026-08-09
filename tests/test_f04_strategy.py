@@ -10,6 +10,7 @@ import pytz
 
 from best_value import calculate_best_value
 from config import SCORING
+from tests.scoring_fixtures import pad_min_pool
 from strategy_engine import (
     STRAT_BEAR_PUT_SPREAD,
     STRAT_BULL_CALL_SPREAD,
@@ -41,14 +42,14 @@ def _contract(strike, price, side="CALL", **kw):
 def _score(rows, **kw):
     kw.setdefault("now_et", NOW)
     kw.setdefault("spot_price", SPOT)
-    out = calculate_best_value(pd.DataFrame(rows), **kw)
+    out = calculate_best_value(pd.DataFrame(pad_min_pool(list(rows))), **kw)
     return out.set_index("strike")["Value_Score"]
 
 
 def _mults(rows, **kw):
     kw.setdefault("now_et", NOW)
     kw.setdefault("spot_price", SPOT)
-    out = calculate_best_value(pd.DataFrame(rows), **kw)
+    out = calculate_best_value(pd.DataFrame(pad_min_pool(list(rows))), **kw)
     return out.set_index("strike")["_multipliers"]
 
 
@@ -71,12 +72,12 @@ def test_strategy_outlook_parsing(strat, expected):
 ])
 def test_all_six_strategies_have_a_branch(strat):
     """Every STRAT_* is handled — no silent fall-through."""
-    rows = [
+    rows = pad_min_pool([
         _contract(245, 3.0, side="CALL"),
         _contract(255, 3.0, side="PUT"),
         _contract(250, 3.0, side="CALL"),
         _contract(250, 3.0, side="PUT"),
-    ]
+    ])
     out = calculate_best_value(
         pd.DataFrame(rows), spot_price=SPOT, now_et=NOW,
         optimal_strategy=strat, upper_1sd=260.0, lower_1sd=240.0,
@@ -145,12 +146,13 @@ def test_bearish_mirrors_bullish():
     filler_c = _contract(260, 3.0, side="CALL")
     filler_p = _contract(240, 3.0, side="PUT")
 
+    frame = pad_min_pool([call_row, filler_c, put_row, filler_p])
     bull = calculate_best_value(
-        pd.DataFrame([call_row, filler_c, put_row, filler_p]),
+        pd.DataFrame(frame),
         spot_price=SPOT, now_et=NOW, daily_bias="HEAVY BULLISH",
     )
     bear = calculate_best_value(
-        pd.DataFrame([call_row, filler_c, put_row, filler_p]),
+        pd.DataFrame(frame),
         spot_price=SPOT, now_et=NOW, daily_bias="HEAVY BEARISH",
     )
     bull_m = bull.loc[bull["strike"] == 245.0, "_multipliers"].iloc[0]

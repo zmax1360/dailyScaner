@@ -572,69 +572,73 @@ def _fmt_report(
             )
             L.append("")
         else:
-            ok_sig, why_sig = ranking_has_signal(bv)
             prov = provenance_line(bv, payload)
-            if not ok_sig:
-                log.info("Best Value omitted for %s — no signal (%s)", ticker, why_sig)
-                L.append(
-                    f"<i>⭐ Best Value omitted — ranking has no signal "
-                    f"({why_sig}).</i>"
-                )
-                L.append("")
-            elif not prov:
+            if not prov:
                 log.info("Best Value omitted for %s — provenance incomplete", ticker)
                 L.append(
                     "<i>⭐ Best Value omitted — provenance incomplete.</i>"
                 )
                 L.append("")
             else:
+                from scoring_pool import POOL_0DTE, POOL_1DTE
                 rows = list((bv or {}).get("rows") or [])
-                L.append("⭐ <b>BEST VALUE OPTION</b>")
-                hdr = "Side  Strike   Exp    Score  Price  VOI    ΔVol"
-                lines = [f"<pre>{hdr}"]
-                for r in rows[:3]:
-                    try:
-                        vol = float(r.get("volume") or 0)
-                        oi = max(int(float(r.get("openInterest") or 0)), 1)
-                        voi = vol / oi
-                        strike = float(r.get("strike") or 0)
-                        score = float(r.get("Value_Score") or 0)
-                        last = float(r.get("last") or 0)
-                    except (TypeError, ValueError):
+                L.append("⭐ <b>BEST VALUE</b> <i>(per DTE pool)</i>")
+                any_pool = False
+                for pool_name in (POOL_1DTE, POOL_0DTE):
+                    ok_sig, why_sig = ranking_has_signal(bv, pool=pool_name)
+                    if not ok_sig:
+                        L.append(
+                            f"⭐ <b>{pool_name}</b> — not ranked "
+                            f"<i>({why_sig})</i>"
+                        )
                         continue
-                    exp = str(r.get("expiry") or "")
-                    exp_s = exp[5:] if len(exp) >= 7 else exp
-                    star = " ⭐" if "BEST VALUE" in str(r.get("Status") or "") else ""
-                    dvol = r.get("dVol")
-                    if dvol is None:
-                        dvol_s = "     —"
-                    else:
-                        try:
-                            dvol_s = f" {int(float(dvol)):+,}"
-                        except (TypeError, ValueError):
-                            dvol_s = "     —"
-                    lines.append(
-                        f"{str(r.get('side') or ''):<5} ${strike:<7.1f} {exp_s:<6} "
-                        f"{score:.4f} ${last:.2f}  {voi:.1f}x{dvol_s}{star}"
+                    any_pool = True
+                    best = next(
+                        (
+                            r for r in rows
+                            if str(r.get("pool") or "") == pool_name
+                            and "BEST VALUE" in str(r.get("Status") or "")
+                        ),
+                        next(
+                            (
+                                r for r in rows
+                                if str(r.get("pool") or "") == pool_name
+                            ),
+                            None,
+                        ),
                     )
-                lines.append("</pre>")
-                L.extend(lines)
-                best = next(
-                    (r for r in rows if "BEST VALUE" in str(r.get("Status") or "")),
-                    rows[0] if rows else None,
-                )
-                if best is not None:
+                    if best is None:
+                        L.append(
+                            f"⭐ <b>{pool_name}</b> — not ranked "
+                            f"<i>(no top row)</i>"
+                        )
+                        continue
                     try:
                         b_vol = float(best.get("volume") or 0)
                         b_oi = max(int(float(best.get("openInterest") or 0)), 1)
-                        L.append(
-                            f"→ <b>{best.get('side')} ${float(best['strike']):.1f}</b> "
-                            f"exp {best.get('expiry')} · "
-                            f"score {float(best['Value_Score']):.4f} · "
-                            f"${float(best['last']):.2f} · {b_vol / b_oi:.1f}×"
+                        dte_v = best.get("dte")
+                        dte_s = (
+                            f"{int(dte_v)}d"
+                            if dte_v is not None and dte_v == dte_v
+                            else "?"
                         )
-                    except (TypeError, ValueError, KeyError):
-                        pass
+                        L.append(
+                            f"⭐ <b>{pool_name}</b>  "
+                            f"{best.get('side')} ${float(best['strike']):.1f}  "
+                            f"{best.get('expiry')} ({dte_s})  "
+                            f"score {float(best['Value_Score']):.2f}  "
+                            f"${float(best['last']):.2f}  "
+                            f"vol/OI {b_vol / b_oi:.1f}x"
+                        )
+                    except (TypeError, ValueError, KeyError) as exc:
+                        L.append(
+                            f"⭐ <b>{pool_name}</b> — display error "
+                            f"<i>({type(exc).__name__})</i>"
+                        )
+                if not any_pool and not (bv or {}).get("rows"):
+                    L.append(
+                        "<i>⭐ Best Value — no pool produced a ranking.</i>"
+                    )
                 L.append(f"<i>{prov}</i>")
                 L.append("")
 

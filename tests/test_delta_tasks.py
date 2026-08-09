@@ -92,12 +92,13 @@ def test_negative_dvol_never_becomes_positive():
     out = attach_dvol(df, prev)
     assert out.loc[0, "dVol"] == 3000.0
     # And abs must not be used in scoring: collapse vs surge
-    df2 = pd.DataFrame([
+    from tests.scoring_fixtures import pad_min_pool
+    df2 = pd.DataFrame(pad_min_pool([
         {"side": "CALL", "strike": 250.0, "expiry": "2026-08-21",
          "volume": 5000, "last": 5.0, "openInterest": 5000, "dte": 28, "iv": 0.30},
         {"side": "CALL", "strike": 255.0, "expiry": "2026-08-21",
          "volume": 5000, "last": 5.0, "openInterest": 5000, "dte": 28, "iv": 0.30},
-    ])
+    ]))
     prev2 = {"top_calls": [
         {"strike": 250.0, "expiry": "2026-08-21", "volume": 1000},
         {"strike": 255.0, "expiry": "2026-08-21", "volume": 9000},
@@ -195,15 +196,18 @@ def test_degraded_iv_returns_none():
 
 
 def test_null_delta_row_excluded_from_leverage_not_defaulted():
+    from tests.scoring_fixtures import pad_min_pool
     now = ET.localize(datetime(2026, 7, 24, 11, 0))
-    rows = [
-        # Good IV → real delta
+    # Pad good-IV rows first so survivors ≥ min_pool_size after excluding null-delta
+    rows = pad_min_pool([
         {"side": "CALL", "strike": 250.0, "expiry": "2026-08-21", "dte": 28,
          "last": 5.0, "volume": 5000, "openInterest": 5000, "iv": 0.30},
+    ])
+    rows.append(
         # Degraded IV → null delta → excluded from leverage / Value_Score
         {"side": "CALL", "strike": 255.0, "expiry": "2026-08-21", "dte": 28,
          "last": 0.50, "volume": 5000, "openInterest": 5000, "iv": 1e-5},
-    ]
+    )
     out = calculate_best_value(pd.DataFrame(rows), spot_price=250.0, now_et=now)
     good = out.loc[out["strike"] == 250.0].iloc[0]
     bad = out.loc[out["strike"] == 255.0].iloc[0]

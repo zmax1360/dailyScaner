@@ -16,6 +16,7 @@ import pytest
 import pytz
 
 from best_value import attach_dvol, build_best_value_df, calculate_best_value
+from tests.scoring_fixtures import pad_min_pool
 
 ET = pytz.timezone("US/Eastern")
 NOW = ET.localize(datetime(2026, 7, 24, 11, 0))
@@ -35,9 +36,10 @@ def contract(strike, price, vol=5000, oi=5000, side="CALL",
     return row
 
 
-def score(rows, **kw):
+def score(rows, *, pad: bool = True, **kw):
     kw.setdefault("now_et", NOW)
     kw.setdefault("spot_price", SPOT)
+    rows = pad_min_pool(list(rows)) if pad else list(rows)
     out = calculate_best_value(pd.DataFrame(rows), **kw)
     return out.set_index("strike")["Value_Score"]
 
@@ -61,8 +63,11 @@ def test_empty_frame_does_not_raise():
 
 
 def test_min_volume_gate_excludes_thin_contracts():
-    s = score([contract(250, 5.0, vol=499), contract(255, 5.0, vol=5000)],
-              min_volume=500)
+    # ≥5 survivors above the gate so the pool ranks (engine-v1.2 min_pool_size)
+    rows = [contract(250, 5.0, vol=499)] + [
+        contract(255 + i * 2.5, 5.0, vol=5000) for i in range(5)
+    ]
+    s = score(rows, pad=False, min_volume=500)
     assert pd.isna(s[250.0])
     assert not pd.isna(s[255.0])
 
@@ -141,7 +146,10 @@ def test_new_entrant_is_not_systematically_penalised():
 
 def test_volume_collapse_scores_lower_than_volume_surge():
     """Identical volume and OI; only the SIGN of dVol differs."""
-    df = pd.DataFrame([contract(250, 5.0, vol=5000), contract(255, 5.0, vol=5000)])
+    rows = pad_min_pool([
+        contract(250, 5.0, vol=5000), contract(255, 5.0, vol=5000),
+    ])
+    df = pd.DataFrame(rows)
     prev = {"top_calls": [
         {"strike": 250.0, "expiry": "2026-08-21", "volume": 1000},   # +4000 build
         {"strike": 255.0, "expiry": "2026-08-21", "volume": 9000},   # -4000 unwind
@@ -187,12 +195,14 @@ def test_value_score_stays_within_its_documented_range():
 
 def test_two_row_universe_produces_degenerate_scores():
     """
-    Characterisation, not a defect claim: with N=2 min-max always yields
-    exactly {0.0, 1.0} on each leg, so the 40/60 weighting is meaningless.
-    Documented so nobody trusts BEST VALUE on a thin chain.
+    engine-v1.2: pools with n < min_pool_size are not ranked (degenerate
+    {0.0, 1.0} min-max is refused rather than published).
     """
-    s = score([contract(250, 5.0, vol=5000), contract(255, 1.0, vol=5000)])
-    assert set(round(v, 6) for v in s.dropna()) <= {0.3, 0.7, 0.09, 0.21}
+    s = score(
+        [contract(250, 5.0, vol=5000), contract(255, 1.0, vol=5000)],
+        pad=False,
+    )
+    assert s.dropna().empty
 
 
 # ── 5. Directional multipliers ───────────────────────────────────────────────

@@ -558,38 +558,30 @@ def _format_scan_message(
         prev_vol_bv = (prev_payload.get("volume") or {}) if prev_payload else None
         bv_df = _build_best_value_df(vol, spot, prev_vol_bv, min_volume=500)
         if not bv_df.empty and bv_df["Status"].astype(str).str.contains("BEST VALUE", na=False).any():
-            has_dvol = "dVol" in bv_df.columns
-            L.append("⭐ <b>BEST VALUE OPTION</b>")
-            ranked = (
-                bv_df[bv_df["Value_Score"].notna()]
-                .sort_values("Value_Score", ascending=False)
-                .head(3)
-            )
-            hdr = "Side  Strike   Exp    Score  Price  VOI"
-            if has_dvol:
-                hdr += "    ΔVol"
-            rows = [f"<pre>{hdr}"]
-            for _, r in ranked.iterrows():
-                voi  = r["volume"] / max(int(r["openInterest"]), 1)
-                star = " ⭐" if "BEST VALUE" in str(r.get("Status") or "") else ""
-                exp_s = r["expiry"][5:] if len(r["expiry"]) >= 7 else r["expiry"]
-                line = (
-                    f"{r['side']:<5} ${r['strike']:<7.1f} {exp_s:<6} "
-                    f"{r['Value_Score']:.4f} ${r['last']:.2f}  {voi:.1f}x"
+            from scoring_pool import POOL_0DTE, POOL_1DTE
+            L.append("⭐ <b>BEST VALUE</b> <i>(per DTE pool)</i>")
+            for pool_name in (POOL_1DTE, POOL_0DTE):
+                best_p = bv_df[
+                    bv_df["Status"].astype(str).str.contains("BEST VALUE", na=False)
+                    & (bv_df.get("pool") == pool_name)
+                ]
+                if best_p.empty:
+                    L.append(f"⭐ <b>{pool_name}</b> — not ranked")
+                    continue
+                best = best_p.iloc[0]
+                voi_b = best["volume"] / max(int(best["openInterest"]), 1)
+                dte_s = (
+                    f"{int(best['dte'])}d"
+                    if "dte" in best.index and pd.notna(best.get("dte"))
+                    else "?"
                 )
-                if has_dvol and pd.notna(r.get("dVol")):
-                    line += f"  {int(r['dVol']):+,}"
-                line += star
-                rows.append(line)
-            rows.append("</pre>")
-            L.extend(rows)
-            best = bv_df[bv_df["Status"].astype(str).str.contains("BEST VALUE", na=False)].iloc[0]
-            voi_b = best["volume"] / max(int(best["openInterest"]), 1)
-            L.append(
-                f"→ <b>{best['side']} ${best['strike']:.1f}</b> "
-                f"exp {best['expiry']} · score {best['Value_Score']:.4f} · "
-                f"${best['last']:.2f} · {voi_b:.1f}×"
-            )
+                L.append(
+                    f"⭐ <b>{pool_name}</b>  "
+                    f"{best['side']} ${best['strike']:.1f}  "
+                    f"{best['expiry']} ({dte_s})  "
+                    f"score {best['Value_Score']:.2f}  "
+                    f"${best['last']:.2f}  vol/OI {voi_b:.1f}x"
+                )
             L.append("")
 
     # ── Expiry drill-down ─────────────────────────────────────────────────────
@@ -2642,32 +2634,29 @@ def _render_best_value_panel(
     )
     _render_add_position_form(ticker)
 
-    # ── Summary callout ───────────────────────────────────────────────────────
+    # ── Summary callout (one star per DTE pool) ───────────────────────────────
     best = df[df["Status"].astype(str).str.contains("BEST VALUE", na=False)]
     if not best.empty:
-        b    = best.iloc[0]
-        voi  = b["volume"] / max(int(b["openInterest"]), 1)
-        dvol_part  = f" | **ΔVol:** {int(b['dVol']):+,}" if has_dvol and pd.notna(b.get("dVol")) else ""
-        vel        = b["Score_Velocity"]
-        vel_part   = f" | **Velocity:** {vel:+.4f}" if pd.notna(vel) else ""
-        sig        = b["Action_Signal"]
-        sig_part   = f" | {sig}" if sig and sig != "HOLD" else ""
-        tgt        = b.get("Target_Status") or ""
-        tgt_part   = f" | {tgt}" if tgt else ""
-        sky_part   = f" | {BLUE_SKY_TAG}" if BLUE_SKY_TAG in str(b.get("Status") or "") else ""
-        st.success(
-            f"⭐ **{b['side']} ${b['strike']:.1f}**"
-            f" | **Exp:** {b['expiry']}"
-            f" | **Score:** {b['Value_Score']:.4f}"
-            f"{vel_part}"
-            f" | **Price:** ${b['last']:.2f}"
-            f" | **Vol/OI:** {voi:.1f}x"
-            f"{dvol_part}"
-            f"{sig_part}"
-            f"{tgt_part}"
-            f"{sky_part}",
-            icon="⭐",
-        )
+        from scoring_pool import POOL_0DTE, POOL_1DTE
+        lines = []
+        for pool_name in (POOL_1DTE, POOL_0DTE):
+            sub = best[best["pool"] == pool_name] if "pool" in best.columns else best
+            if sub.empty:
+                lines.append(f"⭐ **{pool_name}** — not ranked")
+                continue
+            b = sub.iloc[0]
+            voi = b["volume"] / max(int(b["openInterest"]), 1)
+            dte_s = (
+                f"{int(b['dte'])}d"
+                if "dte" in b.index and pd.notna(b.get("dte"))
+                else "?"
+            )
+            lines.append(
+                f"⭐ **{pool_name}** {b['side']} ${b['strike']:.1f} "
+                f"{b['expiry']} ({dte_s}) · score {b['Value_Score']:.2f} · "
+                f"${b['last']:.2f} · vol/OI {voi:.1f}x"
+            )
+        st.success("  \n".join(lines), icon="⭐")
 
     # Charts sit below the scanner table/callout so the table layout stays untouched.
     _render_expiry_distribution_charts(top5, spot)

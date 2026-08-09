@@ -10,6 +10,7 @@ import pytz
 
 from best_value import calculate_best_value
 from config import SCORING
+from tests.scoring_fixtures import pad_min_pool
 
 ET = pytz.timezone("US/Eastern")
 NOW = ET.localize(datetime(2026, 7, 20, 11, 0, 0))
@@ -91,15 +92,17 @@ def test_puts_not_floored_in_leverage_norm():
 
 
 def test_null_delta_still_excluded_and_renormalised():
-    rows = [
+    rows = pad_min_pool([
         {"side": "CALL", "strike": 250.0, "expiry": "2026-08-21", "dte": 28,
          "last": 5.0, "volume": 5000, "openInterest": 5000, "iv": 0.30},
         {"side": "PUT", "strike": 250.0, "expiry": "2026-08-21", "dte": 28,
          "last": 5.0, "volume": 5000, "openInterest": 5000, "iv": 0.30},
+    ])
+    rows.append(
         # Degraded IV → null delta → excluded
         {"side": "CALL", "strike": 255.0, "expiry": "2026-08-21", "dte": 28,
          "last": 0.50, "volume": 5000, "openInterest": 5000, "iv": 1e-5},
-    ]
+    )
     out = calculate_best_value(pd.DataFrame(rows), spot_price=SPOT, now_et=NOW)
     bad = out.loc[out["strike"] == 255.0].iloc[0]
     assert pd.isna(bad["delta"])
@@ -156,7 +159,7 @@ def test_mirrored_call_put_leverage_norm_comparable(monkeypatch):
 
     monkeypatch.setattr(greeks, "bs_delta", _fixed_delta)
     # Same premium for all — |delta| alone drives leverage rank
-    df = pd.DataFrame([
+    df = pd.DataFrame(pad_min_pool([
         {
             "side": "CALL", "strike": 250.0, "expiry": "2026-08-21", "dte": 32,
             "last": 3.0, "volume": 800, "openInterest": 1000, "iv": 0.35,
@@ -173,7 +176,7 @@ def test_mirrored_call_put_leverage_norm_comparable(monkeypatch):
             "side": "PUT", "strike": 240.0, "expiry": "2026-08-21", "dte": 32,
             "last": 3.0, "volume": 800, "openInterest": 1000, "iv": 0.35,
         },
-    ])
+    ]))
     out = calculate_best_value(df, spot_price=SPOT, now_et=NOW)
     atm = out[out["strike"] == 250.0]
     assert len(atm) == 2

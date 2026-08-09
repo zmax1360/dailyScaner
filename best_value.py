@@ -14,6 +14,12 @@ import pandas as pd
 import pytz
 
 from config import SCORING
+from scoring_pool import (
+    DEFAULT_MIN_POOL_SIZE,
+    POOL_0DTE,
+    POOL_1DTE,
+    scoring_pool,
+)
 
 
 def _contract_price(c: dict) -> float:
@@ -252,6 +258,8 @@ def calculate_best_value(
     df["_multipliers"] = None
     df["delta"] = float("nan")
     df["extrinsic"] = float("nan")
+    df["pool"] = None
+    df["_rank"] = pd.NA
 
     mask = (df["volume"] >= mv) & (df["last"] > min_last)
     work = df[mask].copy()
@@ -354,22 +362,62 @@ def calculate_best_value(
             return pd.Series(0.5, index=s.index)
         return (s - mn) / (mx - mn)
 
+    # Pool assignment (engine-v1.2) — NULL dte never silently pooled
+    dte_col = work["dte"] if "dte" in work.columns else (
+        work["DTE"] if "DTE" in work.columns else None
+    )
+    pools: list[str | None] = []
+    if dte_col is None:
+        pools = [None] * len(work)
+        _log.warning("dte column missing — all rows excluded from pool ranking")
+    else:
+        n_excl = 0
+        for v in dte_col.tolist():
+            p = scoring_pool(v)
+            if p is None:
+                n_excl += 1
+            pools.append(p)
+        if n_excl:
+            _log.info(
+                "null/invalid dte — %d rows excluded from ranking (not pooled)",
+                n_excl,
+            )
+    work["pool"] = pools
+
     work["_nlev"] = float("nan")
     work["_nflow"] = float("nan")
-    flow_ok = work["_flow"].notna()
-    if flow_ok.any():
-        work.loc[flow_ok, "_nflow"] = _minmax(work.loc[flow_ok, "_flow"].astype(float))
-    if has_delta.any():
-        work.loc[has_delta, "_nlev"] = _minmax(work.loc[has_delta, "_lev"].astype(float))
-    # Only rows with a real delta AND usable flow participate in Value_Score
     work["Value_Score"] = float("nan")
-    scored_mask = has_delta & flow_ok
-    work.loc[scored_mask, "Value_Score"] = (
-        work.loc[scored_mask, "_nlev"] * w_lev
-        + work.loc[scored_mask, "_nflow"] * w_flow
-    )
+    flow_ok = work["_flow"].notna()
+    eligible = has_delta & flow_ok & work["pool"].notna()
+
+    min_pool = int(cfg.get("min_pool_size", DEFAULT_MIN_POOL_SIZE))
+    ranked_pools: list[str] = []
+    for pool_name in (POOL_0DTE, POOL_1DTE):
+        in_pool = eligible & (work["pool"] == pool_name)
+        n_pool = int(in_pool.sum())
+        if n_pool < min_pool:
+            if n_pool > 0:
+                _log.info(
+                    "pool %s has %d survivors (< %d) — not ranked (not merged)",
+                    pool_name, n_pool, min_pool,
+                )
+            continue
+        # Independent min-max within this pool only
+        work.loc[in_pool, "_nlev"] = _minmax(
+            work.loc[in_pool, "_lev"].astype(float)
+        )
+        work.loc[in_pool, "_nflow"] = _minmax(
+            work.loc[in_pool, "_flow"].astype(float)
+        )
+        work.loc[in_pool, "Value_Score"] = (
+            work.loc[in_pool, "_nlev"] * w_lev
+            + work.loc[in_pool, "_nflow"] * w_flow
+        )
+        ranked_pools.append(pool_name)
+
     # Pre-multiplier blend — persisted as base_score (do not recompute in log_run)
     work["_base_score"] = work["Value_Score"].copy()
+    work.attrs["ranked_pools"] = ranked_pools
 
     # Extrinsic value (instrumentation): mid - intrinsic
     work["extrinsic"] = float("nan")
@@ -627,10 +675,19 @@ def calculate_best_value(
 
     work["Value_Score"] = work["Value_Score"].round(4)
     work["Status"] = ""
-    scored = work["Value_Score"].dropna()
-    if not scored.empty:
-        best_idx = scored.idxmax()
-        status = "⭐ BEST VALUE"
+    work["_rank"] = pd.NA
+    # Rank within pool + one BEST VALUE star per ranked pool
+    for pool_name in (POOL_0DTE, POOL_1DTE):
+        pool_scored = work.loc[
+            work["pool"].eq(pool_name) & work["Value_Score"].notna(),
+            "Value_Score",
+        ].sort_values(ascending=False)
+        if pool_scored.empty:
+            continue
+        for rank_i, idx in enumerate(pool_scored.index, start=1):
+            work.at[idx, "_rank"] = rank_i
+        best_idx = pool_scored.index[0]
+        status = f"⭐ BEST VALUE · {pool_name}"
         if is_blue_sky_breakout(profited_shares_pct, daily_bias):
             status = f"{status} · {BLUE_SKY_TAG}"
         work.at[best_idx, "Status"] = status
@@ -648,6 +705,8 @@ def calculate_best_value(
     df.loc[work.index, "_flow"] = work["_flow"]
     df.loc[work.index, "_base_score"] = work["_base_score"]
     df.loc[work.index, "extrinsic"] = work["extrinsic"]
+    df.loc[work.index, "pool"] = work["pool"]
+    df.loc[work.index, "_rank"] = work["_rank"]
     if "_bias_unknown" in work.columns:
         df.loc[work.index, "_bias_unknown"] = work["_bias_unknown"]
     if "dvol_suspect" in work.columns:

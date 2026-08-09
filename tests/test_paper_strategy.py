@@ -34,7 +34,8 @@ CREATE TABLE flags (
     rank INTEGER,
     is_control INTEGER,
     mid REAL,
-    mark_close REAL
+    mark_close REAL,
+    pool TEXT
 );
 """
 
@@ -60,17 +61,20 @@ def _ins(
     side: str = "CALL",
     expiry: str = "2026-07-31",
     ticker: str = "AAPL",
+    pool: str | None = None,
 ):
+    if pool is None:
+        pool = "0DTE" if dte == 0 else "1DTE+"
     conn.execute(
         """
         INSERT INTO flags (
             run_id, ts_et, ticker, side, strike, expiry, dte,
-            rank, is_control, mid, mark_close
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            rank, is_control, mid, mark_close, pool
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             run_id, ts, ticker, side, strike, expiry, dte,
-            rank, is_control, mid, mark_close,
+            rank, is_control, mid, mark_close, pool,
         ),
     )
 

@@ -89,10 +89,9 @@ def _log_scan_attribution(
     """
     try:
         from attribution import (
-            build_control_rows,
+            build_control_rows_per_pool,
             engine_sha,
             log_run,
-            modal_flagged_expiry,
         )
         from best_value import build_best_value_df, resolve_biases_for_ticker
 
@@ -127,15 +126,8 @@ def _log_scan_attribution(
             ],
             ignore_index=True,
         )
-        exp = modal_flagged_expiry(bv_df)
-        if not exp and "expiry" in chain.columns and not chain.empty:
-            # No scored rows  still log ATM control on nearest chain expiry
-            exp = str(chain["expiry"].astype(str).mode().iloc[0])
-        ctrl = (
-            build_control_rows(chain, spot, exp)
-            if exp
-            else build_control_rows(pd.DataFrame(), spot, "")
-        )
+        # One ATM control pair per DTE pool (engine-v1.2)
+        ctrl = build_control_rows_per_pool(chain, spot)
 
         # vwap_state intentionally omitted (None): VWAP lives in app.py only.
         # Passing it here would change what the engine sees - leave column empty.
