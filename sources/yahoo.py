@@ -304,3 +304,88 @@ class YahooSource:
         if last > 0:
             return last
         return None
+
+    def fetch_option_exit(
+        self,
+        ticker: str,
+        side: str,
+        strike: float,
+        expiry: str,
+        *,
+        now_et: datetime | None = None,
+        trade_max_age: timedelta | None = None,
+    ) -> tuple[float | None, str | None]:
+        """
+        Live BID (quote) or fresh last trade — never mid. For t15m/t30m exits.
+
+        lastPrice is only accepted when lastTradeDate is within trade_max_age
+        of mark time (default 5 minutes). Stale last → (None, None).
+        """
+        max_age = trade_max_age if trade_max_age is not None else timedelta(minutes=5)
+        mark_now = now_et or datetime.now(ET)
+        if mark_now.tzinfo is None:
+            mark_now = mark_now.replace(tzinfo=ET)
+        mark_now = mark_now.astimezone(ET)
+
+        t = yf.Ticker(ticker)
+        try:
+            chain = _yf_retry(
+                lambda: t.option_chain(expiry),
+                label=f"exit {expiry}",
+                attempts=3,
+                base_sleep=2.0,
+            )
+        except ValueError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "fetch_option_exit failed %s %s %s %s: %s",
+                ticker, side, strike, expiry, exc,
+            )
+            return None, None
+        book = chain.calls if str(side).upper() == "CALL" else chain.puts
+        row = book[abs(book["strike"] - float(strike)) < 1e-6]
+        if row.empty:
+            raise ValueError(
+                f"strike not found: {ticker} {side} {strike} {expiry}"
+            )
+        r = row.iloc[0]
+        bid = float(r.get("bid") or 0)
+        last = float(r.get("lastPrice") or 0)
+        if bid > 0:
+            return bid, "quote"
+        if last > 0 and _yahoo_last_trade_is_fresh(r, mark_now=mark_now, max_age=max_age):
+            return last, "trade"
+        return None, None
+
+
+def _yahoo_last_trade_is_fresh(
+    row,
+    *,
+    mark_now: datetime,
+    max_age: timedelta,
+) -> bool:
+    """True when lastTradeDate is present and within max_age of mark_now (ET)."""
+    raw = None
+    for key in ("lastTradeDate", "lastTradeDateUtc", "lastTrade"):
+        if hasattr(row, "index") and key in row.index:
+            raw = row[key]
+            break
+        if isinstance(row, dict) and key in row:
+            raw = row[key]
+            break
+    if raw is None or (isinstance(raw, float) and raw != raw):
+        return False
+    try:
+        ts = pd.Timestamp(raw)
+    except (TypeError, ValueError):
+        return False
+    if pd.isna(ts):
+        return False
+    if ts.tzinfo is None:
+        # yfinance often emits naive UTC or exchange-local; treat as UTC then ET.
+        traded = ts.to_pydatetime().replace(tzinfo=ZoneInfo("UTC")).astimezone(ET)
+    else:
+        traded = ts.to_pydatetime().astimezone(ET)
+    age = mark_now - traded
+    return timedelta(0) <= age <= max_age

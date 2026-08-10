@@ -362,6 +362,8 @@ def test_migration_preserves_existing_rows(tmp_path):
     for col in (
         "marked_t1h_at", "marked_t1d_at", "marked_exp_at",
         "mark_close", "marked_close_at", "close_method",
+        "mark_t15m", "marked_t15m_at", "method_t15m",
+        "mark_t30m", "marked_t30m_at", "method_t30m",
     ):
         assert col in cols_after
     after = conn.execute(

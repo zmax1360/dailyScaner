@@ -215,6 +215,8 @@ class MassiveSource:
         self.last_chain_contracts: int = 0
         self.last_chain_used_strike_window: bool = False
         self.last_chain_spot: float | None = None
+        # Per-ticker chain cache for short-horizon exit marks (one fetch / run).
+        self._exit_chain_cache: dict[str, pd.DataFrame] = {}
 
     def _request(
         self,
@@ -429,6 +431,53 @@ class MassiveSource:
             return None
         except Exception:
             return None
+
+    def _exit_chain(self, ticker: str) -> pd.DataFrame:
+        """Cached near-term chain for exit marks — max_dte=7, once per ticker."""
+        key = str(ticker).upper()
+        cached = self._exit_chain_cache.get(key)
+        if cached is not None:
+            return cached
+        chain = self.fetch_chain(ticker, max_dte=7)
+        self._exit_chain_cache[key] = chain
+        return chain
+
+    def fetch_option_exit(
+        self,
+        ticker: str,
+        side: str,
+        strike: float,
+        expiry: str,
+    ) -> tuple[float | None, str | None]:
+        """Live BID (quote) or last trade — never mid. For t15m/t30m exits."""
+        try:
+            chain = self._exit_chain(ticker)
+            want = str(side).upper()
+            exp = str(expiry)[:10]
+            sub = chain[
+                (chain["side"] == want)
+                & (chain["expiry"].astype(str).str[:10] == exp)
+                & ((chain["strike"] - float(strike)).abs() < 1e-6)
+            ]
+            if sub.empty:
+                raise ValueError(
+                    f"strike not found: {ticker} {side} {strike} {expiry}"
+                )
+            r = sub.iloc[0]
+            bid, last = float(r["bid"]), float(r["last"])
+            if bid == bid and bid > 0:
+                return bid, "quote"
+            if last == last and last > 0:
+                return last, "trade"
+            return None, None
+        except ValueError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "fetch_option_exit failed %s %s %s %s: %s",
+                ticker, side, strike, expiry, exc,
+            )
+            return None, None
 
 
 def _interval_to_agg(interval: str) -> tuple[int, str]:

@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-mark_runner.py — Write-once T+1h / T+1d / close / expiry marks for attribution.
+mark_runner.py — Write-once marks for attribution.
 
   python mark_runner.py --dry-run
   python mark_runner.py
   python mark_runner.py --expiry-only
   python mark_runner.py --force          # ignore market-hours gate
 
-Close marks are due at 16:15 ET on the flag's session date (buy-and-hold-to-
-close). Expiry marks use intrinsic from the underlying close on expiry day.
-Horizons run t1h → t1d → close → expiry. A wall-clock runtime cap exits 0 so
-launchd's next StartInterval gets a clean slot.
+Short horizons (t15m / t30m) store the live BID as an exit fill (method=quote
+or trade). Due times at/after 16:00 ET are sealed method=unavailable — never
+clamped to the close. t1h/t1d/close/expiry behaviour is unchanged.
+
+Horizons run t15m → t30m → t1h → t1d → close → expiry. A wall-clock runtime
+cap exits 0 so launchd's next StartInterval gets a clean slot.
 """
 
 from __future__ import annotations
@@ -25,13 +27,16 @@ from datetime import date, datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 from attribution import (
+    CASH_CLOSE_TIME,
     CLOSE_MARK_TIME,
     default_db_path,
     due_for_marking,
+    fetch_option_exit,
     fetch_option_mid,
     note_mark_failure,
     note_stale_horizon,
     now_et,
+    resolve_market_data_source_name,
     write_mark,
 )
 from logging_config import setup_logging
@@ -55,8 +60,11 @@ T1H_STALE_MARKET_HOURS = 4.0
 _CLOSE_0DTE_ABS_TOL = 0.25
 _CLOSE_0DTE_REL_TOL = 0.05
 
-# Time-sensitive first — close before expiry (close is unrecoverable next day).
-HORIZON_PRIORITY: tuple[str, ...] = ("t1h", "t1d", "close", "expiry")
+# Time-sensitive first — short exits before hold marks; close before expiry.
+HORIZON_PRIORITY: tuple[str, ...] = (
+    "t15m", "t30m", "t1h", "t1d", "close", "expiry",
+)
+SHORT_HORIZONS = frozenset({"t15m", "t30m"})
 
 log = logging.getLogger("mark_runner")
 
@@ -188,11 +196,23 @@ def due_datetime(ts_et: datetime | str, horizon: str) -> datetime:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=ET)
     ts = ts.astimezone(ET)
+    if horizon == "t15m":
+        return ts + timedelta(minutes=15)
+    if horizon == "t30m":
+        return ts + timedelta(minutes=30)
     if horizon == "t1h":
         return ts + timedelta(hours=1)
     if horizon == "t1d":
         return ts + timedelta(days=1)
-    raise ValueError(f"due_datetime only for t1h/t1d, got {horizon}")
+    raise ValueError(f"due_datetime only for t15m/t30m/t1h/t1d, got {horizon}")
+
+
+def short_mark_due_after_cash_close(ts_et: datetime | str, horizon: str) -> bool:
+    """True when the short-horizon due instant falls at/after 16:00 ET."""
+    if horizon not in SHORT_HORIZONS:
+        return False
+    due = due_datetime(ts_et, horizon)
+    return due.time() >= CASH_CLOSE_TIME
 
 
 def is_past_staleness_ceiling(
@@ -203,9 +223,10 @@ def is_past_staleness_ceiling(
     """
     True when too much *market* time has elapsed since first_markable_at(due).
 
+    t15m/t30m: past cash close (16:00 ET) on the due session — exit window gone
     t1h: > 4 market hours
     t1d: > one full mark session (09:30–16:15)
-    expiry: never stale under this rule
+    expiry/close: never stale under this rule (close uses is_close_stale)
     """
     if horizon in ("expiry", "close"):
         # close uses is_close_stale (session-date rule), not market-hours elapsed.
@@ -213,6 +234,13 @@ def is_past_staleness_ceiling(
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=ET)
     as_of = as_of.astimezone(ET)
+    if horizon in SHORT_HORIZONS:
+        # Due-after-16:00 is unavailable, not stale — handled separately.
+        if short_mark_due_after_cash_close(ts_et, horizon):
+            return False
+        due = due_datetime(ts_et, horizon)
+        cash = datetime.combine(due.date(), CASH_CLOSE_TIME, tzinfo=ET)
+        return as_of >= cash
     first = first_markable_at(due_datetime(ts_et, horizon))
     elapsed = market_hours_between(first, as_of)
     if horizon == "t1h":
@@ -342,10 +370,14 @@ def _mark_horizon(
     db_path: str | None = None,
     deadline: float | None = None,
     underlying_cache: dict[tuple[str, str], float | None] | None = None,
+    market_source=None,
 ) -> tuple[int, int, bool]:
     """
     Returns (attempted, written, stopped_early).
     stopped_early True when the runtime deadline fired mid-horizon.
+
+    ``market_source`` is constructed once per runner pass and reused so Massive
+    can cache the exit chain per ticker (no per-contract full-chain fetch).
     """
     as_of = as_of or now_et()
     cache = underlying_cache if underlying_cache is not None else {}
@@ -362,12 +394,55 @@ def _mark_horizon(
             return attempted, written, True
 
         fid = int(r["flag_id"])
+
+        # Short horizons: due at/after 16:00 ET → seal unavailable (no network).
+        if horizon in SHORT_HORIZONS and short_mark_due_after_cash_close(
+            r["ts_et"], horizon,
+        ):
+            attempted += 1
+            if dry_run:
+                log.info(
+                    "dry-run unavailable %s flag_id=%s — due after 16:00 ET",
+                    horizon, fid,
+                )
+                continue
+            ok = write_mark(
+                fid, horizon, None, db_path=db_path,  # type: ignore[arg-type]
+                mark_method="unavailable",
+            )
+            if ok:
+                written += 1
+            log.info(
+                "unavailable %s flag_id=%s — due after cash close (%s)",
+                horizon, fid, "sealed" if ok else "already sealed",
+            )
+            continue
+
         stale = False
         if horizon == "close":
             stale = is_close_stale(r["ts_et"], as_of)
-        elif horizon in ("t1h", "t1d"):
+        elif horizon in ("t15m", "t30m", "t1h", "t1d"):
             stale = is_past_staleness_ceiling(horizon, r["ts_et"], as_of)
         if stale:
+            if horizon in SHORT_HORIZONS:
+                attempted += 1
+                if dry_run:
+                    log.info(
+                        "dry-run stale %s flag_id=%s — would seal method=stale",
+                        horizon, fid,
+                    )
+                else:
+                    ok = write_mark(
+                        fid, horizon, None, db_path=db_path,  # type: ignore[arg-type]
+                        mark_method="stale",
+                    )
+                    if ok:
+                        written += 1
+                    log.info(
+                        "stale %s flag_id=%s — %s, no price",
+                        horizon, fid, "sealed" if ok else "already sealed",
+                    )
+                continue
             if dry_run:
                 log.info(
                     "dry-run stale %s flag_id=%s — would note, no mark",
@@ -384,6 +459,7 @@ def _mark_horizon(
         attempted += 1
         mid: float | None = None
         close_method: str | None = None
+        mark_method: str | None = None
         try:
             if horizon == "expiry":
                 exp = date.fromisoformat(str(r["expiry"])[:10])
@@ -407,9 +483,15 @@ def _mark_horizon(
                 mid = option_intrinsic(str(r["side"]), float(r["strike"]), u_close)
             elif horizon == "close":
                 mid, close_method = _fetch_close_mark(r, cache=cache)
+            elif horizon in SHORT_HORIZONS:
+                mid, mark_method = fetch_option_exit(
+                    r["ticker"], r["side"], float(r["strike"]), str(r["expiry"]),
+                    source=market_source,
+                )
             else:
                 mid = fetch_option_mid(
                     r["ticker"], r["side"], float(r["strike"]), str(r["expiry"]),
+                    source=market_source,
                 )
         except ValueError as exc:
             reason = str(exc) or "permanent"
@@ -428,31 +510,46 @@ def _mark_horizon(
                     reason, "noted" if noted else "already noted",
                 )
             continue
+        except Exception as exc:
+            # Never abort the run on a single-quote failure.
+            log.info(
+                "skip %s flag_id=%s %s %s %s — fetch error: %s",
+                horizon, fid, r["ticker"], r["side"], r["strike"], exc,
+            )
+            continue
 
         if mid is None:
             # Transient empty quote — leave unmarked for a later pass.
             log.info(
-                "skip %s flag_id=%s %s %s %s — no mid (transient)",
+                "skip %s flag_id=%s %s %s %s — no %s (transient)",
                 horizon, fid, r["ticker"], r["side"], r["strike"],
+                "bid/trade" if horizon in SHORT_HORIZONS else "mid",
             )
             continue
         if dry_run:
             log.info(
-                "dry-run %s flag_id=%s → mid=%.4f%s",
+                "dry-run %s flag_id=%s → px=%.4f%s",
                 horizon, fid, mid,
-                f" method={close_method}" if close_method else "",
+                (
+                    f" method={mark_method}" if mark_method
+                    else (f" method={close_method}" if close_method else "")
+                ),
             )
             continue
         ok = write_mark(
             fid, horizon, mid, db_path=db_path,  # type: ignore[arg-type]
             close_method=close_method,
+            mark_method=mark_method,
         )
         if ok:
             written += 1
             log.info(
-                "marked %s flag_id=%s mid=%.4f%s",
+                "marked %s flag_id=%s px=%.4f%s",
                 horizon, fid, mid,
-                f" method={close_method}" if close_method else "",
+                (
+                    f" method={mark_method}" if mark_method
+                    else (f" method={close_method}" if close_method else "")
+                ),
             )
         else:
             log.info(
@@ -610,14 +707,27 @@ def main(argv: list[str] | None = None) -> int:
             horizons = HORIZON_PRIORITY
         else:
             log.info(
-                "outside t1h/t1d window (09:30–16:15 ET) — close + expiry pass"
-                "%s",
+                "outside live-quote window (09:30–16:15 ET) — "
+                "short-seal + close + expiry pass%s",
                 " (in close-quote window 16:15–17:00)" if in_close_quote_window()
                 else "",
             )
-            horizons = ("close", "expiry")
+            # t15m/t30m still run to seal unavailable/stale (no quote needed).
+            horizons = ("t15m", "t30m", "close", "expiry")
 
         underlying_cache: dict[tuple[str, str], float | None] = {}
+        market_source = None
+        try:
+            from sources import get_source
+            src_name = resolve_market_data_source_name()
+            market_source = get_source(src_name)
+            log.info("market_data_source=%s", src_name)
+        except Exception as exc:
+            log.error(
+                "failed to construct market_data_source — exit/mid fetches "
+                "will resolve per-call: %s",
+                exc,
+            )
         for h in horizons:
             if _deadline_exceeded(deadline):
                 log.warning(
@@ -630,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 deadline=deadline,
                 underlying_cache=underlying_cache,
+                market_source=market_source,
             )
             log.info("%s: due=%d written=%d", h, a, w)
             if stopped:

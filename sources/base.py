@@ -63,6 +63,19 @@ class MarketDataSource(Protocol):
         expiry: str,
     ) -> float | None: ...
 
+    def fetch_option_exit(
+        self,
+        ticker: str,
+        side: str,
+        strike: float,
+        expiry: str,
+    ) -> tuple[float | None, str | None]:
+        """
+        Exit fill for short-horizon marks: (bid, 'quote') or (last, 'trade').
+        (None, None) = transient; raise ValueError for permanent miss.
+        """
+        ...
+
 
 def validate_chain(df: pd.DataFrame) -> pd.DataFrame:
     """

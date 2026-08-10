@@ -25,10 +25,17 @@ import pandas as pd
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger("attribution")
 
-Horizon = Literal["t1h", "t1d", "close", "expiry"]
+Horizon = Literal["t15m", "t30m", "t1h", "t1d", "close", "expiry"]
+ShortHorizon = Literal["t15m", "t30m"]
 
 # Session close (ET). Same-session flags become due for mark_close at/after this.
 CLOSE_MARK_TIME = dtime(16, 15)
+# Cash equity close — short-horizon exit marks due at/after this are unavailable
+# (never clamped to the close print).
+CASH_CLOSE_TIME = dtime(16, 0)
+
+# Allowed method_* values for t15m / t30m exit marks (bid fill, not mid).
+SHORT_MARK_METHODS = frozenset({"quote", "trade", "stale", "unavailable"})
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -70,11 +77,17 @@ CREATE TABLE IF NOT EXISTS flags (
     mark_t1d    REAL,
     mark_close  REAL,
     mark_expiry REAL,
+    mark_t15m   REAL,
+    mark_t30m   REAL,
     marked_t1h_at TEXT,
     marked_t1d_at TEXT,
     marked_close_at TEXT,
     marked_exp_at TEXT,
+    marked_t15m_at TEXT,
+    marked_t30m_at TEXT,
     close_method  TEXT,
+    method_t15m   TEXT,
+    method_t30m   TEXT,
     dte           INTEGER,
     volume        INTEGER,
     open_interest INTEGER,
@@ -108,21 +121,46 @@ SELECT
     f.base_score,
     f.multipliers,
     f.mid,
+    f.ask,
     f.is_control,
     f.mark_t1h,
     f.mark_t1d,
     f.mark_close,
     f.mark_expiry,
+    f.mark_t15m,
+    f.mark_t30m,
     f.marked_t1h_at,
     f.marked_t1d_at,
     f.marked_close_at,
     f.marked_exp_at,
+    f.marked_t15m_at,
+    f.marked_t30m_at,
     f.close_method,
+    f.method_t15m,
+    f.method_t30m,
     r.config_hash,
     r.engine_sha,
     r.daily_bias,
     r.market_state,
     r.news_bias,
+    -- Short-horizon primary return: ask entry / bid exit (not mid).
+    CASE
+        WHEN f.ask IS NOT NULL AND f.ask > 0 AND f.mark_t15m IS NOT NULL
+        THEN (f.mark_t15m - f.ask) / f.ask
+    END AS ret_t15m,
+    CASE
+        WHEN f.ask IS NOT NULL AND f.ask > 0 AND f.mark_t30m IS NOT NULL
+        THEN (f.mark_t30m - f.ask) / f.ask
+    END AS ret_t30m,
+    -- Mid-based short-horizon returns kept for comparison only.
+    CASE
+        WHEN f.mid IS NOT NULL AND f.mid > 0 AND f.mark_t15m IS NOT NULL
+        THEN (f.mark_t15m - f.mid) / f.mid
+    END AS ret_t15m_mid,
+    CASE
+        WHEN f.mid IS NOT NULL AND f.mid > 0 AND f.mark_t30m IS NOT NULL
+        THEN (f.mark_t30m - f.mid) / f.mid
+    END AS ret_t30m_mid,
     CASE
         WHEN f.mid IS NOT NULL AND f.mid > 0 AND f.mark_t1h IS NOT NULL
         THEN (f.mark_t1h - f.mid) / f.mid
@@ -139,6 +177,14 @@ SELECT
         WHEN f.mid IS NOT NULL AND f.mid > 0 AND f.mark_expiry IS NOT NULL
         THEN (f.mark_expiry - f.mid) / f.mid
     END AS ret_expiry,
+    CASE
+        WHEN f.marked_t15m_at IS NOT NULL
+        THEN ROUND((julianday(f.marked_t15m_at) - julianday(f.ts_et)) * 24 * 60, 2)
+    END AS minutes_t15m,
+    CASE
+        WHEN f.marked_t30m_at IS NOT NULL
+        THEN ROUND((julianday(f.marked_t30m_at) - julianday(f.ts_et)) * 24 * 60, 2)
+    END AS minutes_t30m,
     CASE
         WHEN f.marked_t1h_at IS NOT NULL
         THEN ROUND((julianday(f.marked_t1h_at) - julianday(f.ts_et)) * 24, 2)
@@ -192,6 +238,13 @@ _FLAG_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
     ("realized_vol_20d", "REAL"),
     ("iv_premium", "REAL"),
     ("pool", "TEXT"),  # '0DTE' | '1DTE+' — rank is within-pool (engine-v1.2)
+    # Short-horizon exit marks (bid fill) — additive; does not change scoring
+    ("mark_t15m", "REAL"),
+    ("marked_t15m_at", "TEXT"),
+    ("method_t15m", "TEXT"),
+    ("mark_t30m", "REAL"),
+    ("marked_t30m_at", "TEXT"),
+    ("method_t30m", "TEXT"),
 )
 
 _RUN_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
@@ -201,11 +254,19 @@ _RUN_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
 )
 
 _MARK_AT_COL = {
+    "t15m": "marked_t15m_at",
+    "t30m": "marked_t30m_at",
     "t1h": "marked_t1h_at",
     "t1d": "marked_t1d_at",
     "close": "marked_close_at",
     "expiry": "marked_exp_at",
 }
+
+_MARK_METHOD_COL = {
+    "t15m": "method_t15m",
+    "t30m": "method_t30m",
+}
+
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
@@ -216,6 +277,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # Index after migrate — mark_close is absent on pre-migration flags tables.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_flags_due_close ON flags(mark_close, ts_et)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_flags_due_t15m ON flags(mark_t15m, ts_et)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_flags_due_t30m ON flags(mark_t30m, ts_et)"
     )
     run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
     for col, sql_type in _RUN_MIGRATE_COLS:
@@ -836,17 +903,29 @@ def due_for_marking(
         as_of = as_of.replace(tzinfo=ET)
     as_of = as_of.astimezone(ET)
 
-    if horizon == "t1h":
+    if horizon == "t15m":
+        col = "mark_t15m"
+        method_col = "method_t15m"
+        cutoff = as_of - timedelta(minutes=15)
+    elif horizon == "t30m":
+        col = "mark_t30m"
+        method_col = "method_t30m"
+        cutoff = as_of - timedelta(minutes=30)
+    elif horizon == "t1h":
         col = "mark_t1h"
+        method_col = None
         cutoff = as_of - timedelta(hours=1)
     elif horizon == "t1d":
         col = "mark_t1d"
+        method_col = None
         cutoff = as_of - timedelta(days=1)
     elif horizon == "close":
         col = "mark_close"
+        method_col = None
         cutoff = as_of  # unused — session-date rule below
     elif horizon == "expiry":
         col = "mark_expiry"
+        method_col = None
         cutoff = as_of  # expiry < today handled in SQL
     else:
         raise ValueError(f"unknown horizon: {horizon}")
@@ -894,6 +973,27 @@ def due_for_marking(
                   AND (r.run_kind IS NULL OR r.run_kind != 'eod')
                 """,
                 (*sess_args, f"%{stale_tag}%", fail_like),
+            ).fetchall()
+        elif method_col is not None:
+            # Short horizons: sealed when mark OR method is set (unavailable/
+            # stale seal mark=NULL + method=…). Guard remains mark IS NULL for
+            # price writes; method IS NULL excludes sealed non-price rows.
+            stale_tag = f"stale:{horizon}"
+            rows = conn.execute(
+                f"""
+                SELECT f.flag_id, f.ticker, f.side, f.strike, f.expiry,
+                       f.mid, f.ts_et, f.notes, f.dte
+                FROM flags f
+                LEFT JOIN runs r ON r.run_id = f.run_id
+                WHERE f.{col} IS NULL
+                  AND f.{method_col} IS NULL
+                  AND f.ts_et <= ?
+                  AND (f.notes IS NULL OR f.notes NOT LIKE ?)
+                  AND (f.notes IS NULL OR f.notes NOT LIKE ?)
+                  AND (f.notes IS NULL OR f.notes NOT LIKE '%n/a:eod%')
+                  AND (r.run_kind IS NULL OR r.run_kind != 'eod')
+                """,
+                (cutoff_iso, f"%{stale_tag}%", fail_like),
             ).fetchall()
         else:
             stale_tag = f"stale:{horizon}"
@@ -993,12 +1093,78 @@ def write_mark(
     *,
     db_path: str | None = None,
     close_method: str | None = None,
+    mark_method: str | None = None,
 ) -> bool:
     """
-    Write-once mark. Returns True if written, False if already set or value is None.
-    Never writes 0.0 as a stand-in for a failed fetch — callers must pass None.
-    Only expiry may be exactly 0.0 (OTM intrinsic). close rejects 0.0 like t1h/t1d.
+    Write-once mark. Returns True if written, False if already set or refused.
+
+    Never writes 0.0 as a stand-in for a failed fetch — callers must pass None
+    (except expiry OTM intrinsic, and short-horizon seal-only methods).
+
+    Short horizons (t15m/t30m): store BID (or last as method='trade'). Seal-only
+    methods ``stale`` / ``unavailable`` write method_* + marked_*_at with
+    mark_* left NULL. Idempotent on ``mark_* IS NULL`` (and method_* IS NULL
+    for short horizons).
     """
+    at_col = _MARK_AT_COL[horizon]
+    marked_at = now_et().astimezone(ET).isoformat(timespec="seconds")
+
+    # ── Short-horizon exit marks (bid fill) ───────────────────────────────────
+    if horizon in ("t15m", "t30m"):
+        col = "mark_t15m" if horizon == "t15m" else "mark_t30m"
+        method_col = _MARK_METHOD_COL[horizon]
+        method = str(mark_method or "").strip().lower()
+        if method not in SHORT_MARK_METHODS:
+            log.warning(
+                "refusing %s mark without mark_method in %s flag_id=%s got %r",
+                horizon, sorted(SHORT_MARK_METHODS), flag_id, mark_method,
+            )
+            return False
+
+        # Seal-only: due after cash close, or missed the exit window.
+        if method in ("stale", "unavailable"):
+            if value is not None:
+                log.warning(
+                    "refusing %s seal method=%s with a price flag_id=%s",
+                    horizon, method, flag_id,
+                )
+                return False
+            with _db(db_path) as conn:
+                cur = conn.execute(
+                    f"""
+                    UPDATE flags
+                    SET {method_col} = ?, {at_col} = ?
+                    WHERE flag_id = ?
+                      AND {col} IS NULL
+                      AND {method_col} IS NULL
+                    """,
+                    (method, marked_at, int(flag_id)),
+                )
+                return cur.rowcount == 1
+
+        if value is None:
+            return False
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return False
+        if v <= 0.0 or not math.isfinite(v):
+            log.warning("refusing non-positive %s mark for flag_id=%s: %s",
+                        horizon, flag_id, v)
+            return False
+        with _db(db_path) as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE flags
+                SET {col} = ?, {at_col} = ?, {method_col} = ?
+                WHERE flag_id = ?
+                  AND {col} IS NULL
+                  AND {method_col} IS NULL
+                """,
+                (v, marked_at, method, int(flag_id)),
+            )
+            return cur.rowcount == 1
+
     if value is None:
         return False
     try:
@@ -1017,8 +1183,6 @@ def write_mark(
         "close": "mark_close",
         "expiry": "mark_expiry",
     }[horizon]
-    at_col = _MARK_AT_COL[horizon]
-    marked_at = now_et().astimezone(ET).isoformat(timespec="seconds")
     with _db(db_path) as conn:
         if horizon == "close":
             method = str(close_method or "").strip().lower()
@@ -1051,6 +1215,25 @@ def write_mark(
         return cur.rowcount == 1
 
 
+def resolve_market_data_source_name() -> str:
+    """
+    Resolve SCORING['market_data_source'].
+
+    Configured in config.py SCORING (not env). If the key is absent, log.error
+    naming the key and the fallback — never silent.
+    """
+    from config import SCORING
+
+    if "market_data_source" not in SCORING:
+        log.error(
+            "SCORING missing key %r — falling back to %r",
+            "market_data_source",
+            "yahoo",
+        )
+        return "yahoo"
+    return str(SCORING["market_data_source"])
+
+
 def fetch_option_mid(
     ticker: str,
     side: str,
@@ -1068,9 +1251,8 @@ def fetch_option_mid(
     """
     try:
         if source is None:
-            from config import SCORING
             from sources import get_source
-            source = get_source(str(SCORING.get("market_data_source", "yahoo")))
+            source = get_source(resolve_market_data_source_name())
         return source.fetch_option_mid(ticker, side, strike, expiry)
     except ValueError:
         # Permanent (expiry/strike not found) — caller must note & skip retries.
@@ -1078,3 +1260,48 @@ def fetch_option_mid(
     except Exception as exc:
         log.debug("fetch_option_mid failed: %s", exc)
         return None
+
+
+def fetch_option_exit(
+    ticker: str,
+    side: str,
+    strike: float,
+    expiry: str,
+    *,
+    source=None,
+) -> tuple[float | None, str | None]:
+    """
+    Live exit fill for short horizons: prefer BID (method='quote'), else last
+    trade (method='trade'). Never returns mid. Never invents a price.
+
+    Returns (price, method) or (None, None) on transient miss.
+    Re-raises ValueError for permanent failures (unknown expiry / strike).
+
+    No as-of/historical path — wired sources are live-only. Historical rows
+    cannot be backfilled with a true bid-at-timestamp from this stack.
+
+    Prefer constructing ``source`` once per mark_runner pass and passing it
+    in — Massive caches the exit chain on the instance.
+    """
+    try:
+        if source is None:
+            from sources import get_source
+            source = get_source(resolve_market_data_source_name())
+        fetch = getattr(source, "fetch_option_exit", None)
+        if callable(fetch):
+            return fetch(ticker, side, strike, expiry)
+        log.error(
+            "source %r has no fetch_option_exit — cannot mark exit "
+            "%s %s %s %s",
+            getattr(source, "name", type(source).__name__),
+            ticker, side, strike, expiry,
+        )
+        return None, None
+    except ValueError:
+        raise
+    except Exception as exc:
+        log.warning(
+            "fetch_option_exit failed %s %s %s %s: %s",
+            ticker, side, strike, expiry, exc,
+        )
+        return None, None

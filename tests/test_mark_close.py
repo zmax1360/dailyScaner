@@ -72,8 +72,9 @@ def _seed(
 
 
 def test_horizon_priority_close_before_expiry():
-    assert HORIZON_PRIORITY == ("t1h", "t1d", "close", "expiry")
+    assert HORIZON_PRIORITY == ("t15m", "t30m", "t1h", "t1d", "close", "expiry")
     assert HORIZON_PRIORITY.index("close") < HORIZON_PRIORITY.index("expiry")
+    assert HORIZON_PRIORITY.index("t15m") < HORIZON_PRIORITY.index("t1h")
 
 
 def test_mark_window_excludes_close_quote_band():

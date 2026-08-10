@@ -7,6 +7,7 @@ No network, no globbing, no "latest file" resolution. Pass a path or dict.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ import pandas as pd
 from sources.base import CHAIN_COLUMNS, validate_chain
 
 ET = ZoneInfo("America/New_York")
+log = logging.getLogger("sources.fixture")
 
 
 def _as_float(v: Any, *, zero_to_nan: bool = False) -> float:
@@ -175,3 +177,43 @@ class FixtureSource:
                 return last
             return None
         return None
+
+    def fetch_option_exit(
+        self,
+        ticker: str,
+        side: str,
+        strike: float,
+        expiry: str,
+    ) -> tuple[float | None, str | None]:
+        """Live BID (quote) or last trade — never mid. For t15m/t30m exits."""
+        try:
+            want = str(side).upper()
+            exp = str(expiry)[:10]
+            vol = self._payload.get("volume") or {}
+            key = "top_calls" if want == "CALL" else "top_puts"
+            for c in vol.get(key) or []:
+                if str(c.get("expiry") or "")[:10] != exp:
+                    continue
+                try:
+                    if abs(float(c.get("strike")) - float(strike)) > 1e-6:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                bid = _as_float(c.get("bid"))
+                last = _as_float(c.get("lastPrice", c.get("last")))
+                if bid == bid and bid > 0:
+                    return bid, "quote"
+                if last == last and last > 0:
+                    return last, "trade"
+                return None, None
+            raise ValueError(
+                f"strike not found: {ticker} {side} {strike} {expiry}"
+            )
+        except ValueError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "fetch_option_exit failed %s %s %s %s: %s",
+                ticker, side, strike, expiry, exc,
+            )
+            return None, None
