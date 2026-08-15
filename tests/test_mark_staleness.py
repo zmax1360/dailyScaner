@@ -84,9 +84,9 @@ def test_expiry_mark_exempt_from_staleness(tmp_path, monkeypatch):
     """Expiry marks remain writable regardless of wall/market age."""
     db = str(tmp_path / "stale_exp.db")
     # Flag days ago; expiry already past
-    ts = _et(2026, 7, 1, 10, 0)
-    fid = _seed_flag(db, ts=ts, expiry="2026-07-10")
-    as_of = _et(2026, 7, 20, 12, 0)
+    ts = _et(2026, 8, 10, 10, 0)
+    fid = _seed_flag(db, ts=ts, expiry="2026-08-14")
+    as_of = _et(2026, 8, 20, 12, 0)
     assert is_past_staleness_ceiling("expiry", ts, as_of) is False
 
     # Intrinsic from underlying close: CALL 250 @ underlying 251.25 → 1.25

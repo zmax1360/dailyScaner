@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from sources.base import CHAIN_COLUMNS, MarketDataSource, validate_chain
-from sources.yahoo import YahooSource, chain_frame_from_yahoo_legs
+from sources.yahoo import (
+    YahooSource,
+    _YF_RATE_LIMIT_ATTEMPTS,
+    _YF_RATE_LIMIT_SLEEP_SEC,
+    _yf_retry,
+    chain_frame_from_yahoo_legs,
+)
 
 GOLDEN = Path(__file__).resolve().parent / "golden"
 
@@ -88,3 +96,109 @@ def test_yahoo_emits_nan_delta_not_default():
     d = float(df.loc[0, "delta"])
     assert math.isnan(d)
     assert d != 0.5
+
+
+def _fake_option_chain(strike: float = 200.0):
+    leg = pd.DataFrame([{
+        "strike": strike,
+        "lastPrice": 1.30,
+        "volume": 10.0,
+        "openInterest": 100.0,
+        "impliedVolatility": 0.3,
+        "bid": 1.25,
+        "ask": 1.35,
+        "lastTradeDate": pd.Timestamp.now(tz="UTC"),
+    }])
+    return SimpleNamespace(calls=leg.copy(), puts=leg.copy())
+
+
+def test_yahoo_option_chain_cached_per_ticker_expiry(monkeypatch):
+    """~500 contracts across few expiries → few HTTP option_chain calls."""
+    src = YahooSource()
+    calls: list[tuple[str, str]] = []
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def option_chain(self, expiry):
+            calls.append((str(self.ticker).upper(), str(expiry)[:10]))
+            return _fake_option_chain()
+
+    monkeypatch.setattr("sources.yahoo.yf.Ticker", FakeTicker)
+
+    expiries = [f"2026-08-{d:02d}" for d in (10, 11, 14, 15, 21)]
+    # Simulate a mark pass: 500 contracts, 2 tickers, 5 expiries shared.
+    # Strike varies but chain HTTP is keyed only by (ticker, expiry).
+    n_contracts = 0
+    for ticker in ("AAPL", "NVDA"):
+        for i in range(250):
+            exp = expiries[i % len(expiries)]
+            mid = src.fetch_option_mid(ticker, "CALL", 200.0, exp)
+            exit_px, method = src.fetch_option_exit(ticker, "CALL", 200.0, exp)
+            assert mid == pytest.approx(1.30)
+            assert exit_px == pytest.approx(1.25) and method == "quote"
+            n_contracts += 1
+
+    assert n_contracts == 500
+    # Before cache: 500 mid + 500 exit = 1000 HTTP calls.
+    # After: one call per (ticker, expiry) = 2 * 5 = 10.
+    assert len(calls) == 10
+    assert src.option_chain_fetches == 10
+    assert len(src._option_chain_cache) == 10
+
+
+def test_yahoo_cache_is_per_instance_not_global(monkeypatch):
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def option_chain(self, expiry):
+            return _fake_option_chain()
+
+    monkeypatch.setattr("sources.yahoo.yf.Ticker", FakeTicker)
+    a = YahooSource()
+    b = YahooSource()
+    a.fetch_option_mid("AAPL", "CALL", 200.0, "2026-08-15")
+    assert a.option_chain_fetches == 1
+    assert b.option_chain_fetches == 0
+    b.fetch_option_mid("AAPL", "CALL", 200.0, "2026-08-15")
+    assert b.option_chain_fetches == 1
+
+
+def test_yf_retry_rate_limit_fail_fast(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(float(s)))
+
+    class YFRateLimitError(Exception):
+        pass
+
+    n = {"i": 0}
+
+    def boom():
+        n["i"] += 1
+        raise YFRateLimitError("Too Many Requests")
+
+    with pytest.raises(YFRateLimitError):
+        _yf_retry(boom, label="mid 2026-08-15", attempts=3, base_sleep=2.0)
+
+    assert n["i"] == _YF_RATE_LIMIT_ATTEMPTS
+    assert sleeps == [_YF_RATE_LIMIT_SLEEP_SEC]
+    assert sum(sleeps) <= 2.0  # was 15+30 under the old backoff
+
+
+def test_yf_retry_transient_keeps_exponential(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(float(s)))
+
+    n = {"i": 0}
+
+    def boom():
+        n["i"] += 1
+        raise ConnectionError("reset")
+
+    with pytest.raises(ConnectionError):
+        _yf_retry(boom, label="mid x", attempts=3, base_sleep=2.0)
+
+    assert n["i"] == 3
+    assert sleeps == [2.0, 4.0]

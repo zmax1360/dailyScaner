@@ -5,9 +5,11 @@ MOVE of existing fetch logic from dailyScaner / data_adapter / attribution.
 Callers are NOT rewired in this step — this module is additive only.
 
 Preserved intentionally (do not "fix" here):
-  - ``_yf_retry`` attempts / base_sleep / rate-limit backoff
   - bid/ask ``fillna(0)`` (chain_quality owns usability)
   - volume / openInterest ``fillna(0)`` as in dailyScaner.fetch_data
+
+Rate-limit path in ``_yf_retry`` is intentionally fail-fast (see constants):
+long 15s/30s sleeps starve mark_runner's 600s budget across hundreds of contracts.
 """
 
 from __future__ import annotations
@@ -26,13 +28,33 @@ from sources.base import CHAIN_COLUMNS, validate_chain
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger("sources.yahoo")
 
+# Transient network errors: keep brief exponential backoff.
+# Rate limits: one short retry then fail — mark_runner seals/skips and moves on.
+# Old path slept 15s+30s per contract and burned the 600s runtime cap.
+_YF_RATE_LIMIT_ATTEMPTS = 2       # initial try + 1 retry
+_YF_RATE_LIMIT_SLEEP_SEC = 1.0    # single backoff; never 15s/30s
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    msg = str(exc)
+    return (
+        name == "YFRateLimitError"
+        or "Too Many Requests" in msg
+        or "Rate limited" in msg
+    )
+
 
 def _yf_retry(fn, *, label: str, attempts: int = 5, base_sleep: float = 3.0):
     """Call Yahoo via yfinance with backoff on rate limits / transient errors.
 
     ValueError (e.g. expiry/strike not found) is permanent — never retried.
+    YFRateLimitError: at most ``_YF_RATE_LIMIT_ATTEMPTS`` tries with a short
+    sleep — prefer fail-fast over burning the mark_runner runtime budget.
+    Other transient errors keep the caller-supplied attempts / exponential sleep.
     """
     last_err = None
+    rate_limit_tries = 0
     for attempt in range(1, attempts + 1):
         try:
             return fn()
@@ -41,16 +63,16 @@ def _yf_retry(fn, *, label: str, attempts: int = 5, base_sleep: float = 3.0):
         except Exception as e:
             last_err = e
             name = type(e).__name__
-            rate_limited = (
-                name == "YFRateLimitError"
-                or "Too Many Requests" in str(e)
-                or "Rate limited" in str(e)
-            )
-            if attempt >= attempts:
-                break
-            wait = base_sleep * (2 ** (attempt - 1))
+            rate_limited = _is_rate_limit_error(e)
             if rate_limited:
-                wait = max(wait, 15.0 * attempt)
+                rate_limit_tries += 1
+                if rate_limit_tries >= _YF_RATE_LIMIT_ATTEMPTS:
+                    break
+                wait = _YF_RATE_LIMIT_SLEEP_SEC
+            else:
+                if attempt >= attempts:
+                    break
+                wait = base_sleep * (2 ** (attempt - 1))
             log.warning(
                 "Yahoo %s retry %d/%d after %.0fs (%s)",
                 label, attempt, attempts, wait, name,
@@ -170,12 +192,55 @@ def chain_frame_from_yahoo_legs(
     return validate_chain(pd.DataFrame(rows, columns=CHAIN_COLUMNS))
 
 
+# Sentinel: prior fetch for (ticker, expiry) failed this pass — do not re-hit.
+_CHAIN_FAILED = object()
+
+
 class YahooSource:
-    """yfinance-backed MarketDataSource. volume may carry prior session."""
+    """yfinance-backed MarketDataSource. volume may carry prior session.
+
+    Instance-scoped ``_option_chain_cache`` collapses per-contract
+    ``option_chain`` HTTP calls to one fetch per (ticker, expiry) for the
+    lifetime of this object. Construct once per mark_runner pass (see
+    mark_runner.main) — never reuse across passes or process-global.
+    """
 
     name = "yahoo"
     volume_is_session_scoped = False
     provides_quotes = True
+
+    def __init__(self) -> None:
+        # Mirrors MassiveSource._exit_chain_cache: per-instance, not persisted.
+        self._option_chain_cache: dict[tuple[str, str], Any] = {}
+        # Diagnostic counter — HTTP option_chain fetches this instance made.
+        self.option_chain_fetches: int = 0
+
+    def _option_chain(self, ticker: str, expiry: str):
+        """Cached yf.Ticker.option_chain — one HTTP call per (ticker, expiry)."""
+        key = (str(ticker).upper(), str(expiry)[:10])
+        cached = self._option_chain_cache.get(key)
+        if cached is _CHAIN_FAILED:
+            raise RuntimeError(
+                f"option_chain failed earlier this pass for {key[0]} {key[1]}"
+            )
+        if cached is not None:
+            return cached
+        t = yf.Ticker(ticker)
+        try:
+            chain = _yf_retry(
+                lambda: t.option_chain(key[1]),
+                label=f"chain {key[1]}",
+                attempts=3,
+                base_sleep=2.0,
+            )
+        except Exception as exc:
+            # Rate-limit: one burn per key this pass (not once per contract).
+            if _is_rate_limit_error(exc):
+                self._option_chain_cache[key] = _CHAIN_FAILED
+            raise
+        self._option_chain_cache[key] = chain
+        self.option_chain_fetches += 1
+        return chain
 
     def fetch_chain(self, ticker: str, *, max_dte: int) -> pd.DataFrame:
         t = yf.Ticker(ticker)
@@ -214,12 +279,7 @@ class YahooSource:
         all_puts: list[pd.DataFrame] = []
         for expiry in kept:
             try:
-                chain = _yf_retry(
-                    lambda e=expiry: t.option_chain(e),
-                    label=f"chain {expiry}",
-                    attempts=3,
-                    base_sleep=2.0,
-                )
+                chain = self._option_chain(ticker, expiry)
             except Exception:
                 continue
             for side_df, bucket in (
@@ -276,14 +336,8 @@ class YahooSource:
         Raises ValueError for permanent failures (unknown expiry / strike).
         Returns None only for transient/empty-quote cases that may succeed later.
         """
-        t = yf.Ticker(ticker)
         try:
-            chain = _yf_retry(
-                lambda: t.option_chain(expiry),
-                label=f"mid {expiry}",
-                attempts=3,
-                base_sleep=2.0,
-            )
+            chain = self._option_chain(ticker, expiry)
         except ValueError:
             raise
         except Exception:
@@ -327,14 +381,8 @@ class YahooSource:
             mark_now = mark_now.replace(tzinfo=ET)
         mark_now = mark_now.astimezone(ET)
 
-        t = yf.Ticker(ticker)
         try:
-            chain = _yf_retry(
-                lambda: t.option_chain(expiry),
-                label=f"exit {expiry}",
-                attempts=3,
-                base_sleep=2.0,
-            )
+            chain = self._option_chain(ticker, expiry)
         except ValueError:
             raise
         except Exception as exc:

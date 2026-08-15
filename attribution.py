@@ -36,6 +36,13 @@ CASH_CLOSE_TIME = dtime(16, 0)
 
 # Allowed method_* values for t15m / t30m exit marks (bid fill, not mid).
 SHORT_MARK_METHODS = frozenset({"quote", "trade", "stale", "unavailable"})
+# Close/expiry seal-only methods (mark left NULL — no invented price).
+CLOSE_SEAL_METHODS = frozenset({"stale", "unavailable"})
+
+# Live option quotes cannot recover sessions/expiries before the collection
+# window. ISO date prefix; compared with substr(ts_et, 1, 10) / substr(expiry, 1, 10)
+# — never SQLite date() on offset-aware ISO strings.
+UNMARKABLE_BEFORE = "2026-08-10"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -943,12 +950,15 @@ def due_for_marking(
                 WHERE {col} IS NULL
                   AND expiry < ?
                   AND (notes IS NULL OR notes NOT LIKE ?)
+                  AND (notes IS NULL OR notes NOT LIKE '%unavailable:expiry%')
                 """,
                 (today, fail_like),
             ).fetchall()
         elif horizon == "close":
             # Due at 16:15 ET on the flag's session date; also return prior
-            # sessions so mark_runner can write stale:close (unrecoverable).
+            # sessions so mark_runner can seal close_method=unavailable
+            # (live quote cannot recover a past session). Sealed rows are
+            # excluded by close_method IS NULL.
             stale_tag = "stale:close"
             sess = "substr(f.ts_et, 1, 10)"
             if as_of.time() >= CLOSE_MARK_TIME:
@@ -966,6 +976,7 @@ def due_for_marking(
                 FROM flags f
                 LEFT JOIN runs r ON r.run_id = f.run_id
                 WHERE f.{col} IS NULL
+                  AND f.close_method IS NULL
                   AND {sess_clause}
                   AND (f.notes IS NULL OR f.notes NOT LIKE ?)
                   AND (f.notes IS NULL OR f.notes NOT LIKE ?)
@@ -1103,8 +1114,10 @@ def write_mark(
 
     Short horizons (t15m/t30m): store BID (or last as method='trade'). Seal-only
     methods ``stale`` / ``unavailable`` write method_* + marked_*_at with
-    mark_* left NULL. Idempotent on ``mark_* IS NULL`` (and method_* IS NULL
-    for short horizons).
+    mark_* left NULL. Close seals the same way via close_method (mark_close
+    stays NULL). Expiry seals via notes ``unavailable:expiry`` + marked_exp_at
+    (no method_expiry column). Idempotent on mark_* IS NULL (and method IS NULL
+    for short/close seals).
     """
     at_col = _MARK_AT_COL[horizon]
     marked_at = now_et().astimezone(ET).isoformat(timespec="seconds")
@@ -1165,6 +1178,53 @@ def write_mark(
             )
             return cur.rowcount == 1
 
+    # Close / expiry seal-only — same shape as t15m: method + timestamp, mark NULL.
+    seal_method = str(close_method or mark_method or "").strip().lower()
+    if horizon == "close" and seal_method in CLOSE_SEAL_METHODS:
+        if value is not None:
+            log.warning(
+                "refusing close seal method=%s with a price flag_id=%s",
+                seal_method, flag_id,
+            )
+            return False
+        with _db(db_path) as conn:
+            cur = conn.execute(
+                """
+                UPDATE flags
+                SET close_method = ?, marked_close_at = ?
+                WHERE flag_id = ?
+                  AND mark_close IS NULL
+                  AND close_method IS NULL
+                """,
+                (seal_method, marked_at, int(flag_id)),
+            )
+            return cur.rowcount == 1
+
+    if horizon == "expiry" and seal_method == "unavailable":
+        if value is not None:
+            log.warning(
+                "refusing expiry seal method=unavailable with a price flag_id=%s",
+                flag_id,
+            )
+            return False
+        with _db(db_path) as conn:
+            cur = conn.execute(
+                """
+                UPDATE flags
+                SET marked_exp_at = COALESCE(marked_exp_at, ?),
+                    notes = CASE
+                        WHEN notes IS NULL OR notes = '' THEN 'unavailable:expiry'
+                        WHEN notes LIKE '%unavailable:expiry%' THEN notes
+                        ELSE notes || ';unavailable:expiry'
+                    END
+                WHERE flag_id = ?
+                  AND mark_expiry IS NULL
+                  AND (notes IS NULL OR notes NOT LIKE '%unavailable:expiry%')
+                """,
+                (marked_at, int(flag_id)),
+            )
+            return cur.rowcount == 1
+
     if value is None:
         return False
     try:
@@ -1199,8 +1259,20 @@ def write_mark(
                 SET mark_close = ?, marked_close_at = ?, close_method = ?
                 WHERE flag_id = ?
                   AND mark_close IS NULL
+                  AND close_method IS NULL
                 """,
                 (v, marked_at, method, int(flag_id)),
+            )
+        elif horizon == "expiry":
+            cur = conn.execute(
+                """
+                UPDATE flags
+                SET mark_expiry = ?, marked_exp_at = ?
+                WHERE flag_id = ?
+                  AND mark_expiry IS NULL
+                  AND (notes IS NULL OR notes NOT LIKE '%unavailable:expiry%')
+                """,
+                (v, marked_at, int(flag_id)),
             )
         else:
             cur = conn.execute(
@@ -1213,6 +1285,67 @@ def write_mark(
                 (v, marked_at, int(flag_id)),
             )
         return cur.rowcount == 1
+
+
+# One-time / recurrence-prevention seals. Predicate uses ISO date prefixes so
+# offset-aware ts_et cannot be reinterpreted by SQLite date(). The bound
+# `substr(...) < UNMARKABLE_BEFORE` excludes 2026-08-10 and every later day.
+SEAL_UNMARKABLE_CLOSE_SQL = """
+UPDATE flags
+SET close_method = 'unavailable',
+    marked_close_at = ?
+WHERE mark_close IS NULL
+  AND close_method IS NULL
+  AND substr(ts_et, 1, 10) < ?
+"""
+
+SEAL_UNMARKABLE_EXPIRY_SQL = """
+UPDATE flags
+SET marked_exp_at = COALESCE(marked_exp_at, ?),
+    notes = CASE
+        WHEN notes IS NULL OR notes = '' THEN 'unavailable:expiry'
+        WHEN notes LIKE '%unavailable:expiry%' THEN notes
+        ELSE notes || ';unavailable:expiry'
+    END
+WHERE mark_expiry IS NULL
+  AND substr(expiry, 1, 10) < ?
+  AND substr(ts_et, 1, 10) < ?
+  AND (notes IS NULL OR notes NOT LIKE '%unavailable:expiry%')
+"""
+
+
+def backfill_unmarkable_close_seals(
+    *,
+    db_path: str | None = None,
+    before: str = UNMARKABLE_BEFORE,
+    marked_at: str | None = None,
+) -> int:
+    """Seal pre-window close NULLs. Does not write mark_close. Returns rowcount."""
+    if before > UNMARKABLE_BEFORE:
+        raise ValueError(
+            f"close seal cutoff {before!r} must be <= {UNMARKABLE_BEFORE!r}"
+        )
+    ts = marked_at or now_et().astimezone(ET).isoformat(timespec="seconds")
+    with _db(db_path) as conn:
+        cur = conn.execute(SEAL_UNMARKABLE_CLOSE_SQL, (ts, before))
+        return cur.rowcount
+
+
+def backfill_unmarkable_expiry_seals(
+    *,
+    db_path: str | None = None,
+    before: str = UNMARKABLE_BEFORE,
+    marked_at: str | None = None,
+) -> int:
+    """Seal pre-window expiry NULLs. Does not write mark_expiry. Returns rowcount."""
+    if before > UNMARKABLE_BEFORE:
+        raise ValueError(
+            f"expiry seal cutoff {before!r} must be <= {UNMARKABLE_BEFORE!r}"
+        )
+    ts = marked_at or now_et().astimezone(ET).isoformat(timespec="seconds")
+    with _db(db_path) as conn:
+        cur = conn.execute(SEAL_UNMARKABLE_EXPIRY_SQL, (ts, before, before))
+        return cur.rowcount
 
 
 def resolve_market_data_source_name() -> str:
@@ -1281,7 +1414,7 @@ def fetch_option_exit(
     cannot be backfilled with a true bid-at-timestamp from this stack.
 
     Prefer constructing ``source`` once per mark_runner pass and passing it
-    in — Massive caches the exit chain on the instance.
+    in — Yahoo/Massive cache option chains on the instance.
     """
     try:
         if source is None:

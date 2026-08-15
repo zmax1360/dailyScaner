@@ -9,7 +9,9 @@ mark_runner.py — Write-once marks for attribution.
 
 Short horizons (t15m / t30m) store the live BID as an exit fill (method=quote
 or trade). Due times at/after 16:00 ET are sealed method=unavailable — never
-clamped to the close. t1h/t1d/close/expiry behaviour is unchanged.
+clamped to the close. Close/expiry rows whose session or expiry is before
+the live-quote window are sealed the same way (method/notes=unavailable,
+mark left NULL) instead of retrying a live quote that cannot reach them.
 
 Horizons run t15m → t30m → t1h → t1d → close → expiry. A wall-clock runtime
 cap exits 0 so launchd's next StartInterval gets a clean slot.
@@ -18,17 +20,20 @@ cap exits 0 so launchd's next StartInterval gets a clean slot.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import socket
 import sys
 import time
 from datetime import date, datetime, timedelta, time as dtime
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from attribution import (
     CASH_CLOSE_TIME,
     CLOSE_MARK_TIME,
+    UNMARKABLE_BEFORE,
     default_db_path,
     due_for_marking,
     fetch_option_exit,
@@ -44,6 +49,11 @@ from logging_config import setup_logging
 ET = ZoneInfo("America/New_York")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
+# Append-only JSONL — runtime-cap shortfalls (exit 0 still; EOD report surfaces).
+CAP_HITS_PATH = os.path.join(BASE_DIR, "data", "mark_runner_cap_hits.jsonl")
+# Last attempted (ticker, expiry, flag_id) per horizon — resume after a cap hit.
+# Not a DB column (no schema change). Sidecar file, same idea as cap_hits.
+CURSOR_PATH = os.path.join(BASE_DIR, "data", "mark_runner_cursor.json")
 
 # Single source of truth for the t1h/t1d mark window (also used by health_check).
 MARK_WINDOW_START = dtime(9, 30)
@@ -136,6 +146,12 @@ def is_close_stale(ts_et: datetime | str, as_of: datetime) -> bool:
         as_of = as_of.replace(tzinfo=ET)
     as_of = as_of.astimezone(ET)
     return as_of.date() > session_date_of(ts_et)
+
+
+def is_expiry_beyond_live(expiry: date | str) -> bool:
+    """True when the contract expired before live quotes can cover it."""
+    exp = date.fromisoformat(str(expiry)[:10]) if not isinstance(expiry, date) else expiry
+    return exp < date.fromisoformat(UNMARKABLE_BEFORE)
 
 
 def first_markable_at(due: datetime) -> datetime:
@@ -358,8 +374,186 @@ def fetch_underlying_close(
     return close
 
 
+def _work_order_key(row) -> tuple[str, str, int]:
+    """Group by (ticker, expiry) so one option_chain serves the whole group."""
+    return (
+        str(row["ticker"]).upper(),
+        str(row["expiry"])[:10],
+        int(row["flag_id"]),
+    )
+
+
+def load_horizon_cursor(
+    horizon: str, *, path: str | None = None,
+) -> tuple[str, str, int] | None:
+    src = path or CURSOR_PATH
+    if not os.path.isfile(src):
+        return None
+    try:
+        with open(src, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    rec = (data or {}).get(str(horizon))
+    if not isinstance(rec, dict):
+        return None
+    try:
+        return (
+            str(rec["ticker"]).upper(),
+            str(rec["expiry"])[:10],
+            int(rec["flag_id"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def save_horizon_cursor(
+    horizon: str,
+    row,
+    *,
+    path: str | None = None,
+    dry_run: bool = False,
+) -> None:
+    if dry_run or row is None:
+        return
+    out = path or CURSOR_PATH
+    ticker, expiry, fid = _work_order_key(row)
+    data: dict[str, Any] = {}
+    if os.path.isfile(out):
+        try:
+            with open(out, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    data[str(horizon)] = {
+        "ticker": ticker,
+        "expiry": expiry,
+        "flag_id": fid,
+    }
+    try:
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+    except OSError as exc:
+        log.warning("failed to save mark_runner cursor: %s", exc)
+
+
+def clear_horizon_cursor(
+    horizon: str, *, path: str | None = None, dry_run: bool = False,
+) -> None:
+    if dry_run:
+        return
+    out = path or CURSOR_PATH
+    if not os.path.isfile(out):
+        return
+    try:
+        with open(out, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return
+        data.pop(str(horizon), None)
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+    except (OSError, json.JSONDecodeError):
+        return
+
+
+def rotate_due_rows(rows: list, horizon: str, *, path: str | None = None) -> list:
+    """
+    Cache locality then resume: sort (ticker, expiry, flag_id), rotate so the
+    first row is the one after the last attempted key. Unmarked head is not
+    re-tried until the previous tail has had a pass.
+    """
+    ordered = sorted(rows, key=_work_order_key)
+    if not ordered:
+        return ordered
+    after = load_horizon_cursor(horizon, path=path)
+    if after is None:
+        return ordered
+    for i, r in enumerate(ordered):
+        if _work_order_key(r) > after:
+            return ordered[i:] + ordered[:i]
+    return ordered  # cursor past every due row — start over
+
+
 def _deadline_exceeded(deadline: float | None) -> bool:
     return deadline is not None and time.monotonic() >= deadline
+
+
+def record_runtime_cap_hit(
+    *,
+    horizon: str,
+    attempted: int,
+    written: int,
+    remaining: int,
+    max_runtime: float,
+    dry_run: bool = False,
+    path: str | None = None,
+) -> None:
+    """
+    Persist a runtime-cap shortfall for the EOD report.
+
+    mark_runner still exits 0 for launchd; this file makes the drop visible.
+    No DB schema change — append-only JSONL under data/.
+    """
+    if dry_run:
+        return
+    out = path or CAP_HITS_PATH
+    now = datetime.now(ET)
+    rec = {
+        "ts_et": now.isoformat(timespec="seconds"),
+        "date": now.date().isoformat(),
+        "horizon": str(horizon),
+        "attempted": int(attempted),
+        "written": int(written),
+        "remaining": int(max(0, remaining)),
+        "max_runtime_sec": float(max_runtime),
+    }
+    try:
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except OSError as exc:
+        log.warning("failed to record runtime cap hit: %s", exc)
+
+
+def load_cap_hits(
+    *,
+    since: str | None = None,
+    until: str | None = None,
+    on_date: str | None = None,
+    path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load runtime-cap records for a session date or inclusive date range."""
+    src = path or CAP_HITS_PATH
+    if not os.path.isfile(src):
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        with open(src, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                day = str(rec.get("date") or "")[:10]
+                if on_date is not None:
+                    if day != on_date:
+                        continue
+                else:
+                    if since is not None and day < since:
+                        continue
+                    if until is not None and day > until:
+                        continue
+                out.append(rec)
+    except OSError:
+        return []
+    return out
 
 
 def _mark_horizon(
@@ -371,27 +565,45 @@ def _mark_horizon(
     deadline: float | None = None,
     underlying_cache: dict[tuple[str, str], float | None] | None = None,
     market_source=None,
+    max_runtime: float | None = None,
 ) -> tuple[int, int, bool]:
     """
     Returns (attempted, written, stopped_early).
     stopped_early True when the runtime deadline fired mid-horizon.
 
-    ``market_source`` is constructed once per runner pass and reused so Massive
-    can cache the exit chain per ticker (no per-contract full-chain fetch).
+    ``market_source`` is constructed once per runner pass and reused so Yahoo
+    / Massive can cache option chains on the instance (no per-contract HTTP).
     """
     as_of = as_of or now_et()
     cache = underlying_cache if underlying_cache is not None else {}
-    rows = due_for_marking(horizon, db_path=db_path, as_of=as_of)  # type: ignore[arg-type]
+    rows = rotate_due_rows(
+        list(due_for_marking(horizon, db_path=db_path, as_of=as_of)),  # type: ignore[arg-type]
+        horizon,
+    )
     attempted = 0
     written = 0
+    last_row = None
     for r in rows:
         if _deadline_exceeded(deadline):
+            remaining = max(0, len(rows) - attempted)
             log.warning(
                 "runtime cap hit during %s — stopping horizon early "
                 "(attempted=%d written=%d remaining≈%d)",
-                horizon, attempted, written, max(0, len(rows) - attempted),
+                horizon, attempted, written, remaining,
             )
+            if last_row is not None:
+                save_horizon_cursor(horizon, last_row, dry_run=dry_run)
+            if max_runtime is not None:
+                record_runtime_cap_hit(
+                    horizon=horizon,
+                    attempted=attempted,
+                    written=written,
+                    remaining=remaining,
+                    max_runtime=max_runtime,
+                    dry_run=dry_run,
+                )
             return attempted, written, True
+        last_row = r
 
         fid = int(r["flag_id"])
 
@@ -418,10 +630,52 @@ def _mark_horizon(
             )
             continue
 
+        # Close: prior session — live quote cannot recover the print. Seal
+        # method=unavailable (mark_close stays NULL); do not fetch.
+        if horizon == "close" and is_close_stale(r["ts_et"], as_of):
+            attempted += 1
+            if dry_run:
+                log.info(
+                    "dry-run unavailable close flag_id=%s — session past live quote",
+                    fid,
+                )
+                continue
+            ok = write_mark(
+                fid, "close", None, db_path=db_path,  # type: ignore[arg-type]
+                close_method="unavailable",
+            )
+            if ok:
+                written += 1
+            log.info(
+                "unavailable close flag_id=%s — %s, no price",
+                fid, "sealed" if ok else "already sealed",
+            )
+            continue
+
+        # Expiry: contract expired before the live-quote window. Seal; do not
+        # fetch. In-window expiries still mark via underlying history.
+        if horizon == "expiry" and is_expiry_beyond_live(r["expiry"]):
+            attempted += 1
+            if dry_run:
+                log.info(
+                    "dry-run unavailable expiry flag_id=%s — expiry %s before %s",
+                    fid, str(r["expiry"])[:10], UNMARKABLE_BEFORE,
+                )
+                continue
+            ok = write_mark(
+                fid, "expiry", None, db_path=db_path,  # type: ignore[arg-type]
+                mark_method="unavailable",
+            )
+            if ok:
+                written += 1
+            log.info(
+                "unavailable expiry flag_id=%s — %s, no price",
+                fid, "sealed" if ok else "already sealed",
+            )
+            continue
+
         stale = False
-        if horizon == "close":
-            stale = is_close_stale(r["ts_et"], as_of)
-        elif horizon in ("t15m", "t30m", "t1h", "t1d"):
+        if horizon in ("t15m", "t30m", "t1h", "t1d"):
             stale = is_past_staleness_ceiling(horizon, r["ts_et"], as_of)
         if stale:
             if horizon in SHORT_HORIZONS:
@@ -482,7 +736,9 @@ def _mark_horizon(
                     )
                 mid = option_intrinsic(str(r["side"]), float(r["strike"]), u_close)
             elif horizon == "close":
-                mid, close_method = _fetch_close_mark(r, cache=cache)
+                mid, close_method = _fetch_close_mark(
+                    r, cache=cache, source=market_source,
+                )
             elif horizon in SHORT_HORIZONS:
                 mid, mark_method = fetch_option_exit(
                     r["ticker"], r["side"], float(r["strike"]), str(r["expiry"]),
@@ -556,6 +812,13 @@ def _mark_horizon(
                 "unchanged %s flag_id=%s (already set or refused)",
                 horizon, fid,
             )
+    n_http = getattr(market_source, "option_chain_fetches", None)
+    if n_http is not None:
+        log.info(
+            "%s: option_chain_fetches=%d for attempted=%d (shared source cache)",
+            horizon, n_http, attempted,
+        )
+    clear_horizon_cursor(horizon, dry_run=dry_run)
     return attempted, written, False
 
 
@@ -576,11 +839,15 @@ def _fetch_close_mark(
     row,
     *,
     cache: dict[tuple[str, str], float | None],
+    source=None,
 ) -> tuple[float | None, str | None]:
     """
     Session-close mark: quote first; 0DTE falls back to (or prefers) intrinsic.
 
     Returns (value, close_method) or (None, None) for transient miss.
+    Pass ``source`` from the pass-level MarketDataSource — without it,
+    fetch_option_mid constructs a new YahooSource per contract and the
+    (ticker, expiry) chain cache never hits.
     """
     ticker = str(row["ticker"])
     side = str(row["side"])
@@ -590,7 +857,7 @@ def _fetch_close_mark(
 
     quote: float | None = None
     try:
-        quote = fetch_option_mid(ticker, side, strike, expiry)
+        quote = fetch_option_mid(ticker, side, strike, expiry, source=source)
     except ValueError:
         # Permanent chain miss — for non-0DTE this is fatal; for 0DTE try intrinsic.
         if not _is_0dte(row):
@@ -728,11 +995,26 @@ def main(argv: list[str] | None = None) -> int:
                 "will resolve per-call: %s",
                 exc,
             )
-        for h in horizons:
+        for i, h in enumerate(horizons):
             if _deadline_exceeded(deadline):
+                # This horizon and all later ones are skipped entirely.
+                for skipped_h in horizons[i:]:
+                    try:
+                        n_due = len(due_for_marking(skipped_h, as_of=now_et()))
+                    except Exception:
+                        n_due = 0
+                    record_runtime_cap_hit(
+                        horizon=skipped_h,
+                        attempted=0,
+                        written=0,
+                        remaining=n_due,
+                        max_runtime=max_runtime,
+                        dry_run=args.dry_run,
+                    )
                 log.warning(
-                    "runtime cap %.0fs exceeded before %s — exiting 0 for launchd",
-                    max_runtime, h,
+                    "runtime cap %.0fs exceeded before %s — exiting 0 for launchd "
+                    "(horizons skipped=%s)",
+                    max_runtime, h, ",".join(horizons[i:]),
                 )
                 return 0
             a, w, stopped = _mark_horizon(
@@ -741,9 +1023,24 @@ def main(argv: list[str] | None = None) -> int:
                 deadline=deadline,
                 underlying_cache=underlying_cache,
                 market_source=market_source,
+                max_runtime=max_runtime,
             )
             log.info("%s: due=%d written=%d", h, a, w)
             if stopped:
+                # Mid-horizon stop already recorded; also note later horizons.
+                for skipped_h in horizons[i + 1:]:
+                    try:
+                        n_due = len(due_for_marking(skipped_h, as_of=now_et()))
+                    except Exception:
+                        n_due = 0
+                    record_runtime_cap_hit(
+                        horizon=skipped_h,
+                        attempted=0,
+                        written=0,
+                        remaining=n_due,
+                        max_runtime=max_runtime,
+                        dry_run=args.dry_run,
+                    )
                 log.warning(
                     "runtime cap %.0fs exceeded — exiting 0 for launchd",
                     max_runtime,
