@@ -187,105 +187,53 @@ def _num_or_none(v) -> float | None:
         return None
 
 
-# ── Daily journal files (data/journal/YYYY-MM-DD.json) ─────────────────────────
-
+# ── Daily journal files — I/O in scanner.journal_io, P&L in scanner.lot_match
 
 def journal_path_for_day(day: str | date | None = None) -> str:
+    from scanner.journal_io import journal_path_for_day as _path
     if day is None:
-        day_s = _today_et()
-    elif isinstance(day, date):
-        day_s = day.isoformat()
-    else:
-        day_s = str(day).strip()[:10]
-    return os.path.join(JOURNAL_DIR, f"{day_s}.json")
-
-
-def _load_day_events(day: str) -> list[dict[str, Any]]:
-    path = journal_path_for_day(day)
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path) as fh:
-            rows = json.load(fh)
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
-
-
-def _save_day_events(day: str, events: list[dict[str, Any]]) -> None:
-    os.makedirs(JOURNAL_DIR, exist_ok=True)
-    path = journal_path_for_day(day)
-    with open(path, "w") as fh:
-        json.dump(events, fh, indent=2)
+        day = _today_et()
+    return _path(day)
 
 
 def _event_fingerprint(ev: dict[str, Any]) -> str:
     """Dedupe key for backfill / accidental double-append."""
     return "|".join([
-        str(ev.get("Action") or ""),
-        str(ev.get("Ticker") or ""),
-        str(ev.get("Side") or ""),
-        str(ev.get("Strike") or ""),
-        str(ev.get("Expiry") or ""),
-        str(ev.get("Quantity") or ""),
-        str(ev.get("Price") or ""),
-        str(ev.get("At") or ""),
-        str(ev.get("PnL_Dollars") if ev.get("PnL_Dollars") is not None else ""),
+        str(ev.get("Action") or ev.get("action") or ""),
+        str(ev.get("Ticker") or ev.get("ticker") or ""),
+        str(ev.get("Side") or ev.get("side") or ""),
+        str(ev.get("Strike") or ev.get("strike") or ""),
+        str(ev.get("Expiry") or ev.get("expiry") or ""),
+        str(ev.get("Quantity") or ev.get("quantity") or ""),
+        str(ev.get("Price") or ev.get("price") or ""),
+        str(ev.get("At") or ev.get("at") or ""),
     ])
 
 
 def append_journal_event(event: dict[str, Any], *, day: str | None = None) -> str:
-    """
-    Append one BUY/SELL event to data/journal/YYYY-MM-DD.json.
-    Returns the day string written.
-    """
-    day_s = day or _date_from_iso(event.get("At"))
-    events = _load_day_events(day_s)
+    """Append one fill. P&L is not stored — lot_match derives it on read."""
+    from scanner.journal_io import append_fills, load_journal_day
+
+    day_s = day or _date_from_iso(event.get("At") or event.get("at"))
     fp = _event_fingerprint(event)
-    if any(_event_fingerprint(e) == fp for e in events):
-        return day_s
-    events.append(event)
-    _save_day_events(day_s, events)
+    existing = load_journal_day(day_s)
+    if not existing.empty:
+        for _, row in existing.iterrows():
+            if _event_fingerprint(row.to_dict()) == fp:
+                return day_s
+    append_fills(day_s, [event])
     return day_s
 
 
 def list_journal_days() -> list[str]:
-    """Sorted YYYY-MM-DD days that have a journal file (newest first)."""
-    if not os.path.isdir(JOURNAL_DIR):
-        return []
-    days: list[str] = []
-    for name in os.listdir(JOURNAL_DIR):
-        if name.endswith(".json") and len(name) == 15:  # YYYY-MM-DD.json
-            days.append(name[:10])
-    return sorted(days, reverse=True)
+    from scanner.journal_io import list_journal_days as _list
+    return _list()
 
 
 def load_journal_day(day: str) -> pd.DataFrame:
-    """Load one day's events as a DataFrame."""
-    events = _load_day_events(day)
-    cols = [
-        "Action", "Ticker", "Side", "Strike", "Expiry", "Quantity",
-        "Price", "At", "Entry_Price", "PnL_Pct", "PnL_Dollars", "Day",
-    ]
-    if not events:
-        return pd.DataFrame(columns=cols)
-    rows = []
-    for e in events:
-        rows.append({
-            "Action": e.get("Action"),
-            "Ticker": e.get("Ticker"),
-            "Side": e.get("Side"),
-            "Strike": e.get("Strike"),
-            "Expiry": e.get("Expiry"),
-            "Quantity": e.get("Quantity"),
-            "Price": e.get("Price"),
-            "At": e.get("At"),
-            "Entry_Price": e.get("Entry_Price"),
-            "PnL_Pct": e.get("PnL_Pct"),
-            "PnL_Dollars": e.get("PnL_Dollars"),
-            "Day": day,
-        })
-    return pd.DataFrame(rows)
+    """Raw fills for one day. No P&L columns — use scanner.lot_match."""
+    from scanner.journal_io import load_journal_day as _load
+    return _load(day)
 
 
 def load_all_journal_events() -> pd.DataFrame:
@@ -316,14 +264,13 @@ def backfill_daily_journal_from_ledgers() -> int:
                 "Quantity": _num_or_none(r.get("Quantity")),
                 "Price": _num_or_none(r.get("Entry_Price")),
                 "At": at or _now_iso(),
-                "Entry_Price": _num_or_none(r.get("Entry_Price")),
-                "PnL_Pct": None,
-                "PnL_Dollars": None,
+                "Source": "scanner",
+                "Timestamp_Quality": "approximate",
             }
             day = _date_from_iso(ev["At"])
-            before = len(_load_day_events(day))
+            before = len(load_journal_day(day))
             append_journal_event(ev, day=day)
-            written += max(0, len(_load_day_events(day)) - before)
+            written += max(0, len(load_journal_day(day)) - before)
 
     closed_df = load_closed()
     if closed_df is not None and not closed_df.empty:
@@ -340,14 +287,13 @@ def backfill_daily_journal_from_ledgers() -> int:
                     "Quantity": _num_or_none(r.get("Quantity")),
                     "Price": _num_or_none(r.get("Entry_Price")),
                     "At": bought_at,
-                    "Entry_Price": _num_or_none(r.get("Entry_Price")),
-                    "PnL_Pct": None,
-                    "PnL_Dollars": None,
+                    "Source": "scanner",
+                    "Timestamp_Quality": "approximate",
                 }
                 day = _date_from_iso(bought_at)
-                before = len(_load_day_events(day))
+                before = len(load_journal_day(day))
                 append_journal_event(buy_ev, day=day)
-                written += max(0, len(_load_day_events(day)) - before)
+                written += max(0, len(load_journal_day(day)) - before)
 
             sell_ev = {
                 "Action": "SELL",
@@ -358,14 +304,13 @@ def backfill_daily_journal_from_ledgers() -> int:
                 "Quantity": _num_or_none(r.get("Quantity")),
                 "Price": _num_or_none(r.get("Exit_Price")),
                 "At": sold_at or _now_iso(),
-                "Entry_Price": _num_or_none(r.get("Entry_Price")),
-                "PnL_Pct": _num_or_none(r.get("PnL_Pct")),
-                "PnL_Dollars": _num_or_none(r.get("PnL_Dollars")),
+                "Source": "scanner",
+                "Timestamp_Quality": "approximate",
             }
             day = _date_from_iso(sell_ev["At"])
-            before = len(_load_day_events(day))
+            before = len(load_journal_day(day))
             append_journal_event(sell_ev, day=day)
-            written += max(0, len(_load_day_events(day)) - before)
+            written += max(0, len(load_journal_day(day)) - before)
 
     return written
 
@@ -409,9 +354,8 @@ def append_position(
         "Quantity": row["Quantity"],
         "Price": row["Entry_Price"],
         "At": now,
-        "Entry_Price": row["Entry_Price"],
-        "PnL_Pct": None,
-        "PnL_Dollars": None,
+        "Source": "scanner",
+        "Timestamp_Quality": "exact",
     })
     return df
 
@@ -477,9 +421,8 @@ def close_position(
         "Quantity": closed_rec["Quantity"],
         "Price": closed_rec["Exit_Price"],
         "At": now,
-        "Entry_Price": closed_rec["Entry_Price"],
-        "PnL_Pct": closed_rec["PnL_Pct"],
-        "PnL_Dollars": closed_rec["PnL_Dollars"],
+        "Source": "scanner",
+        "Timestamp_Quality": "exact",
     })
 
     df = df.drop(index=row_index).reset_index(drop=True)
@@ -685,29 +628,34 @@ def journal_performance(journal_df: pd.DataFrame | None = None) -> dict[str, Any
 
 
 def day_performance(day: str) -> dict[str, Any]:
-    """Realized PnL stats for SELL events on one calendar day."""
+    """Realized PnL for one calendar day, derived via FIFO lot match."""
+    from scanner.lot_match import closed_trades
+
     df = load_journal_day(day)
-    sells = df[df["Action"] == "SELL"] if not df.empty else df
     buys = df[df["Action"] == "BUY"] if not df.empty else df
+    sells = df[df["Action"] == "SELL"] if not df.empty else df
+    trades = closed_trades(df) if not df.empty else df
     total = 0.0
     wins = losses = 0
     pcts: list[float] = []
-    for _, r in sells.iterrows():
-        d = _num_or_none(r.get("PnL_Dollars"))
-        p = _num_or_none(r.get("PnL_Pct"))
-        if d is not None:
-            total += float(d)
-            if d > 0:
-                wins += 1
-            elif d < 0:
-                losses += 1
-        if p is not None:
-            pcts.append(float(p))
-    n = int(len(sells))
+    if trades is not None and not trades.empty:
+        for _, r in trades.iterrows():
+            d = _num_or_none(r.get("PnL_Dollars"))
+            p = _num_or_none(r.get("PnL_Pct"))
+            if d is not None:
+                total += float(d)
+                if d > 0:
+                    wins += 1
+                elif d < 0:
+                    losses += 1
+            if p is not None:
+                pcts.append(float(p))
+    n = int(len(trades)) if trades is not None else 0
     return {
         "day": day,
         "n_buys": int(len(buys)),
-        "n_sells": n,
+        "n_sells": int(len(sells)),
+        "n_closed_lots": n,
         "wins": wins,
         "losses": losses,
         "win_rate": (wins / n) if n else None,

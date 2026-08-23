@@ -78,6 +78,7 @@ from pov_leakage import (
     URGENCY_TAG,
 )
 import portfolio_store as portfolio_store
+import pre_trade_check as pre_trade_check
 
 ET = ZoneInfo("America/New_York")
 
@@ -162,18 +163,33 @@ def _choice_control(
     """
     Prefer st.pills / st.segmented_control (Streamlit ≥1.40); fall back to
     horizontal radio on older versions.
+
+    If ``key`` is already in session_state (including a jump set this run),
+    do not also pass default — Streamlit rejects both on the same widget.
     """
     default = default if default in options else (options[0] if options else "")
+    use_default = key is None or key not in st.session_state
+    extra: dict = {}
+    if key is not None:
+        extra["key"] = key
+    if help is not None:
+        extra["help"] = help
+    if use_default:
+        extra["default"] = default
     if hasattr(st, "pills"):
-        val = st.pills(label, options, default=default, key=key, help=help)
+        val = st.pills(label, options, **extra)
         return val if val is not None else default
     if hasattr(st, "segmented_control"):
-        val = st.segmented_control(
-            label, options, default=default, key=key, help=help,
-        )
+        val = st.segmented_control(label, options, **extra)
         return val if val is not None else default
-    idx = options.index(default) if default in options else 0
-    return st.radio(label, options, index=idx, horizontal=True, key=key, help=help)
+    radio_kw: dict = {"horizontal": True}
+    if key is not None:
+        radio_kw["key"] = key
+    if help is not None:
+        radio_kw["help"] = help
+    if use_default:
+        radio_kw["index"] = options.index(default) if default in options else 0
+    return st.radio(label, options, **radio_kw)
 
 
 def _main_tab_labels() -> list[str]:
@@ -195,6 +211,15 @@ def _main_tab_labels() -> list[str]:
         "📰 Market News",
         "📓 Journal",
     ]
+
+
+def _journal_page_labels() -> list[str]:
+    if _streamlit_ge(1, 40):
+        return [
+            ":material/menu_book: Trade log",
+            ":material/fact_check: Pre-Trade Check",
+        ]
+    return ["📓 Trade log", "✅ Pre-Trade Check"]
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -1937,10 +1962,19 @@ def _render_portfolio_manager(
         not scored.empty
         and "Mark_Price" in st.session_state["portfolio_df"].columns
     ):
+        # Match evaluate_portfolio key dtypes (editor Strike is often object).
+        marks = st.session_state["portfolio_df"][
+            ["Ticker", "Side", "Strike", "Expiry", "Mark_Price"]
+        ].copy()
+        marks["Ticker"] = marks["Ticker"].astype(str).str.strip().str.upper()
+        marks["Side"] = (
+            marks["Side"].astype(str).str.strip().str.upper()
+            .replace({"C": "CALL", "P": "PUT"})
+        )
+        marks["Strike"] = pd.to_numeric(marks["Strike"], errors="coerce")
+        marks["Expiry"] = marks["Expiry"].astype(str).str.strip()
         scored = scored.merge(
-            st.session_state["portfolio_df"][
-                ["Ticker", "Side", "Strike", "Expiry", "Mark_Price"]
-            ],
+            marks,
             on=["Ticker", "Side", "Strike", "Expiry"],
             how="left",
             suffixes=("", "_dup"),
@@ -2564,6 +2598,12 @@ def _render_best_value_panel(
     top5 = top5.copy()
     top5["Times_Flagged"] = top5.apply(_times_flagged_row, axis=1)
 
+    # Snapshot for Check this — extra quote cols stay on scored df, not the table.
+    snapshot = pre_trade_check.build_scan_snapshot(
+        ticker, df, top5, run_timestamp,
+    )
+    pre_trade_check.store_scan_snapshot(snapshot)
+
     # 5 Directions strategy is already baked into Value_Score / Strategy_Tag;
     # keep Optimal Strategy column aligned with the engine output.
     if "Optimal_Strategy" in top5.columns and top5["Optimal_Strategy"].astype(str).str.len().gt(0).any():
@@ -2621,7 +2661,10 @@ def _render_best_value_panel(
         disp["Optimal Strategy"] = "—"
 
     # Interactive table: ＋ column in-row (st.dataframe cannot host buttons)
-    _render_best_value_table_with_plus(ticker, top5, disp, has_dvol=has_dvol)
+    _render_best_value_table_with_plus(
+        ticker, top5, disp, has_dvol=has_dvol,
+        scan_id=snapshot.get("scan_id"),
+    )
     # Caption: Velocity/Target columns removed from the table. Score_Velocity is
     # computed as 0.0 for first-seen contracts this session (by design, not a
     # formatting bug); later refreshes can produce non-zero velocity that still
@@ -2630,7 +2673,7 @@ def _render_best_value_panel(
     st.caption(
         "**SCALE 50%** if premium ≥ +25% vs tracked entry "
         "(prior archive / first-seen).  "
-        "Select a row, then use **＋ Add … to Open Positions** below the table."
+        "Select a row, then **Check this** or **＋ Add … to Open Positions**."
     )
     _render_add_position_form(ticker)
 
@@ -2886,6 +2929,7 @@ def _render_best_value_table_with_plus(
     disp: pd.DataFrame,
     *,
     has_dvol: bool,
+    scan_id: str | None = None,
 ) -> None:
     """Best Value table with native single-row selection + Add button below."""
     if top5 is None or top5.empty or disp is None or disp.empty:
@@ -2984,15 +3028,32 @@ def _render_best_value_table_with_plus(
         ticker, top5_r, sel, display=view,
     )
     if payload is None:
-        st.caption("Select a row to add it to Open Positions.")
-    else:
-        label = (
-            f"＋  Add {payload['Side']} ${float(payload['Strike']):.1f} · "
-            f"{payload['Expiry']} to Open Positions"
-        )
-        if st.button(label, type="primary", key=f"bv_add_selected_{ticker}"):
+        st.caption("Select a row, then Check this or add to Open Positions.")
+        return
+
+    add_label = (
+        f"＋  Add {payload['Side']} ${float(payload['Strike']):.1f} · "
+        f"{payload['Expiry']} to Open Positions"
+    )
+    b_add, b_chk = st.columns(2)
+    with b_add:
+        if st.button(add_label, type="primary", key=f"bv_add_selected_{ticker}"):
             st.session_state["_pending_add_pos"] = payload
             st.rerun()
+    with b_chk:
+        if st.button("Check this", key=f"bv_check_selected_{ticker}"):
+            cid = None
+            if sel and CONTRACT_KEY_COL in view.columns:
+                try:
+                    cid = str(view.reset_index(drop=True).iloc[int(sel[0])][CONTRACT_KEY_COL])
+                except (IndexError, TypeError, ValueError, KeyError):
+                    cid = None
+            if cid and scan_id:
+                ref = pre_trade_check.candidate_ref(scan_id, cid)
+                pre_trade_check.set_candidate_query(st, ref)
+                # nav_main is a widget key — jump on the next run, before pills render
+                st.session_state.pop("ptc_nav_done_for", None)
+                st.rerun()
 
 
 def _render_add_position_form(ticker: str) -> None:
@@ -5412,36 +5473,78 @@ def _render_tab_journal() -> None:
             f"day PnL ${day_stats['realized_pnl']:+,.0f}"
         )
 
+    from scanner.lot_match import closed_trades, open_inventory
+
     day_df = portfolio_store.load_journal_day(selected_day)
     if day_df.empty:
         st.info(f"No buy/sell events saved for {selected_day} yet.")
     else:
-        day_show = day_df.copy()
-        day_show["When"] = day_show["At"].map(_fmt_journal_ts)
-        day_show["Price $"] = day_show["Price"].map(
+        st.caption("Fills (as logged). P&L is derived below — not stored on the row.")
+        fill_show = day_df.copy()
+        fill_show["When"] = fill_show["At"].map(_fmt_journal_ts)
+        fill_show["Price $"] = fill_show["Price"].map(
             lambda x: f"${float(x):.2f}" if pd.notna(x) else "—"
         )
-        day_show["Strike"] = day_show["Strike"].map(
+        fill_show["Strike"] = fill_show["Strike"].map(
             lambda x: f"${float(x):.1f}" if pd.notna(x) else "—"
         )
-        day_show["Qty"] = day_show["Quantity"].map(
+        fill_show["Qty"] = fill_show["Quantity"].map(
             lambda x: f"{float(x):.0f}" if pd.notna(x) else "—"
         )
-        day_show["PnL %"] = day_show["PnL_Pct"].map(_fmt_journal_pct)
-        day_show["PnL $"] = day_show["PnL_Dollars"].map(_fmt_journal_money)
+        fill_cols = [
+            c for c in (
+                "Action", "Ticker", "Side", "Strike", "Expiry", "Qty",
+                "When", "Price $", "Source",
+            ) if c in fill_show.columns
+        ]
         st.dataframe(
-            day_show[
-                ["Action", "Ticker", "Side", "Strike", "Expiry", "Qty",
-                 "When", "Price $", "PnL %", "PnL $"]
-            ],
+            fill_show[fill_cols],
             use_container_width=True,
             hide_index=True,
-            height=min(280, 48 + 36 * len(day_show)),
+            height=min(240, 48 + 36 * len(fill_show)),
         )
+
+        lots = closed_trades(day_df)
+        st.markdown("##### Closed lots (FIFO)")
+        if lots.empty:
+            st.caption("No matched lots yet.")
+        else:
+            lot_show = lots.copy()
+            lot_show["Entry"] = lot_show["Entry_Price"].map(
+                lambda x: f"${float(x):.2f}" if pd.notna(x) else "—"
+            )
+            lot_show["Exit"] = lot_show["Exit_Price"].map(
+                lambda x: f"${float(x):.2f}" if pd.notna(x) else "—"
+            )
+            lot_show["Strike"] = lot_show["Strike"].map(
+                lambda x: f"${float(x):.1f}" if pd.notna(x) else "—"
+            )
+            lot_show["Qty"] = lot_show["Quantity"].map(
+                lambda x: f"{float(x):.0f}" if pd.notna(x) else "—"
+            )
+            lot_show["PnL %"] = lot_show["PnL_Pct"].map(_fmt_journal_pct)
+            lot_show["PnL $"] = lot_show["PnL_Dollars"].map(_fmt_journal_money)
+            lot_show["When"] = lot_show["Exit_At"].map(_fmt_journal_ts)
+            st.dataframe(
+                lot_show[
+                    ["Ticker", "Side", "Strike", "Expiry", "Qty",
+                     "Entry", "Exit", "When", "PnL %", "PnL $"]
+                ],
+                use_container_width=True,
+                hide_index=True,
+                height=min(280, 48 + 36 * len(lot_show)),
+            )
+
+        open_lots = open_inventory(day_df)
+        if not open_lots.empty:
+            st.warning(
+                f"{len(open_lots)} unmatched BUY lot(s) — phantom fill until a SELL matches."
+            )
+
         st.download_button(
             f"Download {selected_day} JSON",
             data=json.dumps(
-                day_df.drop(columns=["Day"], errors="ignore").to_dict(orient="records"),
+                day_df.to_dict(orient="records"),
                 indent=2,
             ),
             file_name=f"journal_{selected_day}.json",
@@ -5560,28 +5663,52 @@ def main():
     # Service-down alerts sit above tabs so they're visible on every page
     _services_alert()
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(_main_tab_labels())
+    labels = _main_tab_labels()
+    journal_label = labels[-1]
+    journal_pages = _journal_page_labels()
+    pretrade_label = journal_pages[1]
 
-    with tab1:
+    cand = pre_trade_check.read_candidate_query(st)
+    if cand and st.session_state.get("ptc_nav_done_for") != cand:
+        st.session_state["nav_main"] = journal_label
+        st.session_state["journal_subpage"] = pretrade_label
+        st.session_state["ptc_nav_done_for"] = cand
+
+    page = _choice_control("Page", labels, default=labels[0], key="nav_main")
+
+    if page == labels[0]:
         _market_banner()
         _render_tab1(cfg)
-
-    with tab2:
+    elif page == labels[1]:
         _market_banner()
         _render_tab2(cfg)
-
-    with tab3:
+    elif page == labels[2]:
         _market_banner()
         _render_tab3(cfg)
-
-    with tab4:
+    elif page == labels[3]:
         _render_tab4()
-
-    with tab5:
+    elif page == labels[4]:
         _render_tab5(cfg)
-
-    with tab6:
-        _render_tab_journal()
+    else:
+        jpage = _choice_control(
+            "Journal page", journal_pages, default=journal_pages[0],
+            key="journal_subpage",
+        )
+        if jpage == journal_pages[0]:
+            _render_tab_journal()
+        else:
+            latest = cfg.get("latest_archive") or {}
+            spot = latest.get("spot")
+            try:
+                spot_f = float(spot) if spot is not None else None
+            except (TypeError, ValueError):
+                spot_f = None
+            # Sidebar spot is a chart field — do not pass it when a candidate
+            # is loaded; the page leaves underlying blank for you to type.
+            pre_trade_check.render_pre_trade_page(
+                default_ticker=str(cfg.get("ticker") or ""),
+                default_spot=None if cand else spot_f,
+            )
 
 
 if __name__ == "__main__" or True:
