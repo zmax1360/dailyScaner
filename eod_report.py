@@ -26,14 +26,15 @@ Design notes:
 from __future__ import annotations
 
 import argparse
-import io
+import html
 import os
 import sqlite3
 import statistics
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
@@ -73,7 +74,7 @@ PAPER_VARIANTS = ("ALL", "0DTE", "1DTE+", "CONTROL")
 from scoring_pool import DTE_BUCKET_SQL, dte_bucket as _dte_bucket_fn  # noqa: E402
 
 # Live-quote window end (exclusive) — same constant mark_runner uses (09:30–16:15).
-from mark_runner import MARK_WINDOW_END  # noqa: E402
+from mark_runner import MARK_WINDOW_END, load_cap_hits  # noqa: E402
 
 
 def _et_clock_str(t: dtime) -> str:
@@ -164,28 +165,19 @@ def _short_minutes_col(horizon: str) -> str:
     return f"minutes_{horizon}"
 
 
-class _Tee:
-    """Write to stdout and an in-memory buffer (saved under report/)."""
-
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, data):
-        for s in self.streams:
-            s.write(data)
-
-    def flush(self):
-        for s in self.streams:
-            s.flush()
-
-
-def report_path(*, span_key: str, ticker: str | None, generated: datetime) -> str:
+def report_path(
+    *,
+    span_key: str,
+    ticker: str | None,
+    generated: datetime,
+    ext: str = "txt",
+) -> str:
     os.makedirs(REPORT_DIR, exist_ok=True)
     parts = ["eod", span_key]
     if ticker:
         parts.append(ticker.upper())
     parts.append(generated.strftime("%Y%m%d_%H%M%S"))
-    return os.path.join(REPORT_DIR, "_".join(parts) + ".txt")
+    return os.path.join(REPORT_DIR, "_".join(parts) + f".{ext.lstrip('.')}")
 
 
 def q(conn, sql, args=()):
@@ -198,6 +190,927 @@ def pct(x):
 
 def hr(title=""):
     print("\n" + (f"── {title} " + "─" * (66 - len(title)) if title else "─" * 68))
+
+
+# ── dual-render document (compute once → text + HTML) ─────────────────────────
+
+CellKind = Literal["text", "num", "mean", "pct"]
+
+
+@dataclass
+class Cell:
+    text: str
+    kind: CellKind = "text"
+    raw: float | None = None  # for mean colouring in HTML
+
+
+@dataclass
+class TableBlock:
+    headers: list[str]
+    rows: list[list[Cell]]
+    muted_rows: list[bool] = field(default_factory=list)  # "(low n)" etc.
+
+
+@dataclass
+class ChartBlock:
+    """Inline SVG — HTML only. Caption is HTML-only (txt skips this block)."""
+
+    svg: str
+    caption: list[str] = field(default_factory=list)
+    callout: bool = False
+
+
+@dataclass
+class ReportDoc:
+    """Structured report — one compute path, two renderers."""
+
+    blocks: list[tuple[str, Any]] = field(default_factory=list)
+
+    def banner(self, lines: list[str]) -> None:
+        self.blocks.append(("banner", list(lines)))
+
+    def section(self, title: str) -> None:
+        self.blocks.append(("section", title))
+
+    def lines(self, *lines: str, callout: bool = False) -> None:
+        """Plain body lines (already without leading indent; renderers add it)."""
+        self.blocks.append(("callout" if callout else "lines", list(lines)))
+
+    def subhead(self, text: str) -> None:
+        self.blocks.append(("subhead", text))
+
+    def table(self, table: TableBlock) -> None:
+        self.blocks.append(("table", table))
+
+    def chart(self, chart: ChartBlock) -> None:
+        self.blocks.append(("chart", chart))
+
+    def html_section(self, title: str) -> None:
+        self.blocks.append(("html_section", title))
+
+    def html_lines(self, *lines: str) -> None:
+        self.blocks.append(("html_lines", list(lines)))
+
+    def blank(self) -> None:
+        self.blocks.append(("blank", None))
+
+
+class DocBuilder:
+    """Append to a ReportDoc; optionally mirror historical stdout for tests."""
+
+    def __init__(self, doc: ReportDoc | None = None, *, echo: bool | None = None):
+        self.doc = doc if doc is not None else ReportDoc()
+        # Echo text as we build when no shared doc (section_* unit tests).
+        self.echo = (doc is None) if echo is None else echo
+
+    def section(self, title: str) -> None:
+        self.doc.section(title)
+        if self.echo:
+            hr(title)
+
+    def lines(self, *lines: str, callout: bool = False) -> None:
+        cleaned = [ln[2:] if ln.startswith("  ") else ln for ln in lines]
+        self.doc.lines(*cleaned, callout=callout)
+        if self.echo:
+            for ln in cleaned:
+                print(f"  {ln}" if ln else "")
+
+    def subhead(self, text: str) -> None:
+        self.doc.subhead(text)
+        if self.echo:
+            print(f"\n  {text}")
+
+    def table(
+        self,
+        table: TableBlock,
+        *,
+        text_lines: list[str],
+        html_only: bool = False,
+    ) -> None:
+        """Structured table for HTML + exact preformatted lines for .txt."""
+        if not html_only:
+            self.doc.blocks.append(("pre", list(text_lines)))
+            if self.echo:
+                for ln in text_lines:
+                    print(ln)
+        self.doc.table(table)
+
+    def chart(self, chart: ChartBlock) -> None:
+        self.doc.chart(chart)
+
+    def html_section(self, title: str) -> None:
+        self.doc.html_section(title)
+
+    def html_lines(self, *lines: str) -> None:
+        self.doc.html_lines(*lines)
+
+    def pre(self, text_lines: list[str]) -> None:
+        """Preformatted text-only chunk (no HTML table companion)."""
+        self.doc.blocks.append(("pre", list(text_lines)))
+        if self.echo:
+            for ln in text_lines:
+                print(ln)
+
+    def blank(self) -> None:
+        self.doc.blank()
+        if self.echo:
+            print()
+
+
+_HTML_CSS = """
+:root { color-scheme: light; }
+body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px; line-height: 1.45; color: #111; background: #fafafa;
+  margin: 24px; max-width: 1100px;
+}
+.banner {
+  border: 2px solid #111; padding: 12px 14px; margin-bottom: 20px;
+  background: #fff; font-weight: 600;
+}
+h2 {
+  margin: 28px 0 10px; padding-bottom: 4px;
+  border-bottom: 1px solid #bbb; font-size: 15px; font-weight: 700;
+}
+h3 { margin: 18px 0 6px; font-size: 13px; font-weight: 700; }
+.lines { margin: 4px 0 10px; }
+.lines div { white-space: pre-wrap; }
+.callout {
+  margin: 8px 0 14px; padding: 10px 12px;
+  border-left: 4px solid #111; background: #fff3c4;
+  font-weight: 600;
+}
+.callout div { white-space: pre-wrap; }
+.warn { color: #111; }
+.info { color: #333; }
+table {
+  border-collapse: collapse; margin: 6px 0 14px; width: auto;
+  background: #fff;
+}
+th, td {
+  border: 1px solid #ccc; padding: 3px 10px; text-align: left;
+  white-space: nowrap;
+}
+th { background: #f0f0f0; font-weight: 700; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.mean-pos { color: #0a7a2f; font-weight: 700; text-align: right; }
+td.mean-neg { color: #b00020; font-weight: 700; text-align: right; }
+td.mean-zero { text-align: right; font-weight: 700; }
+tr.low-n td { color: #888; }
+tr.low-n td.mean-pos, tr.low-n td.mean-neg { color: #888; font-weight: 600; }
+.blank { height: 8px; }
+.chart { margin: 12px 0 20px; background: #fff; padding: 8px 8px 4px; overflow-x: auto; }
+.chart svg { display: block; max-width: 100%; height: auto; }
+"""
+
+
+def render_html(doc: ReportDoc) -> str:
+    """Self-contained HTML: inline CSS only, no external assets / JS."""
+    parts: list[str] = [
+        "<!DOCTYPE html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8"/>',
+        "<title>Scanner EOD Report</title>",
+        "<style>",
+        _HTML_CSS,
+        "</style>",
+        "</head>",
+        "<body>",
+    ]
+    blocks = doc.blocks
+    for idx, (kind, payload) in enumerate(blocks):
+        if kind == "banner":
+            parts.append('<header class="banner">')
+            for ln in payload:
+                parts.append(f"<div>{html.escape(ln)}</div>")
+            parts.append("</header>")
+        elif kind == "section":
+            parts.append(f"<h2>{html.escape(payload)}</h2>")
+        elif kind == "callout":
+            parts.append('<div class="callout">')
+            for ln in payload:
+                parts.append(f"<div>{html.escape(ln)}</div>")
+            parts.append("</div>")
+        elif kind == "lines":
+            parts.append('<div class="lines">')
+            for ln in payload:
+                esc = html.escape(ln)
+                if ln.startswith("⚠"):
+                    parts.append(f'<div class="warn">{esc}</div>')
+                elif ln.startswith("i  "):
+                    parts.append(f'<div class="info">{esc}</div>')
+                else:
+                    parts.append(f"<div>{esc}</div>")
+            parts.append("</div>")
+        elif kind == "html_section":
+            parts.append(f"<h2>{html.escape(payload)}</h2>")
+        elif kind == "html_lines":
+            parts.append('<div class="lines">')
+            for ln in payload:
+                parts.append(f"<div>{html.escape(ln)}</div>")
+            parts.append("</div>")
+        elif kind == "subhead":
+            parts.append(f"<h3>{html.escape(payload)}</h3>")
+        elif kind == "chart":
+            ch: ChartBlock = payload
+            parts.append('<div class="chart">')
+            parts.append(ch.svg)
+            if ch.caption:
+                cap_cls = "callout" if ch.callout else "lines"
+                parts.append(f'<div class="{cap_cls}">')
+                for ln in ch.caption:
+                    parts.append(f"<div>{html.escape(ln)}</div>")
+                parts.append("</div>")
+            parts.append("</div>")
+        elif kind == "table":
+            tbl: TableBlock = payload
+            parts.append("<table>")
+            parts.append("<thead><tr>")
+            for h in tbl.headers:
+                parts.append(f"<th>{html.escape(h)}</th>")
+            parts.append("</tr></thead><tbody>")
+            for ri, row in enumerate(tbl.rows):
+                muted = (
+                    bool(tbl.muted_rows[ri]) if ri < len(tbl.muted_rows) else False
+                )
+                cls = ' class="low-n"' if muted else ""
+                parts.append(f"<tr{cls}>")
+                for c in row:
+                    parts.append(_html_td(c))
+                parts.append("</tr>")
+            parts.append("</tbody></table>")
+        elif kind == "blank":
+            parts.append('<div class="blank"></div>')
+        elif kind == "pre":
+            nxt = blocks[idx + 1][0] if idx + 1 < len(blocks) else None
+            if nxt == "table":
+                continue
+            parts.append('<div class="lines">')
+            for ln in payload:
+                body = ln[2:] if ln.startswith("  ") else ln
+                parts.append(f"<div>{html.escape(body)}</div>")
+            parts.append("</div>")
+    parts.extend(["</body>", "</html>"])
+    return "\n".join(parts) + "\n"
+
+
+def _html_td(c: Cell) -> str:
+    esc = html.escape(c.text.strip() if c.kind != "text" else c.text.strip())
+    if c.kind == "mean":
+        if c.raw is None:
+            return f'<td class="num">{esc}</td>'
+        if c.raw > 0:
+            return f'<td class="mean-pos">{esc}</td>'
+        if c.raw < 0:
+            return f'<td class="mean-neg">{esc}</td>'
+        return f'<td class="mean-zero">{esc}</td>'
+    if c.kind in ("num", "pct"):
+        return f'<td class="num">{esc}</td>'
+    return f"<td>{html.escape(c.text.strip())}</td>"
+
+
+def _mean_cell(x: float | None) -> Cell:
+    return Cell(text=pct(x), kind="mean", raw=None if x is None else float(x))
+
+
+# ── inline SVG charts (HTML only) ────────────────────────────────────────────
+
+HIST_N_BINS = 20  # [-100%, +100%] in 10% steps
+HIST_OVERFLOW = HIST_N_BINS  # index of ">+100%"
+EXIT_TIMING_XS = ("15m", "30m", "1h", "close")
+EXIT_TIMING_RANKS = ("01-03", "04-10", "11-20", "21+", "CONTROL")
+_RANK_BUCKET_SQL = """CASE WHEN is_control = 1 THEN 'CONTROL'
+                      WHEN rank <= 3  THEN '01-03'
+                      WHEN rank <= 10 THEN '04-10'
+                      WHEN rank <= 20 THEN '11-20'
+                      ELSE '21+' END"""
+
+
+def hist_bucket(r: float) -> int:
+    """Map a return to histogram bin: 0..19 = [-100%,+100%] 10% steps; 20 = >+100%."""
+    if r is None or r != r:
+        return -1
+    x = float(r)
+    if x > 1.0:
+        return HIST_OVERFLOW
+    if x <= -1.0:
+        return 0
+    idx = int((x + 1.0) * 10 + 1e-12)
+    return HIST_N_BINS - 1 if idx >= HIST_N_BINS else max(0, idx)
+
+
+def hist_bucket_label(i: int) -> str:
+    if i == HIST_OVERFLOW:
+        return ">+100%"
+    lo = -100 + 10 * i
+    hi = lo + 10
+    return f"{lo:+d}"
+
+
+def histogram_counts(returns: list[float]) -> tuple[list[int], int, float | None]:
+    """Counts per hist_bucket from the same clustered returns used in the table."""
+    counts = [0] * (HIST_N_BINS + 1)
+    clean = [float(x) for x in returns if x is not None and x == x]
+    for x in clean:
+        b = hist_bucket(x)
+        if b >= 0:
+            counts[b] += 1
+    mean = statistics.mean(clean) if clean else None
+    return counts, len(clean), mean
+
+
+def _svg(parts: list[str], *, w: int, h: int) -> str:
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" '
+        f'width="{w}" height="{h}" role="img">'
+        + "".join(parts)
+        + "</svg>"
+    )
+
+
+def _tick_y(vmin: float, vmax: float, n: int = 5) -> list[float]:
+    if vmin == vmax:
+        vmin, vmax = vmin - 0.05, vmax + 0.05
+    span = vmax - vmin
+    step = span / max(1, n - 1)
+    return [vmin + i * step for i in range(n)]
+
+
+def svg_histogram(
+    *,
+    title: str,
+    counts: list[int],
+    n: int,
+    mean: float | None,
+) -> str:
+    w, h = 720, 260
+    l, r, t, b = 48, 16, 28, 44
+    pw, ph = w - l - r, h - t - b
+    nb = HIST_N_BINS + 1
+    bar_w = pw / nb
+    ymax = max(counts) if any(counts) else 1
+    ymax = max(1, ymax)
+
+    def x_at(ret: float) -> float:
+        # -1.0 → left of first bar; +1.0 → left of overflow bar
+        if ret > 1.0:
+            return l + HIST_N_BINS * bar_w + bar_w * 0.5
+        frac = (max(-1.0, min(1.0, ret)) + 1.0) / 2.0
+        return l + frac * (HIST_N_BINS * bar_w)
+
+    def y_at(c: float) -> float:
+        return t + ph * (1 - c / ymax)
+
+    parts = [
+        f'<rect x="0" y="0" width="{w}" height="{h}" fill="#fff"/>',
+        f'<text x="{l}" y="18" font-size="12" font-weight="700" '
+        f'font-family="ui-monospace,monospace">'
+        f'{html.escape(title)}  n={n}</text>',
+        f'<line x1="{l}" y1="{t}" x2="{l}" y2="{t+ph}" stroke="#111"/>',
+        f'<line x1="{l}" y1="{t+ph}" x2="{l+pw}" y2="{t+ph}" stroke="#111"/>',
+    ]
+    for c in _tick_y(0, ymax):
+        yi = y_at(c)
+        parts.append(
+            f'<line x1="{l}" y1="{yi:.1f}" x2="{l+pw}" y2="{yi:.1f}" '
+            f'stroke="#eee"/>'
+        )
+        parts.append(
+            f'<text x="{l-6}" y="{yi+4:.1f}" text-anchor="end" font-size="10" '
+            f'font-family="ui-monospace,monospace">{int(round(c))}</text>'
+        )
+    for i, c in enumerate(counts):
+        x = l + i * bar_w
+        bh = ph * (c / ymax)
+        parts.append(
+            f'<rect x="{x+1:.1f}" y="{t+ph-bh:.1f}" width="{bar_w-2:.1f}" '
+            f'height="{bh:.1f}" fill="#333"/>'
+        )
+    # x labels every 20% plus overflow
+    for i in range(0, HIST_N_BINS + 1, 2):
+        x = l + i * bar_w
+        lab = hist_bucket_label(i) if i < HIST_N_BINS else ">+100%"
+        parts.append(
+            f'<text x="{x:.1f}" y="{t+ph+14}" font-size="9" '
+            f'font-family="ui-monospace,monospace" text-anchor="start">'
+            f'{html.escape(lab)}</text>'
+        )
+    # 0% line
+    x0 = x_at(0.0)
+    parts.append(
+        f'<line x1="{x0:.1f}" y1="{t}" x2="{x0:.1f}" y2="{t+ph}" '
+        f'stroke="#111" stroke-width="1.2"/>'
+    )
+    parts.append(
+        f'<text x="{x0+3:.1f}" y="{t+10}" font-size="10" '
+        f'font-family="ui-monospace,monospace">0%</text>'
+    )
+    if mean is not None:
+        xm = x_at(mean)
+        parts.append(
+            f'<line x1="{xm:.1f}" y1="{t}" x2="{xm:.1f}" y2="{t+ph}" '
+            f'stroke="#b00020" stroke-dasharray="4 3"/>'
+        )
+        parts.append(
+            f'<text x="{xm+3:.1f}" y="{t+22}" font-size="10" fill="#b00020" '
+            f'font-family="ui-monospace,monospace">mean {mean:+.1%}</text>'
+        )
+    return _svg(parts, w=w, h=h)
+
+
+def svg_exit_timing(series: list[dict]) -> str:
+    """
+    series items: {rank, n, means: {15m,30m,1h,close}, low_n: bool}
+    Straight segments only — no smoothing.
+    """
+    w, h = 720, 300
+    l, r, t, btm = 56, 140, 28, 36
+    pw, ph = w - l - r, h - t - btm
+    xs = EXIT_TIMING_XS
+    vals = [
+        m
+        for s in series
+        for m in (s["means"].get(k) for k in xs)
+        if m is not None
+    ]
+    if not vals:
+        return _svg(
+            [f'<text x="20" y="40" font-family="ui-monospace,monospace">'
+             f'no matched sample</text>'],
+            w=w, h=80,
+        )
+    ymin, ymax = min(vals + [0.0]), max(vals + [0.0])
+    pad = max(0.02, (ymax - ymin) * 0.12)
+    ymin, ymax = ymin - pad, ymax + pad
+
+    def x_at(i: int) -> float:
+        return l + (i / (len(xs) - 1)) * pw
+
+    def y_at(v: float) -> float:
+        return t + ph * (1 - (v - ymin) / (ymax - ymin))
+
+    marks = {
+        "01-03": ("#111", "8,0", "circle"),
+        "04-10": ("#333", "8,0", "sq"),
+        "11-20": ("#555", "6,3", "tri"),
+        "21+": ("#777", "2,3", "diamond"),
+        "CONTROL": ("#111", "5,4", "plus"),
+    }
+    parts = [
+        f'<rect x="0" y="0" width="{w}" height="{h}" fill="#fff"/>',
+        f'<text x="{l}" y="18" font-size="12" font-weight="700" '
+        f'font-family="ui-monospace,monospace">EXIT TIMING (matched)</text>',
+        f'<line x1="{l}" y1="{t}" x2="{l}" y2="{t+ph}" stroke="#111"/>',
+        f'<line x1="{l}" y1="{t+ph}" x2="{l+pw}" y2="{t+ph}" stroke="#111"/>',
+    ]
+    y0 = y_at(0.0)
+    parts.append(
+        f'<line x1="{l}" y1="{y0:.1f}" x2="{l+pw}" y2="{y0:.1f}" '
+        f'stroke="#ccc"/>'
+    )
+    for tv in _tick_y(ymin, ymax):
+        yi = y_at(tv)
+        parts.append(
+            f'<text x="{l-6}" y="{yi+3:.1f}" text-anchor="end" font-size="10" '
+            f'font-family="ui-monospace,monospace">{tv:+.0%}</text>'
+        )
+    for i, lab in enumerate(xs):
+        xi = x_at(i)
+        parts.append(
+            f'<text x="{xi:.1f}" y="{t+ph+16}" text-anchor="middle" '
+            f'font-size="11" font-family="ui-monospace,monospace">'
+            f'{html.escape(lab)}</text>'
+        )
+    for s in series:
+        rank = s["rank"]
+        color, dash, shape = marks.get(rank, ("#111", "8,0", "circle"))
+        opacity = "0.5" if s["low_n"] else "1"
+        pts = []
+        for i, k in enumerate(xs):
+            m = s["means"].get(k)
+            if m is None:
+                continue
+            pts.append((x_at(i), y_at(m)))
+        if len(pts) >= 2:
+            d = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+            parts.append(
+                f'<polyline fill="none" stroke="{color}" stroke-width="1.6" '
+                f'stroke-dasharray="{dash}" opacity="{opacity}" '
+                f'points="{d}"/>'
+            )
+        for x, y in pts:
+            if shape == "sq":
+                parts.append(
+                    f'<rect x="{x-3:.1f}" y="{y-3:.1f}" width="6" height="6" '
+                    f'fill="{color}" opacity="{opacity}"/>'
+                )
+            elif shape == "tri":
+                parts.append(
+                    f'<polygon points="{x:.1f},{y-4:.1f} {x+4:.1f},{y+3:.1f} '
+                    f'{x-4:.1f},{y+3:.1f}" fill="{color}" opacity="{opacity}"/>'
+                )
+            elif shape == "diamond":
+                parts.append(
+                    f'<polygon points="{x:.1f},{y-4:.1f} {x+4:.1f},{y:.1f} '
+                    f'{x:.1f},{y+4:.1f} {x-4:.1f},{y:.1f}" fill="{color}" '
+                    f'opacity="{opacity}"/>'
+                )
+            elif shape == "plus":
+                parts.append(
+                    f'<line x1="{x-4:.1f}" y1="{y:.1f}" x2="{x+4:.1f}" '
+                    f'y2="{y:.1f}" stroke="{color}" stroke-width="1.6" '
+                    f'opacity="{opacity}"/>'
+                    f'<line x1="{x:.1f}" y1="{y-4:.1f}" x2="{x:.1f}" '
+                    f'y2="{y+4:.1f}" stroke="{color}" stroke-width="1.6" '
+                    f'opacity="{opacity}"/>'
+                )
+            else:
+                parts.append(
+                    f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.2" fill="{color}" '
+                    f'opacity="{opacity}"/>'
+                )
+        low = " (low n)" if s["low_n"] else ""
+        li = EXIT_TIMING_RANKS.index(rank) if rank in EXIT_TIMING_RANKS else 0
+        ly = t + 14 + li * 16
+        lx = l + pw + 12
+        parts.append(
+            f'<text x="{lx}" y="{ly}" font-size="11" fill="{color}" '
+            f'opacity="{opacity}" font-family="ui-monospace,monospace">'
+            f'{html.escape(rank)}{html.escape(low)}  n={s["n"]}</text>'
+        )
+    return _svg(parts, w=w, h=h)
+
+
+def svg_engine_vs_control(groups: list[dict]) -> str:
+    """
+    groups: [{pool, engine_n, engine_mean, ctrl_n, ctrl_mean,
+              engine_low, ctrl_low}]
+    """
+    w, h = 640, 280
+    l, r, t, btm = 56, 24, 28, 36
+    pw, ph = w - l - r, h - t - btm
+    vals = []
+    for g in groups:
+        for m in (g.get("engine_mean"), g.get("ctrl_mean")):
+            if m is not None:
+                vals.append(m)
+    if not vals:
+        return _svg(
+            ['<text x="20" y="40" font-family="ui-monospace,monospace">'
+             'no T15M observations</text>'],
+            w=w, h=80,
+        )
+    ymin, ymax = min(vals + [0.0]), max(vals + [0.0])
+    pad = max(0.02, (ymax - ymin) * 0.15)
+    ymin, ymax = ymin - pad, ymax + pad
+
+    def y_at(v: float) -> float:
+        return t + ph * (1 - (v - ymin) / (ymax - ymin))
+
+    y0 = y_at(0.0)
+    n_g = max(1, len(groups))
+    slot = pw / n_g
+    bar_w = slot * 0.28
+    parts = [
+        f'<rect x="0" y="0" width="{w}" height="{h}" fill="#fff"/>',
+        f'<text x="{l}" y="18" font-size="12" font-weight="700" '
+        f'font-family="ui-monospace,monospace">'
+        f'ENGINE 01-03 vs CONTROL  @ T15M</text>',
+        f'<line x1="{l}" y1="{t}" x2="{l}" y2="{t+ph}" stroke="#111"/>',
+        f'<line x1="{l}" y1="{t+ph}" x2="{l+pw}" y2="{t+ph}" stroke="#111"/>',
+        f'<line x1="{l}" y1="{y0:.1f}" x2="{l+pw}" y2="{y0:.1f}" '
+        f'stroke="#ccc"/>',
+    ]
+    for tv in _tick_y(ymin, ymax):
+        yi = y_at(tv)
+        parts.append(
+            f'<text x="{l-6}" y="{yi+3:.1f}" text-anchor="end" font-size="10" '
+            f'font-family="ui-monospace,monospace">{tv:+.0%}</text>'
+        )
+
+    def bar(x, mean, n, low, hatch: bool):
+        if mean is None:
+            return
+        y = y_at(mean)
+        top, bot = (y, y0) if mean >= 0 else (y0, y)
+        fill = "#0a7a2f" if mean > 0 else ("#b00020" if mean < 0 else "#333")
+        op = "0.4" if low else "1"
+        if hatch:
+            parts.append(
+                f'<rect x="{x:.1f}" y="{top:.1f}" width="{bar_w:.1f}" '
+                f'height="{max(1, bot-top):.1f}" fill="none" stroke="{fill}" '
+                f'stroke-width="1.6" stroke-dasharray="3 2" opacity="{op}"/>'
+            )
+        else:
+            parts.append(
+                f'<rect x="{x:.1f}" y="{top:.1f}" width="{bar_w:.1f}" '
+                f'height="{max(1, bot-top):.1f}" fill="{fill}" '
+                f'opacity="{op}"/>'
+            )
+        low_s = " (low n)" if low else ""
+        parts.append(
+            f'<text x="{x+bar_w/2:.1f}" y="{top-4:.1f}" text-anchor="middle" '
+            f'font-size="10" font-family="ui-monospace,monospace">'
+            f'n={n}{html.escape(low_s)}</text>'
+        )
+
+    for i, g in enumerate(groups):
+        cx = l + i * slot + slot / 2
+        bar(cx - bar_w - 4, g.get("engine_mean"), g.get("engine_n") or 0,
+            bool(g.get("engine_low")), False)
+        bar(cx + 4, g.get("ctrl_mean"), g.get("ctrl_n") or 0,
+            bool(g.get("ctrl_low")), True)
+        parts.append(
+            f'<text x="{cx:.1f}" y="{t+ph+16}" text-anchor="middle" '
+            f'font-size="11" font-family="ui-monospace,monospace">'
+            f'{html.escape(g["pool"])}</text>'
+        )
+    parts.append(
+        f'<text x="{l}" y="{h-6}" font-size="10" '
+        f'font-family="ui-monospace,monospace">'
+        f'solid = engine 01-03   dashed outline = CONTROL</text>'
+    )
+    return _svg(parts, w=w, h=h)
+
+
+def _row_to_obs(row) -> dict:
+    if hasattr(row, "keys"):
+        return {
+            "dte_b": row["dte_b"],
+            "rank_b": row["rank_b"],
+            "d": row["d"],
+            "contract": row["contract"],
+            "r": row["r"],
+        }
+    return {
+        "dte_b": row[0], "rank_b": row[1], "d": row[2],
+        "contract": row[3], "r": row[4],
+    }
+
+
+def clustered_short_obs(conn, where: str, args, horizon: str) -> list[dict]:
+    """
+    One clustered (date, contract) observation — same filter as the
+    T15M/T30M outcome tables. Charts reuse this list; they do not re-query.
+    """
+    ret = f"ret_{horizon}"
+    mins = _short_minutes_col(horizon)
+    mcol = _short_method_col(horizon)
+    max_m = max_minutes_for(horizon)
+    rows = q(conn, f"""
+        SELECT {DTE_BUCKET_SQL} AS dte_b,
+               {_RANK_BUCKET_SQL} AS rank_b,
+               {session_date_sql("ts_et")} d,
+               ticker||side||strike||expiry contract,
+               AVG({ret}) r
+        FROM v_outcomes
+        WHERE {where}
+          AND {ret} IS NOT NULL
+          AND {mcol} IN ('quote', 'trade')
+          AND ask IS NOT NULL AND ask > 0
+          AND ({mins} IS NULL OR {mins} <= {max_m})
+        GROUP BY dte_b, rank_b, d, contract
+    """, args)
+    return [_row_to_obs(r) for r in rows]
+
+
+def _aggregate_outcome_rows(obs: list[dict]):
+    """Table rows from clustered obs — same grouping as the old SQL aggregate."""
+    groups: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for o in obs:
+        r = o.get("r")
+        if r is None or r != r:
+            continue
+        groups[(str(o["dte_b"]), str(o["rank_b"]))].append(float(r))
+    out = []
+    for dte_b, rank_b in sorted(groups):
+        rs = groups[(dte_b, rank_b)]
+        n = len(rs)
+        mean = statistics.mean(rs)
+        kept = [x for x in rs if x < OUTLIER]
+        ex = statistics.mean(kept) if kept else None
+        tails = sum(1 for x in rs if x >= OUTLIER)
+        win = sum(1 for x in rs if x > 0) / n
+        out.append((dte_b, rank_b, n, mean, ex, tails, win))
+    return out
+
+
+def engine_control_t15m_groups(obs: list[dict]) -> list[dict]:
+    """Chart 3 — means from the same T15M clustered obs as the outcome table."""
+    by: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for o in obs:
+        pool, rank = str(o["dte_b"]), str(o["rank_b"])
+        if pool not in ("0DTE", "1DTE+") or rank not in ("01-03", "CONTROL"):
+            continue
+        r = o.get("r")
+        if r is None or r != r:
+            continue
+        by[(pool, rank)].append(float(r))
+    groups = []
+    for pool in ("0DTE", "1DTE+"):
+        e = by.get((pool, "01-03"), [])
+        c = by.get((pool, "CONTROL"), [])
+        groups.append({
+            "pool": pool,
+            "engine_n": len(e),
+            "engine_mean": statistics.mean(e) if e else None,
+            "engine_low": len(e) < FACTOR_LOW_N,
+            "ctrl_n": len(c),
+            "ctrl_mean": statistics.mean(c) if c else None,
+            "ctrl_low": len(c) < FACTOR_LOW_N,
+        })
+    return groups
+
+
+def exit_timing_matched_obs(conn, where: str, args) -> list[dict]:
+    """
+    Clustered (date, contract) rows with usable marks at 15m, 30m, 1h, AND close.
+    One query — table and line chart both consume this list.
+    """
+    rows = q(conn, f"""
+        SELECT {_RANK_BUCKET_SQL} AS rank_b,
+               {session_date_sql("ts_et")} d,
+               ticker||side||strike||expiry contract,
+               AVG(CASE
+                     WHEN method_t15m IN ('quote', 'trade')
+                      AND ask IS NOT NULL AND ask > 0
+                      AND (minutes_t15m IS NULL OR minutes_t15m <= {MAX_MINUTES_T15M})
+                     THEN ret_t15m END) AS r15,
+               AVG(CASE
+                     WHEN method_t30m IN ('quote', 'trade')
+                      AND ask IS NOT NULL AND ask > 0
+                      AND (minutes_t30m IS NULL OR minutes_t30m <= {MAX_MINUTES_T30M})
+                     THEN ret_t30m END) AS r30,
+               AVG(CASE
+                     WHEN ret_t1h IS NOT NULL AND hours_t1h <= {MAX_HOURS_T1H}
+                     THEN ret_t1h END) AS r1h,
+               AVG(ret_close) AS rclose
+        FROM v_outcomes
+        WHERE {where}
+        GROUP BY rank_b, d, contract
+        HAVING r15 IS NOT NULL AND r30 IS NOT NULL
+           AND r1h IS NOT NULL AND rclose IS NOT NULL
+    """, args)
+    out = []
+    for row in rows:
+        if hasattr(row, "keys"):
+            rec = {
+                "rank_b": row["rank_b"],
+                "r15": row["r15"], "r30": row["r30"],
+                "r1h": row["r1h"], "rclose": row["rclose"],
+            }
+        else:
+            rec = {
+                "rank_b": row[0],
+                "r15": row[3], "r30": row[4],
+                "r1h": row[5], "rclose": row[6],
+            }
+        out.append(rec)
+    return out
+
+
+def exit_timing_series(obs: list[dict]) -> list[dict]:
+    """Aggregate matched obs → one series per rank bucket (n + means)."""
+    by: dict[str, list[dict]] = defaultdict(list)
+    for o in obs:
+        by[str(o["rank_b"])].append(o)
+    series = []
+    key_map = {"15m": "r15", "30m": "r30", "1h": "r1h", "close": "rclose"}
+    for rank in EXIT_TIMING_RANKS:
+        rows = by.get(rank, [])
+        if not rows:
+            continue
+        n = len(rows)
+        means = {}
+        for lab, col in key_map.items():
+            vals = [float(r[col]) for r in rows if r[col] is not None and r[col] == r[col]]
+            means[lab] = statistics.mean(vals) if vals else None
+        series.append({
+            "rank": rank,
+            "n": n,
+            "means": means,
+            "low_n": n < FACTOR_LOW_N,
+        })
+    return series
+
+
+def _timing_table(series: list[dict]) -> tuple[TableBlock, list[str]]:
+    headers = ["rank", "n", "15m", "30m", "1h", "close"]
+    text_lines = [
+        f"  {'rank':<10} {'n':>5} {'15m':>8} {'30m':>8} {'1h':>8} {'close':>8}"
+    ]
+    rows: list[list[Cell]] = []
+    muted: list[bool] = []
+    for s in series:
+        low = " (low n)" if s["low_n"] else ""
+        text_lines.append(
+            f"  {s['rank']:<10} {s['n']:>5} "
+            f"{pct(s['means'].get('15m'))} {pct(s['means'].get('30m'))} "
+            f"{pct(s['means'].get('1h'))} {pct(s['means'].get('close'))}{low}"
+        )
+        rows.append([
+            Cell(s["rank"] + low),
+            Cell(str(s["n"]), kind="num"),
+            _mean_cell(s["means"].get("15m")),
+            _mean_cell(s["means"].get("30m")),
+            _mean_cell(s["means"].get("1h")),
+            _mean_cell(s["means"].get("close")),
+        ])
+        muted.append(s["low_n"])
+    return TableBlock(headers=headers, rows=rows, muted_rows=muted), text_lines
+
+
+def section_charts(
+    *,
+    t15m_obs: list[dict],
+    timing_obs: list[dict],
+    doc: ReportDoc | None = None,
+) -> None:
+    """HTML-only charts. Values come from the same obs lists as the tables."""
+    b = DocBuilder(doc, echo=False)
+    b.html_section("CHARTS")
+    b.html_lines(
+        "inline SVG — same clustered observations as the tables above; "
+        "n < 30 drawn muted/dashed",
+    )
+
+    # Chart 1 — distribution from T15M clustered obs, rank 01-03 per pool
+    for pool in ("0DTE", "1DTE+"):
+        rets = [
+            float(o["r"]) for o in t15m_obs
+            if str(o["dte_b"]) == pool
+            and str(o["rank_b"]) == "01-03"
+            and o.get("r") is not None and o["r"] == o["r"]
+        ]
+        counts, n, mean = histogram_counts(rets)
+        b.chart(ChartBlock(
+            svg=svg_histogram(
+                title=f"RETURN DISTRIBUTION  {pool}  rank 01-03",
+                counts=counts, n=n, mean=mean,
+            ),
+        ))
+
+    # Chart 2 — matched sample (one query, table + line)
+    timing_series = exit_timing_series(timing_obs)
+    b.html_section("EXIT TIMING  (matched sample)")
+    if not timing_series:
+        b.html_lines(
+            "no contracts with usable marks at 15m, 30m, 1h, AND close",
+        )
+    else:
+        table, text_lines = _timing_table(timing_series)
+        b.table(table, text_lines=text_lines, html_only=True)
+        b.chart(ChartBlock(
+            svg=svg_exit_timing(timing_series),
+            caption=[
+                "1h and close points use mid and are optimistic relative to "
+                "15m/30m (ask-entry / bid-exit)",
+            ],
+            callout=True,
+        ))
+
+    # Chart 3 — same T15M obs, 01-03 vs CONTROL per pool
+    groups = engine_control_t15m_groups(t15m_obs)
+    b.chart(ChartBlock(svg=svg_engine_vs_control(groups)))
+
+
+def _render_text_faithful(doc: ReportDoc) -> str:
+    """
+    Text renderer that uses preformatted chunks ('pre') when present so the
+    .txt file stays identical to the historical print layout.
+    """
+    out: list[str] = []
+    for kind, payload in doc.blocks:
+        if kind == "banner":
+            out.append("=" * 68)
+            for ln in payload:
+                out.append(f"  {ln}" if ln else "")
+            out.append("=" * 68)
+        elif kind == "section":
+            title = payload or ""
+            out.append("")
+            out.append(
+                f"── {title} " + "─" * (66 - len(title)) if title else "─" * 68
+            )
+        elif kind in ("lines", "callout"):
+            for ln in payload:
+                out.append(f"  {ln}" if ln else "")
+        elif kind == "subhead":
+            out.append("")
+            out.append(f"  {payload}")
+        elif kind == "pre":
+            out.extend(payload)
+        elif kind in ("table", "chart", "html_section", "html_lines"):
+            # Structured tables/charts are HTML companions; text came via 'pre'.
+            continue
+        elif kind == "blank":
+            out.append("")
+    return "\n".join(out) + ("\n" if out else "")
+
+
+# Public alias used by main / tests
+render_text = _render_text_faithful  # type: ignore[misc,assignment]
 
 
 def count_late_marks(conn, where: str, args, horizon: str) -> int:
@@ -272,8 +1185,9 @@ def verdict_rows(conn, where: str, args):
 
 # ── sections ─────────────────────────────────────────────────────────────────
 
-def section_coverage(conn, where, args):
-    hr("COVERAGE")
+def section_coverage(conn, where, args, *, doc: ReportDoc | None = None) -> bool:
+    b = DocBuilder(doc)
+    b.section("COVERAGE")
     r = q(conn, f"""
         SELECT COUNT(*) flags,
                SUM(is_control) ctrl,
@@ -291,29 +1205,58 @@ def section_coverage(conn, where, args):
     (flags, ctrl, runs, days, engines, m1h, m1d, mexp,
      m15, m30, ok15, ok30) = r
     if not flags:
-        print("  no rows — check --date / --ticker")
+        b.lines("no rows — check --date / --ticker")
         return False
     m15 = int(m15 or 0)
     m30 = int(m30 or 0)
     ok15 = int(ok15 or 0)
     ok30 = int(ok30 or 0)
-    print(f"  runs {runs:<6} days {days:<4} flags {flags:<7} controls {ctrl}")
-    print(
-        f"  marked   T+15m {m15:<6} T+30m {m30:<6} "
-        f"T+1h {m1h:<7} T+1d {m1d:<7} expiry {mexp}"
-    )
-    print(
-        f"  coverage T+15m {m15/flags:.0%}  T+30m {m30/flags:.0%}  "
-        f"T+1h {m1h/flags:.0%}"
-    )
-    print(
-        f"  usable   T+15m {ok15:<6} T+30m {ok30:<6} "
-        f"(method quote|trade only — sealed stale/unavailable excluded)"
+    b.lines(
+        f"runs {runs:<6} days {days:<4} flags {flags:<7} controls {ctrl}",
+        f"marked   T+15m {m15:<6} T+30m {m30:<6} "
+        f"T+1h {m1h:<7} T+1d {m1d:<7} expiry {mexp}",
+        f"coverage T+15m {m15/flags:.0%}  T+30m {m30/flags:.0%}  "
+        f"T+1h {m1h/flags:.0%}",
+        f"usable   T+15m {ok15:<6} T+30m {ok30:<6} "
+        f"(method quote|trade only — sealed stale/unavailable excluded)",
     )
     if engines > 1:
-        print(f"  ⚠  {engines} distinct config_hash values — sample spans "
-              f"multiple engines and must be segmented before interpreting")
+        b.lines(
+            f"⚠  {engines} distinct config_hash values — sample spans "
+            f"multiple engines and must be segmented before interpreting"
+        )
     return True
+
+
+def _outcome_table_from_rows(rows) -> tuple[TableBlock, list[str], int]:
+    """Shared outcome-table builder for T15M/T30M/T1H/T1D (one compute path)."""
+    headers = ["", "bucket", "n", "mean", "ex-tail", "tails", "win%"]
+    text_lines = [
+        f"  {'':<8} {'bucket':<9} {'n':>5} {'mean':>8} {'ex-tail':>8} "
+        f"{'tails':>6} {'win%':>7}"
+    ]
+    table_rows: list[list[Cell]] = []
+    last = None
+    unknown_n = 0
+    for dte_b, rank_b, n, mean, ex, tails, win in rows:
+        lead = dte_b if dte_b != last else ""
+        last = dte_b
+        if dte_b == "UNKNOWN":
+            unknown_n += int(n)
+        text_lines.append(
+            f"  {lead:<8} {rank_b:<9} {n:>5} {pct(mean)} {pct(ex)} "
+            f"{tails:>6} {win:>6.0%}"
+        )
+        table_rows.append([
+            Cell(str(lead)),
+            Cell(str(rank_b)),
+            Cell(str(int(n)), kind="num"),
+            _mean_cell(mean),
+            Cell(pct(ex).strip(), kind="pct"),
+            Cell(str(int(tails)), kind="num"),
+            Cell(f"{win:.0%}", kind="pct"),
+        ])
+    return TableBlock(headers=headers, rows=table_rows), text_lines, unknown_n
 
 
 def count_short_sealed(conn, where: str, args, horizon: str) -> tuple[int, int]:
@@ -345,42 +1288,18 @@ def count_late_short_marks(conn, where: str, args, horizon: str) -> int:
 def clustered_short_bucket_rows(conn, where: str, args, horizon: str):
     """
     Clustered short-horizon outcomes (ask-entry ret_* from v_outcomes).
-    Only method in quote|trade; lag filter on minutes_*.
+    Aggregates clustered_short_obs — the same list charts consume.
     """
-    ret = f"ret_{horizon}"
-    mins = _short_minutes_col(horizon)
-    mcol = _short_method_col(horizon)
-    max_m = max_minutes_for(horizon)
-    return q(conn, f"""
-        WITH pc AS (
-          SELECT {DTE_BUCKET_SQL} AS dte_b,
-                 CASE WHEN is_control = 1 THEN 'CONTROL'
-                      WHEN rank <= 3  THEN '01-03'
-                      WHEN rank <= 10 THEN '04-10'
-                      WHEN rank <= 20 THEN '11-20'
-                      ELSE '21+' END rank_b,
-                 {session_date_sql("ts_et")} d,
-                 ticker||side||strike||expiry contract,
-                 AVG({ret}) r
-          FROM v_outcomes
-          WHERE {where}
-            AND {ret} IS NOT NULL
-            AND {mcol} IN ('quote', 'trade')
-            AND ask IS NOT NULL AND ask > 0
-            AND ({mins} IS NULL OR {mins} <= {max_m})
-          GROUP BY dte_b, rank_b, d, contract
-        )
-        SELECT dte_b, rank_b, COUNT(*) n,
-               AVG(r) mean,
-               AVG(CASE WHEN r < {OUTLIER} THEN r END) ex_out,
-               SUM(r >= {OUTLIER}) tails,
-               SUM(r > 0)*1.0/COUNT(*) win
-        FROM pc GROUP BY dte_b, rank_b ORDER BY dte_b, rank_b
-    """, args)
+    return _aggregate_outcome_rows(clustered_short_obs(conn, where, args, horizon))
 
 
-def section_short_buckets(conn, where, args, horizon: str):
+def section_short_buckets(
+    conn, where, args, horizon: str, *,
+    doc: ReportDoc | None = None,
+    obs: list[dict] | None = None,
+):
     """OUTCOMES @ T15M / T30M — ask entry, bid exit, quote|trade only."""
+    b = DocBuilder(doc)
     max_m = max_minutes_for(horizon)
     mins = _short_minutes_col(horizon)
     excluded = count_late_short_marks(conn, where, args, horizon)
@@ -390,45 +1309,49 @@ def section_short_buckets(conn, where, args, horizon: str):
         f"{mins} <= {max_m:g}; excluded {excluded} late; "
         f"sealed stale={n_stale} unavailable={n_unavail})"
     )
-    hr(title)
+    b.section(title)
 
-    rows = clustered_short_bucket_rows(conn, where, args, horizon)
+    if obs is None:
+        obs = clustered_short_obs(conn, where, args, horizon)
+    rows = _aggregate_outcome_rows(obs)
     if not rows:
-        print("  no usable short-horizon outcomes in window "
-              "(need method quote|trade + ask > 0)")
+        b.lines(
+            "no usable short-horizon outcomes in window "
+            "(need method quote|trade + ask > 0)"
+        )
         if n_stale or n_unavail:
-            print(
-                f"  sealed (not observations): stale={n_stale}  "
+            b.lines(
+                f"sealed (not observations): stale={n_stale}  "
                 f"unavailable={n_unavail}"
             )
         return rows
 
-    print(f"  {'':<8} {'bucket':<9} {'n':>5} {'mean':>8} {'ex-tail':>8} "
-          f"{'tails':>6} {'win%':>7}")
-    last = None
-    unknown_n = 0
-    for dte_b, rank_b, n, mean, ex, tails, win in rows:
-        lead = dte_b if dte_b != last else ""
-        last = dte_b
-        if dte_b == "UNKNOWN":
-            unknown_n += int(n)
-        print(f"  {lead:<8} {rank_b:<9} {n:>5} {pct(mean)} {pct(ex)} "
-              f"{tails:>6} {win:>6.0%}")
+    table, text_lines, unknown_n = _outcome_table_from_rows(rows)
+    b.table(table, text_lines=text_lines)
     if unknown_n > 0:
-        print(
-            f"\n  ⚠  UNKNOWN n={unknown_n}: rows predate the dte column and "
-            f"cannot be classified — never merge into 0DTE or 1DTE+"
+        b.lines(
+            "",
+            f"⚠  UNKNOWN n={unknown_n}: rows predate the dte column and "
+            f"cannot be classified — never merge into 0DTE or 1DTE+",
         )
-    print("\n  mean    = ask-entry / bid-exit return (trade we actually make)")
-    print("  ex-tail = mean with >= +100% removed")
-    print(
-        f"  sealed excluded from n: stale={n_stale}  unavailable={n_unavail}"
+    # Same text as before; callout flag makes the bid-exit caveat prominent in HTML.
+    b.lines("", callout=False)
+    b.lines(
+        "mean    = ask-entry / bid-exit return (trade we actually make)",
+        callout=True,
+    )
+    b.lines(
+        "ex-tail = mean with >= +100% removed",
+        f"sealed excluded from n: stale={n_stale}  unavailable={n_unavail}",
     )
     return rows
 
 
-def section_buckets(conn, where, args, horizon="t1h"):
+def section_buckets(
+    conn, where, args, horizon="t1h", *, doc: ReportDoc | None = None,
+):
     """Clustered by (date, contract). One observation per contract per day."""
+    b = DocBuilder(doc)
     hrs = f"hours_{horizon}"
     max_h = max_hours_for(horizon)
     excluded = count_late_marks(conn, where, args, horizon)
@@ -442,67 +1365,65 @@ def section_buckets(conn, where, args, horizon="t1h"):
             f"OUTCOMES @ {horizon.upper()}  (clustered, {hrs} <= {max_h}"
             f"; excluded {excluded} marks taken > {max_h}h late)"
         )
-    hr(title)
+    b.section(title)
     if horizon == "t1h":
-        # Live-quote window ends at MARK_WINDOW_END; T+1h due past that is
-        # unmarkable — final-hour flags never enter the T1H sample.
         cut_hm = last_markable_flag_clock("t1h")[:5]
-        print(
-            f"  note: excludes flags after ~{cut_hm} ET "
-            f"(T+1h falls past the quote window)"
-        )
-        print(
-            "        — hour_et buckets for the final hour are "
-            "structurally empty at T1H"
+        b.lines(
+            f"note: excludes flags after ~{cut_hm} ET "
+            f"(T+1h falls past the quote window)",
+            "      — hour_et buckets for the final hour are "
+            "structurally empty at T1H",
         )
 
     rows = clustered_bucket_rows(conn, where, args, horizon)
     if not rows:
-        print("  no marked outcomes in window")
+        b.lines("no marked outcomes in window")
         return rows
 
-    print(f"  {'':<8} {'bucket':<9} {'n':>5} {'mean':>8} {'ex-tail':>8} "
-          f"{'tails':>6} {'win%':>7}")
-    last = None
-    unknown_n = 0
-    for dte_b, rank_b, n, mean, ex, tails, win in rows:
-        lead = dte_b if dte_b != last else ""
-        last = dte_b
-        if dte_b == "UNKNOWN":
-            unknown_n += int(n)
-        print(f"  {lead:<8} {rank_b:<9} {n:>5} {pct(mean)} {pct(ex)} "
-              f"{tails:>6} {win:>6.0%}")
+    table, text_lines, unknown_n = _outcome_table_from_rows(rows)
+    b.table(table, text_lines=text_lines)
     if unknown_n > 0:
-        print(
-            f"\n  ⚠  UNKNOWN n={unknown_n}: rows predate the dte column and "
-            f"cannot be classified — never merge into 0DTE or 1DTE+"
+        b.lines(
+            "",
+            f"⚠  UNKNOWN n={unknown_n}: rows predate the dte column and "
+            f"cannot be classified — never merge into 0DTE or 1DTE+",
         )
-    print("\n  mean    = what an equal-weight basket returned (this is your P&L)")
-    print("  ex-tail = mean with >= +100% removed (is the edge broad or 3 lucky rows?)")
+    b.lines(
+        "",
+        "mean    = what an equal-weight basket returned (this is your P&L)",
+        "ex-tail = mean with >= +100% removed (is the edge broad or 3 lucky rows?)",
+    )
     return rows
 
 
-def section_verdict(conn, where, args):
-    hr("VERDICT")
+def section_verdict(conn, where, args, *, doc: ReportDoc | None = None):
+    b = DocBuilder(doc)
+    b.section("VERDICT")
     rows = verdict_rows(conn, where, args)
-    d = {b: (n, m) for b, n, m in rows}
+    d = {bkt: (n, m) for bkt, n, m in rows}
     top, ctl = d.get("TOP3"), d.get("CONTROL")
     if not top or not ctl:
-        print("  insufficient data — need both TOP3 and CONTROL rows (1DTE+)")
+        b.lines("insufficient data — need both TOP3 and CONTROL rows (1DTE+)")
         return rows
     edge = top[1] - ctl[1]
-    print(f"  1DTE+ TOP3   n={top[0]:<5} {pct(top[1])}")
-    print(f"  1DTE+ CONTROL n={ctl[0]:<5} {pct(ctl[1])}")
-    print(f"  edge over control: {edge:+.1%}")
+    b.lines(
+        f"1DTE+ TOP3   n={top[0]:<5} {pct(top[1])}",
+        f"1DTE+ CONTROL n={ctl[0]:<5} {pct(ctl[1])}",
+        f"edge over control: {edge:+.1%}",
+    )
     n = min(top[0], ctl[0])
     if n < 200:
-        print(f"  ⚠  n={n} is too small to call. Need ~200+ contract-days per bucket.")
+        b.lines(
+            f"⚠  n={n} is too small to call. Need ~200+ contract-days per bucket."
+        )
     elif abs(edge) < 0.02:
-        print("  → no meaningful edge over picking nearest-ATM")
+        b.lines("→ no meaningful edge over picking nearest-ATM")
     elif edge > 0:
-        print("  → engine beats control. Check it holds across days before believing it.")
+        b.lines(
+            "→ engine beats control. Check it holds across days before believing it."
+        )
     else:
-        print("  → control beats the engine.")
+        b.lines("→ control beats the engine.")
     return rows
 
 
@@ -726,28 +1647,29 @@ def _fmt_win(x) -> str:
     return f"{x:5.0%}"
 
 
-def section_paper_strategy(conn, filt: ReportFilter):
+def section_paper_strategy(
+    conn, filt: ReportFilter, *, doc: ReportDoc | None = None,
+):
     """
     Buy-one-contract, hold-to-close under three fixed entry rules.
 
     Anti-curve-fitting: rules and parameters are locked; do not search over
     entry times / confirm counts or pick entries using the exit.
     """
-    hr("PAPER STRATEGY")
-    print(
-        "  three entry rules, fixed in advance — "
-        "do not add, remove, or tune after seeing results"
-    )
-    print(
-        f"  params  ENTRY_TIME_ET={ENTRY_TIME_ET}  CONFIRM_N={CONFIRM_N}  "
-        f"exit=mark_close  pnl=(mark_close-mid)*100"
+    b = DocBuilder(doc)
+    b.section("PAPER STRATEGY")
+    b.lines(
+        "three entry rules, fixed in advance — "
+        "do not add, remove, or tune after seeing results",
+        f"params  ENTRY_TIME_ET={ENTRY_TIME_ET}  CONFIRM_N={CONFIRM_N}  "
+        f"exit=mark_close  pnl=(mark_close-mid)*100",
     )
     if (
         ENTRY_TIME_ET != _LOCKED_ENTRY_TIME_ET
         or CONFIRM_N != _LOCKED_CONFIRM_N
     ):
-        print(
-            "  ⚠  ENTRY_TIME_ET/CONFIRM_N differ from locked defaults "
+        b.lines(
+            "⚠  ENTRY_TIME_ET/CONFIRM_N differ from locked defaults "
             f"({_LOCKED_ENTRY_TIME_ET} / {_LOCKED_CONFIRM_N}) — "
             "results across parameter values are not comparable"
         )
@@ -756,7 +1678,6 @@ def section_paper_strategy(conn, filt: ReportFilter):
     engine_scans = _load_paper_scans(conn, where, args, control=False)
     control_scans = _load_paper_scans(conn, where, args, control=True)
 
-    # Precompute all trades for each rule
     engine_by_rule = {
         rule: paper_trades_for_rule(engine_scans, rule, is_control=False)
         for rule in PAPER_RULES
@@ -771,9 +1692,10 @@ def section_paper_strategy(conn, filt: ReportFilter):
         WHERE {where} AND mark_close IS NOT NULL
     """, args)[0][0]
     if not n_close:
-        print(
-            "\n  no mark_close rows in window — paper P&L empty until "
-            "mark_runner writes session-close marks"
+        b.lines(
+            "",
+            "no mark_close rows in window — paper P&L empty until "
+            "mark_runner writes session-close marks",
         )
 
     header = (
@@ -781,10 +1703,13 @@ def section_paper_strategy(conn, filt: ReportFilter):
         f"{'total$':>8} {'mean$':>8} {'med$':>8} "
         f"{'best':>8} {'worst':>8} {'persist':>7}"
     )
+    headers = [
+        "variant", "n_days", "n", "win%", "total$", "mean$", "med$",
+        "best", "worst", "persist",
+    ]
 
     for rule in PAPER_RULES:
-        print(f"\n  {rule}")
-        print(header)
+        b.subhead(rule)
         engine = engine_by_rule[rule]
         control = control_by_rule[rule]
         buckets = {
@@ -793,27 +1718,48 @@ def section_paper_strategy(conn, filt: ReportFilter):
             "1DTE+": [t for t in engine if t.dte_bucket == "1DTE+"],
             "CONTROL": control,
         }
-
+        text_lines = [header]
+        table_rows: list[list[Cell]] = []
         for variant in PAPER_VARIANTS:
             s = _summarize_pnls(buckets[variant])
             persist = (
                 "      -" if s["persist"] is None else f"{s['persist']:7.1f}"
             )
-            print(
+            text_lines.append(
                 f"  {variant:<8} {s['n_days']:>6} {s['n']:>4} "
                 f"{_fmt_win(s['win'])} "
                 f"{_fmt_money(s['total'])} {_fmt_money(s['mean'])} "
                 f"{_fmt_money(s['median'])} {_fmt_money(s['best'])} "
                 f"{_fmt_money(s['worst'])} {persist}"
             )
+            mean_raw = s["mean"]
+            table_rows.append([
+                Cell(variant),
+                Cell(str(s["n_days"]), kind="num"),
+                Cell(str(s["n"]), kind="num"),
+                Cell(_fmt_win(s["win"]).strip(), kind="pct"),
+                Cell(_fmt_money(s["total"]).strip(), kind="num"),
+                Cell(
+                    _fmt_money(s["mean"]).strip(),
+                    kind="mean",
+                    raw=None if mean_raw is None else float(mean_raw),
+                ),
+                Cell(_fmt_money(s["median"]).strip(), kind="num"),
+                Cell(_fmt_money(s["best"]).strip(), kind="num"),
+                Cell(_fmt_money(s["worst"]).strip(), kind="num"),
+                Cell(persist.strip(), kind="num"),
+            ])
+        b.table(
+            TableBlock(headers=headers, rows=table_rows),
+            text_lines=text_lines,
+        )
 
-    print(
-        "\n  persist = mean consecutive rank-1 (or control) scans from entry "
-        "(diagnostic only; not extra observations)"
-    )
-    print(
-        "  clustering: one trade per (rule, date, contract) — "
-        "re-entries the same day do not add n"
+    b.lines(
+        "",
+        "persist = mean consecutive rank-1 (or control) scans from entry "
+        "(diagnostic only; not extra observations)",
+        "clustering: one trade per (rule, date, contract) — "
+        "re-entries the same day do not add n",
     )
 
 
@@ -992,32 +1938,36 @@ def section_factor_separation(
     since: str,
     until: str,
     ticker: str | None,
+    doc: ReportDoc | None = None,
 ):
     """
     Diagnostic: which logged variables separate T15M winners from losers.
     Aggregates window-to-date. Does not feed scoring.
     """
-    hr("FACTOR SEPARATION")
-    print(
-        "  diagnostic only — do not act on these until the window closes "
-        f"{WINDOW_END_NOTE}"
+    b = DocBuilder(doc)
+    b.section("FACTOR SEPARATION")
+    b.lines(
+        "diagnostic only — do not act on these until the window closes "
+        f"{WINDOW_END_NOTE}",
+        callout=True,
     )
     obs = _load_factor_observations(
         conn, since=since, until=until, ticker=ticker,
     )
     sessions = sorted({o["sess"] for o in obs}) if obs else []
-    print(
-        f"  range {since} → {until}  sessions={len(sessions)}  "
+    b.lines(
+        f"range {since} → {until}  sessions={len(sessions)}  "
         f"clustered_obs={len(obs)}"
-        f"{'  ticker=' + ticker if ticker else ''}"
+        f"{'  ticker=' + ticker if ticker else ''}",
     )
-    print("  returns = (mark_t15m - ask) / ask  |  method quote|trade only")
+    b.lines(
+        "returns = (mark_t15m - ask) / ask  |  method quote|trade only",
+        callout=True,
+    )
     if not obs:
-        print("  no usable T15M observations in factor window")
+        b.lines("no usable T15M observations in factor window")
         return
 
-    # Quartile edges over FULL window to date, per pool (engine rows only so
-    # control density does not shift cuts — still report CONTROL in buckets).
     q_edges: dict[tuple[str, str], tuple[float, float, float]] = {}
     for pool in ("0DTE", "1DTE+"):
         for var in ("flow_raw", "leverage_raw"):
@@ -1040,25 +1990,23 @@ def section_factor_separation(
 
     for pool in ("0DTE", "1DTE+"):
         pool_obs = [o for o in obs if o["pool"] == pool]
-        print(f"\n  ── {pool}  (n_obs={len(pool_obs)}) ──")
+        b.subhead(f"── {pool}  (n_obs={len(pool_obs)}) ──")
         if not pool_obs:
-            print("  (no observations)")
+            b.lines("(no observations)")
             continue
 
         for var in fixed_vars:
-            print(f"\n  {var}")
+            b.subhead(var)
             if var in ("flow_raw", "leverage_raw"):
                 edges = q_edges.get((pool, var))
                 if not edges:
-                    print("  (insufficient data for quartile edges)")
+                    b.lines("(insufficient data for quartile edges)")
                     continue
-                print(
-                    f"  quartile cuts (engine, window): "
+                b.lines(
+                    f"quartile cuts (engine, window): "
                     f"{edges[0]:.4g} | {edges[1]:.4g} | {edges[2]:.4g}"
                 )
-            print(f"  {'bucket':<12} {'who':<8} {'n':>5} {'mean':>8} {'win%':>7}")
 
-            # Assign labels
             labeled: list[tuple[str, dict]] = []
             for o in pool_obs:
                 if var in ("flow_raw", "leverage_raw"):
@@ -1074,6 +2022,12 @@ def section_factor_separation(
                     continue
                 labeled.append((lab, o))
 
+            headers = ["bucket", "who", "n", "mean", "win%"]
+            text_lines = [
+                f"  {'bucket':<12} {'who':<8} {'n':>5} {'mean':>8} {'win%':>7}"
+            ]
+            table_rows: list[list[Cell]] = []
+            muted_rows: list[bool] = []
             order = list(_FACTOR_BUCKET_ORDER[var])
             seen_extra = sorted({lab for lab, _ in labeled if lab not in order})
             for lab in order + seen_extra:
@@ -1083,9 +2037,8 @@ def section_factor_separation(
                         if lab_i == lab and int(o["is_control"] or 0) == ctrl_flag
                     ]
                     if not subset and ctrl_flag == 1:
-                        continue  # skip empty CONTROL lines
+                        continue
                     if not subset and ctrl_flag == 0:
-                        # still print empty engine buckets? skip for noise
                         continue
                     n = len(subset)
                     rets = [float(o["ret"]) for o in subset]
@@ -1093,19 +2046,71 @@ def section_factor_separation(
                     win = (
                         sum(1 for r in rets if r > 0) / n if n else None
                     )
-                    low = " (low n)" if n < FACTOR_LOW_N else ""
+                    low_n = n < FACTOR_LOW_N
+                    low = " (low n)" if low_n else ""
                     win_s = "     -" if win is None else f"{win:>6.0%}"
-                    print(
+                    text_lines.append(
                         f"  {lab:<12} {who:<8} {n:>5} {pct(mean)} {win_s}{low}"
                     )
+                    table_rows.append([
+                        Cell(lab),
+                        Cell(who),
+                        Cell(str(n), kind="num"),
+                        _mean_cell(mean),
+                        Cell(
+                            (win_s.strip() + low).strip(),
+                            kind="pct",
+                        ),
+                    ])
+                    muted_rows.append(low_n)
+            b.table(
+                TableBlock(
+                    headers=headers, rows=table_rows, muted_rows=muted_rows,
+                ),
+                text_lines=text_lines,
+            )
 
 
-def section_flags(conn, filt: ReportFilter):
+def _cap_hit_flag_line(filt: ReportFilter) -> str | None:
+    """Surface mark_runner runtime-cap shortfalls recorded that session/window."""
+    if filt.on_date:
+        hits = load_cap_hits(on_date=filt.on_date)
+    elif filt.since:
+        hits = load_cap_hits(since=filt.since, until=date.today().isoformat())
+    else:
+        hits = load_cap_hits(on_date=date.today().isoformat())
+    if not hits:
+        return None
+    by_h: dict[str, list[int]] = defaultdict(list)
+    for rec in hits:
+        by_h[str(rec.get("horizon") or "?")].append(int(rec.get("remaining") or 0))
+    parts = [
+        f"{h}×{len(ns)} (≈{sum(ns)} left)"
+        for h, ns in sorted(by_h.items())
+    ]
+    n_events = len(hits)
+    total_left = sum(int(r.get("remaining") or 0) for r in hits)
+    return (
+        f"mark_runner runtime cap hit — {n_events} horizon truncation"
+        f"{'s' if n_events != 1 else ''} "
+        f"[{'; '.join(parts)}]; ≈{total_left} rows left unmarked "
+        f"(exit 0 for launchd — see data/mark_runner_cap_hits.jsonl)"
+    )
+
+
+def section_flags(
+    conn, filt: ReportFilter, *, doc: ReportDoc | None = None,
+):
     """Data-quality checks with explicit WHERE per table (no string rewrite)."""
-    hr("DATA-QUALITY FLAGS")
+    b = DocBuilder(doc)
+    b.section("DATA-QUALITY FLAGS")
     out = []
     v_where, v_args = filt.where_sql()
     f_where, f_args = filt.where_sql()  # flags shares ts_et / ticker columns
+
+    cap_line = _cap_hit_flag_line(filt)
+    if cap_line:
+        out.append(cap_line)
 
     n = q(conn, f"SELECT COUNT(*) FROM v_outcomes WHERE {v_where} AND score > 1.0",
           v_args)[0][0]
@@ -1157,18 +2162,14 @@ def section_flags(conn, filt: ReportFilter):
         out.append(f"top-3 avg open interest {r[0][0]:.0f} — vol/OI likely inflated")
 
     info: list[str] = []
-    # Split null marks: late-session flags whose due falls past the live-quote
-    # window (MARK_WINDOW_END) are structurally unmarkable — not a runner fault.
     now_et = datetime.now(ET)
     clock = "substr(ts_et, 12, 8)"
     win_hm = _et_clock_str(MARK_WINDOW_END)[:5]
-    # Age before a null mark is treated as overdue (due lag + slack).
     overdue_age = {"t1h": timedelta(hours=4), "t1d": timedelta(hours=28)}
 
     for horizon, label in (("t1h", "T+1h"), ("t1d", "T+1d")):
         mark_col = f"mark_{horizon}"
         last_ok = last_markable_flag_clock(horizon)
-        # Unmarkable: due (flag + lag) at/after quote-window close.
         n_unmark = int(q(conn, f"""
             SELECT COUNT(*) FROM v_outcomes
             WHERE {v_where}
@@ -1180,7 +2181,6 @@ def section_flags(conn, filt: ReportFilter):
                 f"{n_unmark} rows unmarkable for {label} "
                 f"(due after {win_hm} ET — late-session flags)"
             )
-        # Genuinely overdue: due was inside the window, flag old enough, still null.
         cutoff = (now_et - overdue_age[horizon]).isoformat(timespec="seconds")
         n_over = int(q(conn, f"""
             SELECT COUNT(*) FROM v_outcomes
@@ -1200,7 +2200,10 @@ def section_flags(conn, filt: ReportFilter):
         lines.append(f"i  {x}")
     for x in out:
         lines.append(f"⚠ {x}")
-    print("  " + ("\n  ".join(lines) if lines else "none"))
+    if lines:
+        b.lines(*lines)
+    else:
+        b.lines("none")
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -1261,47 +2264,72 @@ def main(argv: list[str] | None = None) -> int:
     out_path = a.out or report_path(
         span_key=span_key, ticker=filt.ticker, generated=generated,
     )
+    html_path = (
+        out_path[:-4] + ".html"
+        if out_path.lower().endswith(".txt")
+        else report_path(
+            span_key=span_key, ticker=filt.ticker, generated=generated, ext="html",
+        )
+    )
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
 
-    buf = io.StringIO()
-    old_stdout = sys.stdout
-    sys.stdout = _Tee(old_stdout, buf)
-    try:
-        print("=" * 68)
-        print(f"  SCANNER REPORT — {span}"
-              f"{' — ' + filt.ticker if filt.ticker else ''}")
-        print(f"  generated {generated.strftime('%Y-%m-%d %H:%M')}")
-        print(f"  db {a.db}")
-        print("=" * 68)
+    # Compute once into ReportDoc; render text + HTML from the same blocks.
+    doc = ReportDoc()
+    doc.banner([
+        f"SCANNER REPORT — {span}"
+        f"{' — ' + filt.ticker if filt.ticker else ''}",
+        f"generated {generated.strftime('%Y-%m-%d %H:%M')}",
+        f"db {a.db}",
+    ])
 
-        if not section_coverage(conn, w, args):
-            text = buf.getvalue()
-            with open(out_path, "w", encoding="utf-8") as fh:
-                fh.write(text)
-            print(f"\n  wrote {out_path}", file=old_stdout)
-            return 1
-        section_short_buckets(conn, w, args, "t15m")
-        section_short_buckets(conn, w, args, "t30m")
-        section_buckets(conn, w, args, "t1h")
-        section_buckets(conn, w, args, "t1d")
-        section_verdict(conn, w, args)
-        section_paper_strategy(conn, filt)
-        section_factor_separation(
-            conn,
-            since=factor_since,
-            until=factor_until,
-            ticker=filt.ticker,
-        )
-        section_flags(conn, filt)
-        print()
-        print("── SAVED ─────────────────────────────────────────────────────────")
-        print(f"  {out_path}")
-        print()
-    finally:
-        sys.stdout = old_stdout
+    if not section_coverage(conn, w, args, doc=doc):
+        text = render_text(doc)
+        html = render_html(doc)
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        print(text, end="")
+        print(f"\n  wrote {out_path}")
+        print(f"  wrote {html_path}")
+        return 1
 
+    t15m_obs = clustered_short_obs(conn, w, args, "t15m")
+    section_short_buckets(conn, w, args, "t15m", doc=doc, obs=t15m_obs)
+    section_short_buckets(conn, w, args, "t30m", doc=doc)
+    section_buckets(conn, w, args, "t1h", doc=doc)
+    section_buckets(conn, w, args, "t1d", doc=doc)
+    section_verdict(conn, w, args, doc=doc)
+    section_paper_strategy(conn, filt, doc=doc)
+    section_factor_separation(
+        conn,
+        since=factor_since,
+        until=factor_until,
+        ticker=filt.ticker,
+        doc=doc,
+    )
+    timing_obs = exit_timing_matched_obs(conn, w, args)
+    section_charts(t15m_obs=t15m_obs, timing_obs=timing_obs, doc=doc)
+    section_flags(conn, filt, doc=doc)
+    doc.blank()
+    doc.section("SAVED")
+    doc.lines(out_path)  # .txt path only — keep text report unchanged
+    doc.blank()
+
+    text = render_text(doc)
+    html_doc = ReportDoc(blocks=list(doc.blocks))
+    # HTML SAVED footer also points at the companion .html file.
+    for i in range(len(html_doc.blocks) - 1, -1, -1):
+        if html_doc.blocks[i][0] == "lines":
+            html_doc.blocks[i] = ("lines", [out_path, html_path])
+            break
+    html = render_html(html_doc)
     with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(buf.getvalue())
+        fh.write(text)
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print(text, end="")
+    print(f"  also wrote {html_path}")
     return 0
 
 

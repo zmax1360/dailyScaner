@@ -230,3 +230,114 @@ def test_unknown_warning_printed():
         section_buckets(conn, "1=1", [], "t1h")
     assert "UNKNOWN" in buf.getvalue()
     assert "predate the dte column" in buf.getvalue()
+
+
+def test_hist_bucket_edges():
+    from eod_report import hist_bucket, histogram_counts, HIST_OVERFLOW
+
+    assert hist_bucket(-1.0) == 0
+    assert hist_bucket(-0.95) == 0
+    assert hist_bucket(0.0) == 10
+    assert hist_bucket(1.0) == 19
+    assert hist_bucket(1.01) == HIST_OVERFLOW
+    counts, n, mean = histogram_counts([-0.5, 0.2, 0.2, 1.5])
+    assert n == 4
+    assert counts[5] == 1   # -50%
+    assert counts[12] == 2  # +20%
+    assert counts[HIST_OVERFLOW] == 1
+    assert mean == pytest.approx((-0.5 + 0.2 + 0.2 + 1.5) / 4)
+
+
+def test_engine_control_groups_reuse_obs():
+    from eod_report import engine_control_t15m_groups, FACTOR_LOW_N
+
+    obs = (
+        [{"dte_b": "0DTE", "rank_b": "01-03", "r": 0.10}] * 5
+        + [{"dte_b": "0DTE", "rank_b": "CONTROL", "r": -0.05}] * 2
+        + [{"dte_b": "1DTE+", "rank_b": "01-03", "r": 0.02}] * FACTOR_LOW_N
+        + [{"dte_b": "1DTE+", "rank_b": "04-10", "r": 0.99}]  # ignored
+    )
+    g = {x["pool"]: x for x in engine_control_t15m_groups(obs)}
+    assert g["0DTE"]["engine_n"] == 5 and g["0DTE"]["engine_low"] is True
+    assert g["0DTE"]["engine_mean"] == pytest.approx(0.10)
+    assert g["0DTE"]["ctrl_n"] == 2
+    assert g["1DTE+"]["engine_n"] == FACTOR_LOW_N
+    assert g["1DTE+"]["engine_low"] is False
+
+
+def test_exit_timing_series_low_n_and_means():
+    from eod_report import exit_timing_series
+
+    obs = [
+        {
+            "rank_b": "01-03",
+            "r15": 0.10, "r30": 0.20, "r1h": 0.30, "rclose": 0.40,
+        },
+        {
+            "rank_b": "CONTROL",
+            "r15": -0.10, "r30": -0.10, "r1h": -0.10, "rclose": -0.10,
+        },
+    ]
+    series = {s["rank"]: s for s in exit_timing_series(obs)}
+    assert series["01-03"]["n"] == 1 and series["01-03"]["low_n"] is True
+    assert series["01-03"]["means"]["15m"] == pytest.approx(0.10)
+    assert series["01-03"]["means"]["close"] == pytest.approx(0.40)
+    assert series["CONTROL"]["means"]["1h"] == pytest.approx(-0.10)
+
+
+def test_charts_html_only_not_in_text():
+    from eod_report import (
+        ChartBlock, ReportDoc, render_html, render_text, svg_histogram,
+        histogram_counts,
+    )
+
+    counts, n, mean = histogram_counts([0.1, -0.2])
+    doc = ReportDoc()
+    doc.section("T15M")
+    doc.lines("mean    = ask-entry / bid-exit return (trade we actually make)")
+    doc.html_section("CHARTS")
+    doc.chart(ChartBlock(svg=svg_histogram(
+        title="RETURN DISTRIBUTION  0DTE  rank 01-03",
+        counts=counts, n=n, mean=mean,
+    )))
+    text = render_text(doc)
+    html_out = render_html(doc)
+    assert "<svg" not in text
+    assert "CHARTS" not in text
+    assert "<svg" in html_out and "n=2" in html_out
+    assert "<script" not in html_out
+    assert "cdn." not in html_out
+    assert "mean    = ask-entry" in text
+
+
+def test_exit_timing_matched_requires_all_four_horizons():
+    from eod_report import exit_timing_matched_obs, exit_timing_series
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript("""
+        CREATE TABLE v_outcomes (
+            ts_et TEXT, ticker TEXT, side TEXT, strike REAL, expiry TEXT,
+            dte INTEGER, rank INTEGER, is_control INTEGER, ask REAL,
+            ret_t15m REAL, method_t15m TEXT, minutes_t15m REAL,
+            ret_t30m REAL, method_t30m TEXT, minutes_t30m REAL,
+            ret_t1h REAL, hours_t1h REAL, ret_close REAL
+        );
+    """)
+    base = ("2026-08-10T10:00:00-04:00", "AAPL", "CALL", 200.0, "2026-08-14")
+    conn.execute(
+        """INSERT INTO v_outcomes VALUES
+           (?,?,?,?,?, 5,1,0, 1.0,
+            0.10,'quote',10, 0.20,'quote',20, 0.30,1.0, 0.40)""",
+        base,
+    )
+    conn.execute(
+        """INSERT INTO v_outcomes VALUES
+           (?,?,?,?,?, 5,1,0, 1.0,
+            0.11,'quote',10, 0.21,'quote',20, 0.31,1.0, NULL)""",
+        ("2026-08-10T10:05:00-04:00", "AAPL", "CALL", 205.0, "2026-08-14"),
+    )
+    obs = exit_timing_matched_obs(conn, "1=1", [])
+    assert len(obs) == 1
+    s = exit_timing_series(obs)
+    assert s[0]["n"] == 1
+    assert s[0]["means"]["close"] == pytest.approx(0.40)

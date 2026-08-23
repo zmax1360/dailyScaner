@@ -11,6 +11,9 @@ data/journal/
 files/
 files.zip
 .env
+data/schwab_tokens.json
+data/mark_runner_cap_hits.jsonl
+data/mark_runner_cursor.json
 *.log
 logs/
 report/
