@@ -44,6 +44,7 @@ from best_value_ui import (
     STAR_COL,
     attach_contract_keys,
     best_value_star,
+    greeks_display_columns,
     pending_add_pos_payload,
 )
 from volume_analysis import (
@@ -2618,6 +2619,10 @@ def _render_best_value_panel(
             spot=spot,
         )
 
+    # Display-only provider greeks from the already-fetched chain (vol_curr).
+    # Do not use scoring ``delta`` (Black-Scholes overwrite). Missing → "—".
+    greeks_disp = greeks_display_columns(top5, vol_curr)
+
     disp = top5.rename(columns={
         "side":           "Side",
         "strike":         "Strike",
@@ -2645,6 +2650,10 @@ def _render_best_value_panel(
     disp["Volume"]      = disp["Volume"].apply(lambda x: f"{int(x):,}")
     disp["OI"]          = disp["OI"].apply(lambda x: f"{int(x):,}")
     disp["IV"]          = disp["IV"].apply(lambda x: f"{x:.1%}" if x > 0 else "—")
+    disp["Delta"] = greeks_disp["Delta"].to_numpy() if not greeks_disp.empty else "—"
+    disp["Theta/Prem"] = (
+        greeks_disp["Theta/Prem"].to_numpy() if not greeks_disp.empty else "—"
+    )
     if has_dvol:
         disp["ΔVol"]    = disp["ΔVol"].apply(
             lambda x: f"{int(x):+,}" if pd.notna(x) else "—"
@@ -2673,7 +2682,9 @@ def _render_best_value_panel(
     st.caption(
         "**SCALE 50%** if premium ≥ +25% vs tracked entry "
         "(prior archive / first-seen).  "
-        "Select a row, then **Check this** or **＋ Add … to Open Positions**."
+        "Select a row, then **Check this** or **＋ Add … to Open Positions**.  "
+        "Delta: 🔴 abs(δ)<0.15 · 🟠 0.15–0.25 · plain otherwise "
+        "(display only — rows are not filtered)."
     )
     _render_add_position_form(ticker)
 
@@ -2945,8 +2956,12 @@ def _render_best_value_table_with_plus(
         show_cols.append("ΔVol")
     # Velocity / Target dropped — typically uniform zeros/"—" and steal width
     # from Optimal Strategy. Score_Velocity still drives Action_Signal upstream.
+    # TODO(2026-08-28): Signal often renders "(0)" and Optimal Strategy is
+    # identical across rows even as Value_Score ranges (~0.08–0.29). Consistent
+    # with known flow_norm / leverage_norm / category-multiplier bugs. Do not
+    # fix during the measurement window.
     show_cols += [
-        "IV", "Value_Score", "Signal", "Optimal Strategy",
+        "IV", "Delta", "Theta/Prem", "Value_Score", "Signal", "Optimal Strategy",
     ]
 
     # ★ marker replaces pandas Styler highlight (see note below on Streamlit 1.37.1).
@@ -2979,6 +2994,8 @@ def _render_best_value_table_with_plus(
         "OI": st.column_config.TextColumn("OI", width="small"),
         "ΔVol": st.column_config.TextColumn("ΔVol", width="small"),
         "IV": st.column_config.TextColumn("IV", width="small"),
+        "Delta": st.column_config.TextColumn("Delta", width="small"),
+        "Theta/Prem": st.column_config.TextColumn("Theta/Prem", width="small"),
         "Value_Score": st.column_config.TextColumn("Value_Score", width="small"),
         "Signal": st.column_config.TextColumn("Signal", width="medium"),
         "Optimal Strategy": st.column_config.TextColumn(

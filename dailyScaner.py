@@ -392,6 +392,27 @@ def _clean_history(df):
     return df
 
 
+_VOLUME_BLOCK_CORE_COLS = [
+    "strike", "expiry", "dte", "lastPrice", "bid", "ask",
+    "volume", "openInterest", "impliedVolatility",
+]
+_VOLUME_BLOCK_GREEK_COLS = ("delta", "theta")
+
+
+def _volume_block_records(leg: pd.DataFrame, n: int = 30) -> list:
+    """Top-n volume contracts for the archive volume block. Greeks optional."""
+    if leg is None or getattr(leg, "empty", True):
+        return []
+    if "volume" not in leg.columns:
+        return []
+    sub = leg[leg["volume"] > 0].head(int(n))
+    cols = [c for c in _VOLUME_BLOCK_CORE_COLS if c in sub.columns]
+    cols.extend(c for c in _VOLUME_BLOCK_GREEK_COLS if c in sub.columns)
+    if not cols:
+        return []
+    return sub[cols].to_dict(orient="records")
+
+
 def _legacy_option_leg(chain: pd.DataFrame, side: str) -> pd.DataFrame:
     """Map CHAIN_COLUMNS rows back to the scanner's legacy Yahoo-shaped leg."""
     sub = chain.loc[chain["side"] == side].copy()
@@ -400,6 +421,7 @@ def _legacy_option_leg(chain: pd.DataFrame, side: str) -> pd.DataFrame:
             columns=[
                 "strike", "lastPrice", "volume", "openInterest",
                 "impliedVolatility", "bid", "ask", "expiry", "dte",
+                "delta", "theta",
             ]
         )
     out = pd.DataFrame({
@@ -414,6 +436,11 @@ def _legacy_option_leg(chain: pd.DataFrame, side: str) -> pd.DataFrame:
         "expiry": sub["expiry"].astype(str),
         "dte": sub["dte"],
     })
+    # Provider greeks — persist when the source supplied them. Display only.
+    if "delta" in sub.columns:
+        out["delta"] = pd.to_numeric(sub["delta"], errors="coerce")
+    if "theta" in sub.columns:
+        out["theta"] = pd.to_numeric(sub["theta"], errors="coerce")
     return out.sort_values("volume", ascending=False).reset_index(drop=True)
 
 
@@ -909,12 +936,8 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
             "total_call_vol": int(calls_all["volume"].sum()),
             "total_put_vol":  int(puts_all["volume"].sum()),
             "pc_ratio": round(float(puts_all["volume"].sum() / calls_all["volume"].sum()), 3) if calls_all["volume"].sum() > 0 else 0,
-            "top_puts":  puts_all[puts_all["volume"]>0].head(30)[
-                ["strike","expiry","dte","lastPrice","bid","ask","volume","openInterest","impliedVolatility"]
-            ].to_dict(orient="records"),
-            "top_calls": calls_all[calls_all["volume"]>0].head(30)[
-                ["strike","expiry","dte","lastPrice","bid","ask","volume","openInterest","impliedVolatility"]
-            ].to_dict(orient="records"),
+            "top_puts":  _volume_block_records(puts_all),
+            "top_calls": _volume_block_records(calls_all),
         }
     }
 
@@ -1045,14 +1068,8 @@ def run(source=None):
 
     # Top-30 shaped volume block -- quality gate + per-contract rollover check.
     _vol_gate = {
-        "top_calls": calls_all[calls_all["volume"] > 0].head(30)[
-            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
-             "volume", "openInterest", "impliedVolatility"]
-        ].to_dict(orient="records"),
-        "top_puts": puts_all[puts_all["volume"] > 0].head(30)[
-            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
-             "volume", "openInterest", "impliedVolatility"]
-        ].to_dict(orient="records"),
+        "top_calls": _volume_block_records(calls_all),
+        "top_puts": _volume_block_records(puts_all),
         "total_call_vol": total_cv0,
         "total_put_vol": total_pv0,
     }
@@ -1293,14 +1310,8 @@ def run(source=None):
 
     # Attribution: every scored contract + ATM controls (fail-soft)
     vol_curr = {
-        "top_calls": calls_all[calls_all["volume"] > 0].head(30)[
-            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
-             "volume", "openInterest", "impliedVolatility"]
-        ].to_dict(orient="records"),
-        "top_puts": puts_all[puts_all["volume"] > 0].head(30)[
-            ["strike", "expiry", "dte", "lastPrice", "bid", "ask",
-             "volume", "openInterest", "impliedVolatility"]
-        ].to_dict(orient="records"),
+        "top_calls": _volume_block_records(calls_all),
+        "top_puts": _volume_block_records(puts_all),
     }
     vol_prev_bv = None
     if prev_result:

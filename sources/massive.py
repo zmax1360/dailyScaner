@@ -112,8 +112,10 @@ def map_snapshot_results_to_chain(
 
         iv = _as_float(item.get("implied_volatility"), zero_to_nan=True)
         delta = float("nan")
+        theta = float("nan")
         if isinstance(greeks, dict) and greeks:
             delta = _as_float(greeks.get("delta"))
+            theta = _as_float(greeks.get("theta"))
 
         # Absent last_quote → NaN bid/ask (never 0, never synthesised from close)
         if quote:
@@ -135,11 +137,16 @@ def map_snapshot_results_to_chain(
             "openInterest": _as_float(item.get("open_interest")),
             "iv": iv,
             "delta": delta,
+            "theta": theta,
         })
 
     if not rows:
         return validate_chain(pd.DataFrame(columns=CHAIN_COLUMNS))
-    return validate_chain(pd.DataFrame(rows, columns=CHAIN_COLUMNS))
+    # theta is display-only — attach after validate so CHAIN_COLUMNS stays exact.
+    base = validate_chain(pd.DataFrame(rows, columns=CHAIN_COLUMNS))
+    base = base.copy()
+    base["theta"] = pd.to_numeric([r["theta"] for r in rows], errors="coerce")
+    return base
 
 
 def _cap_strikes_per_expiry(
@@ -164,7 +171,11 @@ def _cap_strikes_per_expiry(
     if not parts:
         return df
     out = pd.concat(parts, ignore_index=True)
-    return validate_chain(out[CHAIN_COLUMNS])
+    extras = [c for c in out.columns if c not in CHAIN_COLUMNS]
+    base = validate_chain(out[CHAIN_COLUMNS])
+    for c in extras:
+        base[c] = out[c].to_numpy()
+    return base
 
 
 def _retry_sleep(attempt: int, *, base: float = 2.0) -> float:

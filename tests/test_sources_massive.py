@@ -15,6 +15,7 @@ from sources.base import CHAIN_COLUMNS, MarketDataSource
 from sources.massive import (
     MassivePlanError,
     MassiveSource,
+    _cap_strikes_per_expiry,
     map_snapshot_results_to_chain,
     ns_utc_to_et,
 )
@@ -42,13 +43,15 @@ def test_massive_maps_to_chain_contract(snapshot_payload):
         today_et=date(2026, 7, 28),
         max_dte=45,
     )
-    assert list(df.columns) == CHAIN_COLUMNS
+    assert list(df.columns)[: len(CHAIN_COLUMNS)] == CHAIN_COLUMNS
+    assert "theta" in df.columns
     assert not df.empty
     row = df[(df["strike"] == 340.0) & (df["side"] == "CALL")].iloc[0]
     assert row["expiry"] == "2026-08-21"
     assert row["volume"] == pytest.approx(1200.0)
     assert row["bid"] == pytest.approx(2.20)
     assert row["delta"] == pytest.approx(0.55)
+    assert row["theta"] == pytest.approx(-0.1)
 
 
 def test_empty_greeks_yields_nan_delta(snapshot_payload):
@@ -57,6 +60,18 @@ def test_empty_greeks_yields_nan_delta(snapshot_payload):
     )
     deep = df[(df["strike"] == 205.0) & (df["side"] == "CALL")].iloc[0]
     assert math.isnan(float(deep["delta"]))
+    assert math.isnan(float(deep["theta"]))
+
+
+def test_strike_cap_preserves_provider_theta(snapshot_payload):
+    df = map_snapshot_results_to_chain(
+        snapshot_payload["results"], today_et=date(2026, 7, 28), max_dte=45,
+    )
+    capped = _cap_strikes_per_expiry(df, spot=340.0, max_per_side=1)
+    row = capped[(capped["strike"] == 340.0) & (capped["side"] == "CALL")]
+    assert not row.empty
+    assert "theta" in capped.columns
+    assert float(row.iloc[0]["theta"]) == pytest.approx(-0.1)
 
 
 def test_missing_last_quote_yields_nan_bid_ask(snapshot_payload):
