@@ -19,13 +19,22 @@ warnings.filterwarnings("ignore")
 from logging_config import setup_logging
 log = logging.getLogger("weekly")
 
-TICKER  = sys.argv[1].upper() if len(sys.argv) > 1 else "AAPL"
+def _parse_ticker() -> str:
+    """Read ticker from argv, ignoring flags like --AAPL / --source."""
+    for candidate in sys.argv[1:]:
+        if candidate.startswith("-"):
+            continue
+        if candidate.isalpha() and 1 <= len(candidate) <= 5:
+            return candidate.upper()
+    return "AAPL"
+
+TICKER  = _parse_ticker()
 W            = 70    # report width
 SPREAD_WIDTH = 10.0  # target width of the ATM bull call spread in points
 
-# ── KNOWN EARNINGS (update manually each quarter) ─────────────────────────────
+# ── KNOWN EARNINGS (update manually each quarter; past dates are ignored) ─────
 EARNINGS = {
-    "AAPL": datetime(2026, 7, 30),
+    "AAPL": datetime(2026, 10, 30),  # next print after 2026-07-30; confirm each quarter
 }
 
 # ── COLOR HELPERS (shared with daily scanner) ─────────────────────────────────
@@ -244,12 +253,19 @@ def analyze_oi_structure(calls, puts, spot):
     }
 
 def earnings_check(ticker, today=None):
-    """Check days to next earnings."""
+    """Days to next earnings. Stale (already-past) dates are treated as unknown."""
     today   = today or datetime.today()
     earndt  = EARNINGS.get(ticker)
     if not earndt:
         return None, None
-    days    = (earndt - today).days
+    days    = (earndt.date() - today.date()).days
+    if days < 0:
+        log.warning(
+            "EARNINGS[%s]=%s is %d days in the past — ignoring. "
+            "Update the dict to the next print.",
+            ticker, earndt.strftime("%Y-%m-%d"), abs(days),
+        )
+        return None, None
     return earndt.strftime("%Y-%m-%d"), days
 
 def checklist(ticker_data, macro, oi, earnings_days):
@@ -646,20 +662,30 @@ def print_report(ticker, ticker_data, macro, oi, score, checks, thesis, earnings
     log.info(f"{'─'*W}\n")
 
 # ── GATE HELPERS ──────────────────────────────────────────────────────────────
-def _compute_exit_date(earnings_date, expiration: str) -> str:
+def _compute_exit_date(earnings_date, expiration: str, today=None) -> str:
     """
-    Hard exit date: day before earnings if earnings falls on or before
-    expiration, otherwise the expiration date itself.
+    Hard exit date: day before earnings if that earnings is still ahead
+    and falls on or before expiration; otherwise expiration.
 
-    earnings_date is a "YYYY-MM-DD" string (from earnings_check) or None.
-    expiration is always a "YYYY-MM-DD" string (from fetch_options_30dte).
+    Never returns a date on or before *today* (optionlab requires
+    start_date < target_date). Stale earnings must not produce a past exit.
     """
+    today_d = (today or datetime.today()).date()
+    exp_dt  = datetime.strptime(expiration, "%Y-%m-%d").date()
+
+    def _usable(d) -> bool:
+        return d > today_d
+
     if earnings_date is None:
         return expiration
     earn_dt = datetime.strptime(earnings_date, "%Y-%m-%d").date()
-    exp_dt  = datetime.strptime(expiration,    "%Y-%m-%d").date()
+    if earn_dt <= today_d:
+        return expiration
     if earn_dt <= exp_dt:
-        return (datetime.strptime(earnings_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        hard = earn_dt - timedelta(days=1)
+        if _usable(hard):
+            return hard.strftime("%Y-%m-%d")
+        return expiration
     return expiration
 
 
@@ -709,7 +735,8 @@ def run(source=None):
     ticker_data       = analyze_ticker(daily, weekly)
     macro             = analyze_macro(macro_raw)
     oi                = analyze_oi_structure(calls, puts, ticker_data["daily"]["spot"])
-    earnings_date, earnings_days = earnings_check(TICKER)
+    today = datetime.today()
+    earnings_date, earnings_days = earnings_check(TICKER, today=today)
     score, checks     = checklist(ticker_data, macro, oi, earnings_days)
 
     cand = select_candidate_spread(calls, ticker_data["daily"]["spot"])
@@ -718,12 +745,12 @@ def run(source=None):
                      "reasons": ["no valid candidate: chain too thin or failed sanity checks"]}
         exit_date = None
     else:
-        exit_date = _compute_exit_date(earnings_date, exp)
+        exit_date = _compute_exit_date(earnings_date, exp, today=today)
         gate      = evaluate_spread_gate(
             spot=ticker_data["daily"]["spot"], iv=cand["iv"],
             long_strike=cand["long_strike"],   short_strike=cand["short_strike"],
             long_premium=cand["long_premium"], short_premium=cand["short_premium"],
-            entry_date=datetime.today().strftime("%Y-%m-%d"),
+            entry_date=today.strftime("%Y-%m-%d"),
             exit_date=exit_date, expiration=exp,
         )
 
