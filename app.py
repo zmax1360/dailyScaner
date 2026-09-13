@@ -42,11 +42,18 @@ from best_value_archive import (
 from best_value_ui import (
     CONTRACT_KEY_COL,
     STAR_COL,
+    apply_display_keep,
     attach_contract_keys,
     best_value_star,
+    contract_key,
+    filter_ranked_display,
     greeks_display_columns,
+    hidden_delta_band_caption,
+    is_fully_extrinsic,
     pending_add_pos_payload,
+    ranked_delta_band_mask,
 )
+from time_stop import format_exit_by_cell
 from volume_analysis import (
     get_stock_volume_analysis,
     get_intraday_vwap_state,
@@ -80,6 +87,17 @@ from pov_leakage import (
 )
 import portfolio_store as portfolio_store
 import pre_trade_check as pre_trade_check
+from scanner.journal_io import journal_path_for_day, list_journal_days, load_journal_day
+from scanner.journal_view import (
+    concat_all_fills,
+    day_fill_counts,
+    load_all_day_frames,
+    metrics_from_match,
+    positions_frame,
+    today_et as journal_today_et,
+    try_match,
+    closed_on_day,
+)
 
 ET = ZoneInfo("America/New_York")
 
@@ -269,6 +287,18 @@ def _watch_archive_auto_refresh(ticker: str) -> None:
         st.caption("Auto-refresh on · watching for new scans")
 
     _watcher()
+
+
+def _latest_weekly_archive(ticker: str) -> dict:
+    files = sorted(glob.glob(f"archive_weekly/{ticker}_*.json"), reverse=True)
+    if not files:
+        return {}
+    try:
+        with open(files[0]) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _latest_archive(ticker: str = "AAPL") -> dict | None:
@@ -2558,6 +2588,8 @@ def _render_best_value_panel(
         "iv", "Value_Score", "Score_Velocity",
         "Action_Signal", "Target_Status", "Status",
     ]
+    if "extrinsic" in df.columns:
+        keep.append("extrinsic")
     show_n = int(max(1, min(30, top_n)))
     top5 = (
         df[keep]
@@ -2669,9 +2701,44 @@ def _render_best_value_panel(
     if "Optimal Strategy" not in disp.columns:
         disp["Optimal Strategy"] = "—"
 
+    now_et = datetime.now(ET)
+    exit_cells = []
+    for _, r in top5.iterrows():
+        worthless = (
+            is_fully_extrinsic(r.get("extrinsic"), r.get("last"))
+            if "extrinsic" in r.index else False
+        )
+        exit_cells.append(
+            format_exit_by_cell(
+                r.get("dte"), r.get("expiry"),
+                now=now_et, fully_extrinsic=worthless,
+            )
+        )
+    disp["Exit by"] = exit_cells
+
+    show_all = st.toggle(
+        "Show all ranked contracts",
+        value=False,
+        key=f"bv_delta_show_all_{str(ticker).upper()}",
+        help="Default hides rows outside the Pre-Trade |δ| band 0.35–0.50, "
+             "including missing delta. Does not change scoring or attribution.",
+    )
+    vis_top5, n_hidden, n_ranked = filter_ranked_display(
+        top5, vol_curr, show_all=show_all,
+    )
+    if show_all:
+        vis_disp = disp
+        st.caption(
+            f"Showing all {n_ranked} ranked contracts (delta band filter off)."
+        )
+    else:
+        keep = ranked_delta_band_mask(top5, vol_curr)
+        vis_disp = apply_display_keep(disp, keep)
+        st.caption(hidden_delta_band_caption(n_hidden, n_ranked))
+
     # Interactive table: ＋ column in-row (st.dataframe cannot host buttons)
     _render_best_value_table_with_plus(
-        ticker, top5, disp, has_dvol=has_dvol,
+        ticker, vis_top5, vis_disp, has_dvol=has_dvol,
         scan_id=snapshot.get("scan_id"),
     )
     # Caption: Velocity/Target columns removed from the table. Score_Velocity is
@@ -2683,8 +2750,9 @@ def _render_best_value_panel(
         "**SCALE 50%** if premium ≥ +25% vs tracked entry "
         "(prior archive / first-seen).  "
         "Select a row, then **Check this** or **＋ Add … to Open Positions**.  "
-        "Delta: 🔴 abs(δ)<0.15 · 🟠 0.15–0.25 · plain otherwise "
-        "(display only — rows are not filtered)."
+        "Default view: 0.35 ≤ |δ| ≤ 0.50 (Pre-Trade band; null δ hidden).  "
+        "Delta tones when showing all: 🔴 abs(δ)<0.15 · 🟠 0.15–0.25.  "
+        "**Exit by** is now-relative (0DTE +30m / 1DTE+ +60m, cap 15:45 ET)."
     )
     _render_add_position_form(ticker)
 
@@ -2713,7 +2781,7 @@ def _render_best_value_panel(
         st.success("  \n".join(lines), icon="⭐")
 
     # Charts sit below the scanner table/callout so the table layout stays untouched.
-    _render_expiry_distribution_charts(top5, spot)
+    _render_expiry_distribution_charts(vis_top5, spot)
 
 
 def _expiry_dist_degenerate_reason(iv, dte_days) -> str:
@@ -2950,7 +3018,7 @@ def _render_best_value_table_with_plus(
     disp_r = disp.reset_index(drop=True)
 
     show_cols = [
-        STAR_COL, "Side", "Strike", "Expiry", "DTE", "Price", "Volume", "OI",
+        STAR_COL, "Side", "Strike", "Expiry", "DTE", "Exit by", "Price", "Volume", "OI",
     ]
     if has_dvol and "ΔVol" in disp_r.columns:
         show_cols.append("ΔVol")
@@ -2989,6 +3057,7 @@ def _render_best_value_table_with_plus(
         "Strike": st.column_config.TextColumn("Strike", width="small"),
         "Expiry": st.column_config.TextColumn("Expiry", width="medium"),
         "DTE": st.column_config.TextColumn("DTE", width="small"),
+        "Exit by": st.column_config.TextColumn("Exit by", width="medium"),
         "Price": st.column_config.TextColumn("Price", width="small"),
         "Volume": st.column_config.TextColumn("Volume", width="small"),
         "OI": st.column_config.TextColumn("OI", width="small"),
@@ -4787,6 +4856,8 @@ def _render_tab2(cfg: dict):
         float(payload.get("spot") or 0),
         vol_prev,
         float(prev_payload.get("spot") or 0) if prev_payload else 0.0,
+        ticker=ticker,
+        scan_ts=payload.get("timestamp"),
     )
 
 
@@ -4801,16 +4872,16 @@ def _norm_pdf(x: float) -> float:
 def _bs_greeks(
     S: float, K: float, iv: float, dte_days: int,
     r: float = 0.05, is_call: bool = True,
-) -> tuple[float | None, float | None]:
+) -> tuple[float | None, float | None, float | None]:
     """
-    Black-Scholes gamma and theta.
-    Returns (gamma, theta_per_calendar_day).
-    Theta is in dollars (negative = time decay cost per day).
-    Returns (None, None) when inputs are invalid (e.g. 0DTE, zero IV).
+    Black-Scholes delta, gamma, and theta (archive display / prefill only).
+    Returns (delta, gamma, theta_per_calendar_day).
+    Theta is in dollars per calendar day (negative = time decay cost).
+    Returns (None, None, None) when inputs are invalid (e.g. 0DTE, zero IV).
     """
     import math
     if dte_days <= 0 or iv <= 0.001 or S <= 0 or K <= 0:
-        return None, None
+        return None, None, None
     try:
         T    = dte_days / 365.0
         sqT  = math.sqrt(T)
@@ -4819,6 +4890,7 @@ def _bs_greeks(
         nd1  = _norm_pdf(d1)
         disc = math.exp(-r * T)
 
+        delta = _norm_cdf(d1) if is_call else _norm_cdf(d1) - 1.0
         gamma = nd1 / (S * iv * sqT)
 
         theta_annual = -(S * nd1 * iv) / (2 * sqT)
@@ -4827,14 +4899,17 @@ def _bs_greeks(
         else:
             theta_annual += r * K * disc * _norm_cdf(-d2)
 
-        return gamma, theta_annual / 365.0
+        return delta, gamma, theta_annual / 365.0
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def _render_greeks_panel(
     vol_curr: dict, spot: float,
     vol_prev: dict | None = None, prev_spot: float = 0.0,
+    *,
+    ticker: str = "",
+    scan_ts: str | None = None,
 ) -> None:
     """
     Theta & Gamma by strike — computed from Black-Scholes using archive IV.
@@ -4857,11 +4932,10 @@ def _render_greeks_panel(
         fmt = f"+{v:.{precision}f}" if v > 0 else f"{v:.{precision}f}"
         return fmt
 
-    def _delta_style(val: str) -> str:
-        s = str(val)
-        if s.startswith("+"): return "color:#00c853;font-weight:bold"
-        if s.startswith("-"): return "color:#d50000;font-weight:bold"
-        return "color:#666"
+    def _quote_cell(v: float) -> str:
+        if v != v or v <= 0:
+            return "—"
+        return f"${v:.2f}"
 
     rows = []
     for side, vol_key, is_call in [
@@ -4874,15 +4948,28 @@ def _render_greeks_panel(
             dte    = int(c.get("dte") or 0)
             expiry = c.get("expiry", "?")
             price  = float(c.get("lastPrice") or 0)
+            oi     = c.get("openInterest")
+            try:
+                bid = float(c["bid"]) if c.get("bid") is not None else float("nan")
+            except (TypeError, ValueError):
+                bid = float("nan")
+            try:
+                ask = float(c["ask"]) if c.get("ask") is not None else float("nan")
+            except (TypeError, ValueError):
+                ask = float("nan")
 
-            gamma, theta = _bs_greeks(spot, strike, iv, dte, is_call=is_call)
+            delta, gamma, theta = _bs_greeks(
+                spot, strike, iv, dte, is_call=is_call,
+            )
 
             # Previous greeks
             p = prev_lookup.get((side, strike, expiry))
             if p and prev_spot > 0:
                 p_iv  = float(p.get("impliedVolatility") or 0)
                 p_dte = int(p.get("dte") or 0)
-                pg, pt = _bs_greeks(prev_spot, strike, p_iv, p_dte, is_call=is_call)
+                _, pg, pt = _bs_greeks(
+                    prev_spot, strike, p_iv, p_dte, is_call=is_call,
+                )
             else:
                 pg, pt = None, None
 
@@ -4895,12 +4982,23 @@ def _render_greeks_panel(
                 "Expiry":  expiry,
                 "DTE":     f"{dte}d",
                 "Price":   f"${price:.2f}",
+                "Bid":     _quote_cell(bid),
+                "Ask":     _quote_cell(ask),
                 "IV":      f"{iv:.1%}" if iv > 0 else "—",
+                "Delta":   f"{abs(delta):.3f}" if delta is not None else "—",
                 "Gamma":   f"{gamma:.5f}" if gamma is not None else "—",
                 "Theta/d": f"${theta:.4f}" if theta is not None else "—",
                 "_strike": strike,
+                "_dte":    dte,
+                "_delta":  delta,
                 "_gamma":  gamma,
                 "_theta":  theta,
+                # Unit of _theta from _bs_greeks (calendar-day dollars). Do not assume at prefill.
+                "_theta_units": "per day",
+                "_oi":     oi,
+                "_bid":    bid if bid == bid and bid > 0 else None,
+                "_ask":    ask if ask == ask and ask > 0 else None,
+                CONTRACT_KEY_COL: contract_key(side, strike, expiry),
             }
             if vol_prev:
                 row["ΔGamma"] = _signed_greek(d_gamma, 5)
@@ -4913,20 +5011,80 @@ def _render_greeks_panel(
 
     df = pd.DataFrame(rows)
 
-    def _side_style(val: str) -> str:
-        if val == "CALL": return "color:#00c853;font-weight:bold"
-        if val == "PUT":  return "color:#d50000;font-weight:bold"
-        return ""
-
-    display_cols = ["Side","Strike","Expiry","DTE","Price","IV","Gamma","Theta/d"]
+    display_cols = ["Side","Strike","Expiry","DTE","Price","Bid","Ask","IV","Delta","Gamma","Theta/d"]
     if vol_prev:
-        display_cols = ["Side","Strike","Expiry","DTE","Price","IV",
+        display_cols = ["Side","Strike","Expiry","DTE","Price","Bid","Ask","IV","Delta",
                         "Gamma","ΔGamma","Theta/d","ΔTheta"]
 
-    styled = df[display_cols].style.map(_side_style, subset=["Side"])
-    if vol_prev:
-        styled = styled.map(_delta_style, subset=["ΔGamma", "ΔTheta"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    view = df[display_cols + [CONTRACT_KEY_COL]].copy()
+    col_cfg = {CONTRACT_KEY_COL: None}
+    table_key = f"greeks_select_{str(ticker or 'NA').upper()}"
+    sel: list[int] = []
+    try:
+        event = st.dataframe(
+            view,
+            on_select="rerun",
+            selection_mode="single-row",
+            use_container_width=True,
+            hide_index=True,
+            column_config=col_cfg,
+            key=table_key,
+        )
+        if event is not None and getattr(event, "selection", None) is not None:
+            sel = list(event.selection.rows or [])
+    except TypeError:
+        st.dataframe(
+            view.drop(columns=[CONTRACT_KEY_COL], errors="ignore"),
+            use_container_width=True,
+            hide_index=True,
+            key=f"{table_key}_fallback_df",
+        )
+        labels = [
+            f"{r['Side']} {r['Strike']} · {r['Expiry']}"
+            for _, r in df.iterrows()
+        ]
+        pick = st.selectbox(
+            "Contract to check",
+            options=["—"] + labels,
+            key=f"{table_key}_fallback_pick",
+        )
+        if pick and pick != "—":
+            sel = [labels.index(pick)]
+
+    raw = df.reset_index(drop=True)
+    chosen = None
+    if sel:
+        try:
+            chosen = raw.iloc[int(sel[0])]
+        except (IndexError, TypeError, ValueError):
+            chosen = None
+
+    if chosen is None:
+        st.caption("Select a row, then **Check this** to prefill Pre-Trade Check.")
+    else:
+        refuse = pre_trade_check.archive_greeks_refusal(
+            chosen.get("_delta"), chosen.get("_theta"),
+        )
+        help_s = refuse or "Open Pre-Trade Check with this contract prefilled."
+        if refuse:
+            st.caption(refuse)
+        if st.button(
+            "Check this",
+            key=f"greeks_check_{str(ticker or 'NA').upper()}",
+            disabled=bool(refuse),
+            help=help_s,
+        ):
+            prefill = pre_trade_check.archive_prefill_from_row(
+                chosen, ticker=ticker, underlying=spot, scan_ts=scan_ts,
+            )
+            if prefill is None:
+                st.warning(refuse or "Cannot prefill this row.")
+            else:
+                cid = str(chosen.get(CONTRACT_KEY_COL) or "")
+                pre_trade_check.stage_archive_prefill(
+                    st, prefill, contract_id=cid or None,
+                )
+                st.rerun()
 
     # ── Altair charts: Gamma | Theta by strike ─────────────────────────────
     chart_df = df[df["_gamma"].notna()].copy()
@@ -5401,7 +5559,7 @@ def _fmt_journal_money(x) -> str:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return "—"
     try:
-        return f"${float(x):+,.0f}"
+        return f"${float(x):+,.2f}"
     except Exception:
         return "—"
 
@@ -5429,22 +5587,17 @@ def _render_tab_journal() -> None:
     st.markdown("### Trade Journal")
     st.caption(
         "Tracks options you **buy** (＋ on Best Value) and **sell** (− close). "
-        "Each day is saved to `data/journal/YYYY-MM-DD.json`."
+        "Each day is saved to `data/journal/YYYY-MM-DD.json`. "
+        "P&L is FIFO from fill prices — stored PnL columns are ignored."
     )
 
-    # Ensure existing ledger trades exist as daily files (idempotent)
-    try:
-        portfolio_store.backfill_daily_journal_from_ledgers()
-    except Exception:
-        pass
-
-    open_df = st.session_state.get("portfolio_df")
-    if open_df is None:
-        open_df = portfolio_store.load_portfolio()
-        st.session_state["portfolio_df"] = open_df
-
-    journal = portfolio_store.journal_dataframe(open_df=open_df)
-    stats = portfolio_store.journal_performance(journal)
+    day_frames = load_all_day_frames()
+    all_fills = concat_all_fills(day_frames)
+    closed_all, open_all, global_err = try_match(all_fills)
+    if global_err:
+        st.error(f"Journal FIFO: {global_err}")
+    stats = metrics_from_match(closed_all, open_all)
+    journal = positions_frame(closed_all, open_all)
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Closed trades", stats["n_closed"])
@@ -5455,7 +5608,7 @@ def _render_tab_journal() -> None:
     )
     m3.metric(
         "Realized PnL",
-        f"${stats['total_realized_pnl']:+,.0f}",
+        f"${stats['total_realized_pnl']:+,.2f}",
     )
     m4.metric(
         "Avg PnL %",
@@ -5463,12 +5616,17 @@ def _render_tab_journal() -> None:
     )
     m5.metric(
         "Open / unrealized",
-        f"{stats['n_open']} · ${stats['unrealized_pnl']:+,.0f}",
+        f"{stats['n_open']} · ${stats['unrealized_pnl']:+,.2f}",
     )
+    if not open_all.empty:
+        st.warning(
+            f"{len(open_all)} unmatched BUY lot(s) across the journal — "
+            "phantom fill until a SELL matches."
+        )
 
     st.markdown("#### Daily record")
-    days = portfolio_store.list_journal_days()
-    today = portfolio_store.today_et()
+    days = list_journal_days()
+    today = journal_today_et()
     day_options = days if days else [today]
     if today not in day_options:
         day_options = [today] + day_options
@@ -5482,17 +5640,25 @@ def _render_tab_journal() -> None:
             key="journal_day_filter",
             help="One JSON file per ET calendar day",
         )
-    day_stats = portfolio_store.day_performance(selected_day)
+    day_df = (
+        day_frames[selected_day]
+        if selected_day in day_frames
+        else load_journal_day(selected_day)
+    )
+    n_buys, n_sells = day_fill_counts(day_df)
+    day_closed = closed_on_day(closed_all, selected_day)
+    day_pnl = (
+        float(day_closed["PnL_Dollars"].sum()) if not day_closed.empty else 0.0
+    )
+    day_pnl_s = f"${day_pnl:+,.2f}"
+    day_file = journal_path_for_day(selected_day)
     with d2:
         st.caption(
-            f"File: `{os.path.relpath(day_stats['file'], os.path.dirname(os.path.abspath(__file__)))}` "
-            f"· buys {day_stats['n_buys']} · sells {day_stats['n_sells']} · "
-            f"day PnL ${day_stats['realized_pnl']:+,.0f}"
+            f"File: `{os.path.relpath(day_file, os.path.dirname(os.path.abspath(__file__)))}` "
+            f"· buys {n_buys} · sells {n_sells} · "
+            f"day PnL {day_pnl_s}"
         )
 
-    from scanner.lot_match import closed_trades, open_inventory
-
-    day_df = portfolio_store.load_journal_day(selected_day)
     if day_df.empty:
         st.info(f"No buy/sell events saved for {selected_day} yet.")
     else:
@@ -5521,7 +5687,7 @@ def _render_tab_journal() -> None:
             height=min(240, 48 + 36 * len(fill_show)),
         )
 
-        lots = closed_trades(day_df)
+        lots = day_closed
         st.markdown("##### Closed lots (FIFO)")
         if lots.empty:
             st.caption("No matched lots yet.")
@@ -5550,12 +5716,6 @@ def _render_tab_journal() -> None:
                 use_container_width=True,
                 hide_index=True,
                 height=min(280, 48 + 36 * len(lot_show)),
-            )
-
-        open_lots = open_inventory(day_df)
-        if not open_lots.empty:
-            st.warning(
-                f"{len(open_lots)} unmatched BUY lot(s) — phantom fill until a SELL matches."
             )
 
         st.download_button(
@@ -5612,14 +5772,12 @@ def _render_tab_journal() -> None:
         lambda x: f"${float(x):.2f}" if pd.notna(x) else "—"
     )
     show["PnL %"] = show.apply(
-        lambda r: _fmt_journal_pct(
-            r["PnL_Pct"] if r["Status"] == "CLOSED" else r["Unrealized_Pct"]
-        ),
+        lambda r: _fmt_journal_pct(r["PnL_Pct"] if r["Status"] == "CLOSED" else None),
         axis=1,
     )
     show["PnL $"] = show.apply(
         lambda r: _fmt_journal_money(
-            r["PnL_Dollars"] if r["Status"] == "CLOSED" else r["Unrealized_Dollars"]
+            r["PnL_Dollars"] if r["Status"] == "CLOSED" else None
         ),
         axis=1,
     )
@@ -5655,7 +5813,7 @@ def _render_tab_journal() -> None:
             .sort_values("Realized_PnL", ascending=False)
         )
         grp["Realized_PnL"] = grp["Realized_PnL"].map(
-            lambda x: f"${float(x):+,.0f}" if pd.notna(x) else "—"
+            lambda x: f"${float(x):+,.2f}" if pd.notna(x) else "—"
         )
         grp["Avg_Pct"] = grp["Avg_Pct"].map(_fmt_journal_pct)
         st.dataframe(grp, use_container_width=True, hide_index=True, height=200)
@@ -5691,6 +5849,13 @@ def main():
         st.session_state["journal_subpage"] = pretrade_label
         st.session_state["ptc_nav_done_for"] = cand
 
+    arch = st.session_state.get(pre_trade_check.ARCHIVE_PREFILL_KEY)
+    arch_id = arch.get("id") if isinstance(arch, dict) else None
+    if arch_id and st.session_state.get("ptc_nav_done_for") != arch_id:
+        st.session_state["nav_main"] = journal_label
+        st.session_state["journal_subpage"] = pretrade_label
+        st.session_state["ptc_nav_done_for"] = arch_id
+
     page = _choice_control("Page", labels, default=labels[0], key="nav_main")
 
     if page == labels[0]:
@@ -5721,10 +5886,20 @@ def main():
             except (TypeError, ValueError):
                 spot_f = None
             # Sidebar spot is a chart field — do not pass it when a candidate
-            # is loaded; the page leaves underlying blank for you to type.
+            # or archive prefill is loaded; archive sets underlying itself.
+            arch_pending = st.session_state.get(pre_trade_check.ARCHIVE_PREFILL_KEY)
+            ticker = str(cfg.get("ticker") or "")
+            vwap_info = _cached_vwap_state(ticker) if ticker else {}
+            weekly_payload = _latest_weekly_archive(ticker) if ticker else {}
             pre_trade_check.render_pre_trade_page(
-                default_ticker=str(cfg.get("ticker") or ""),
-                default_spot=None if cand else spot_f,
+                default_ticker=ticker,
+                default_spot=None if (cand or arch_pending) else spot_f,
+                or_data=(latest.get("or_data") or {}) if latest else {},
+                vwap=(vwap_info or {}).get("VWAP"),
+                emas={
+                    "daily": (weekly_payload.get("daily") or {}),
+                    "weekly": (weekly_payload.get("weekly") or {}),
+                },
             )
 
 

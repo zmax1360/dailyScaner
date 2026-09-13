@@ -323,3 +323,12 @@ def test_t10_distance_field_validation():
     neg_i = compute_pre_trade(_t2(target_distance=2.00, invalidation_distance=-1.00))
     assert neg_i["field_errors"].get("invalidation_distance") == DISTANCE_ERROR
     assert neg_i["verdict"] == "SKIP"
+
+
+def test_pretrade_paths_are_outside_journal_dir():
+    from pre_trade_check import CHECKS_PATH, PREFS_PATH, SCANS_PATH
+
+    for path in (CHECKS_PATH, PREFS_PATH, SCANS_PATH):
+        norm = path.replace("\\", "/")
+        assert "/data/pretrade/" in norm
+        assert "/data/journal/" not in norm

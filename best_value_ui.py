@@ -20,6 +20,10 @@ STAR_COL = "★"
 # Display-only visual gate (do not filter or reorder). Attribution thresholds.
 _DELTA_RED = 0.15
 _DELTA_AMBER = 0.25
+# Post-ranking view filter. Same numbers as Pre-Trade DELTA_MIN / DELTA_MAX.
+# Does not change scoring, ranking, or attribution writes.
+DISPLAY_DELTA_MIN = 0.35
+DISPLAY_DELTA_MAX = 0.50
 # TODO(2026-08-28): Signal often renders "(0)" and Optimal Strategy is identical
 # across rows even as Value_Score ranges (~0.08–0.29). Consistent with known
 # flow_norm / leverage_norm / category-multiplier bugs. Do not fix during the
@@ -87,6 +91,82 @@ def delta_cell_tone(delta: Any) -> str | None:
     return "plain"
 
 
+def delta_in_pretrade_band(
+    delta: Any,
+    *,
+    lo: float = DISPLAY_DELTA_MIN,
+    hi: float = DISPLAY_DELTA_MAX,
+) -> bool:
+    """True when |delta| is inside the Pre-Trade gate. Null/NaN → False."""
+    d = _finite_float(delta)
+    if d is None:
+        return False
+    mag = abs(d)
+    return lo <= mag <= hi
+
+
+def ranked_delta_band_mask(
+    top5: pd.DataFrame,
+    vol_curr: dict | None,
+    *,
+    lo: float = DISPLAY_DELTA_MIN,
+    hi: float = DISPLAY_DELTA_MAX,
+) -> list[bool]:
+    """
+    Per-row keep flags for the ranked scanner table.
+
+    Uses provider ``chain_delta`` (the displayed Delta), never scoring
+    ``delta`` and never strike distance. Null delta → False.
+    """
+    if top5 is None or getattr(top5, "empty", True):
+        return []
+    attached = attach_chain_greeks(top5, vol_curr)
+    return [
+        delta_in_pretrade_band(d, lo=lo, hi=hi)
+        for d in attached["chain_delta"]
+    ]
+
+
+def apply_display_keep(frame: pd.DataFrame, keep: list[bool]) -> pd.DataFrame:
+    """Positional keep. Do not pass a bool list to ``iloc`` (True→1, False→0)."""
+    if frame is None or getattr(frame, "empty", True):
+        return frame.copy() if frame is not None else pd.DataFrame()
+    if len(keep) != len(frame):
+        return frame.copy()
+    pos = [i for i, k in enumerate(keep) if k]
+    return frame.iloc[pos].copy()
+
+
+def filter_ranked_display(
+    top5: pd.DataFrame,
+    vol_curr: dict | None,
+    *,
+    show_all: bool = False,
+    lo: float = DISPLAY_DELTA_MIN,
+    hi: float = DISPLAY_DELTA_MAX,
+) -> tuple[pd.DataFrame, int, int]:
+    """
+    View filter after ranking. ``top5`` is not modified.
+
+    Returns ``(visible, n_hidden, n_ranked)``. ``show_all=True`` restores
+    the full ranked list (hidden=0).
+    """
+    if top5 is None or getattr(top5, "empty", True):
+        empty = top5.copy() if top5 is not None else pd.DataFrame()
+        return empty, 0, 0
+    n_ranked = len(top5)
+    if show_all:
+        return top5.copy(), 0, n_ranked
+    keep = ranked_delta_band_mask(top5, vol_curr, lo=lo, hi=hi)
+    visible = apply_display_keep(top5, keep)
+    n_hidden = n_ranked - len(visible)
+    return visible, n_hidden, n_ranked
+
+
+def hidden_delta_band_caption(n_hidden: int, n_ranked: int) -> str:
+    return f"{n_hidden} of {n_ranked} hidden: outside delta band"
+
+
 def format_delta_cell(delta: Any) -> str:
     """
     Display Delta. Colour travels in the cell text so a Streamlit header
@@ -101,6 +181,15 @@ def format_delta_cell(delta: Any) -> str:
     if tone == "amber":
         return f"🟠 {formatted}"
     return formatted
+
+
+def is_fully_extrinsic(extrinsic: Any, price: Any) -> bool:
+    """True when extrinsic/price rounds to 100.0% — same rule as Pre-Trade."""
+    p = _finite_float(price)
+    e = _finite_float(extrinsic)
+    if p is None or p <= 0 or e is None:
+        return False
+    return round((e / p) * 100, 1) == 100.0
 
 
 def format_theta_prem(theta: Any, price: Any) -> str:

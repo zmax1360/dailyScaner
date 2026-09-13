@@ -90,11 +90,11 @@ def test_oversell_raises():
 
 def test_legacy_file_drops_stored_pnl():
     raw = json.loads(Path("data/journal/2026-07-28.json").read_text())
-    assert any("PnL_Dollars" in row for row in raw)
     df = load_journal_day("2026-07-28")
     assert not df.empty
     for col in ("PnL_Pct", "PnL_Dollars", "Entry_Price"):
         assert col not in df.columns
+        assert not any(col in row for row in raw)
     assert list(df.columns) == FILL_COLS
     assert set(df["Action"]) == {"BUY", "SELL"}
 
