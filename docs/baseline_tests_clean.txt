@@ -1,0 +1,72 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.7, pytest-9.1.1, pluggy-1.6.0
+rootdir: /Users/alizafarianaraki/works/optionTrading
+configfile: pyproject.toml
+testpaths: tests
+plugins: cov-7.1.0, socket-0.8.1, langsmith-0.7.24, anyio-4.13.0
+collected 406 items
+
+tests/test_0dte_delta.py ......                                          [  1%]
+tests/test_attribution.py .................                              [  5%]
+tests/test_best_value_engine.py ...........x.xx..................        [ 13%]
+tests/test_best_value_ui.py ......                                       [ 15%]
+tests/test_dailyScaner_regressions.py ...............                    [ 18%]
+tests/test_dashboard_adapters.py ...................                     [ 23%]
+tests/test_delta_tasks.py .............                                  [ 26%]
+tests/test_distribution.py .........                                     [ 29%]
+tests/test_eod_report.py .............                                   [ 32%]
+tests/test_eod_scan.py ........                                          [ 34%]
+tests/test_f04_strategy.py ..................                            [ 38%]
+tests/test_golden_master.py .x                                           [ 39%]
+tests/test_health_overdue.py ....                                        [ 40%]
+tests/test_import_graph.py ..                                            [ 40%]
+tests/test_journal_metrics.py .......                                    [ 42%]
+tests/test_journal_pnl.py ...                                            [ 43%]
+tests/test_leverage_abs_delta.py .......                                 [ 44%]
+tests/test_logging_config.py ...                                         [ 45%]
+tests/test_lot_match.py ......                                           [ 47%]
+tests/test_mark_close.py ...............                                 [ 50%]
+tests/test_mark_runner_expiry.py ..........                              [ 53%]
+tests/test_mark_short_horizon.py ........                                [ 55%]
+tests/test_mark_staleness.py .....                                       [ 56%]
+tests/test_massive_strike_window.py .F.....                              [ 58%]
+tests/test_matched_chain_rollover.py ........                            [ 60%]
+tests/test_no_naive_datetime.py ....                                     [ 61%]
+tests/test_notify_gates.py ...............                               [ 64%]
+tests/test_paper_strategy.py .......                                     [ 66%]
+tests/test_pre_trade_check.py ...........                                [ 69%]
+tests/test_pretrade_bridge.py ..........................                 [ 75%]
+tests/test_report_timestamps.py ...                                      [ 76%]
+tests/test_scanner_greeks_display.py ...........                         [ 79%]
+tests/test_scoring_inputs_persist.py ............                        [ 82%]
+tests/test_scoring_pools.py ..........                                   [ 84%]
+tests/test_session_scoped_dormant.py ..                                  [ 84%]
+tests/test_source_aware_rollover.py .........                            [ 87%]
+tests/test_sources_base.py ....                                          [ 88%]
+tests/test_sources_fixture.py ....                                       [ 89%]
+tests/test_sources_massive.py ..........                                 [ 91%]
+tests/test_sources_yahoo.py .......                                      [ 93%]
+tests/test_spread_gate.py ...                                            [ 94%]
+tests/test_stale_volume.py .........                                     [ 96%]
+tests/test_time_stop.py ........                                         [ 98%]
+tests/test_weekly_exit_date.py .......                                   [100%]
+
+=================================== FAILURES ===================================
+____________________ test_no_pagination_cap_hit_with_window ____________________
+tests/test_massive_strike_window.py:73: in test_no_pagination_cap_hit_with_window
+    assert not df.empty
+E   assert not True
+E    +  where True = Empty DataFrame\nColumns: [side, strike, expiry, dte, bid, ask, last, volume, openInterest, iv, delta]\nIndex: [].empty
+=============================== warnings summary ===============================
+tests/test_spread_gate.py::test_garbage_inputs_never_raise
+  /Users/alizafarianaraki/works/Conda/anaconda3/lib/python3.12/site-packages/optionlab/black_scholes.py:422: RuntimeWarning: divide by zero encountered in divide
+    return (log(s0 / x) + (r - y + vol * vol / 2.0) * years_to_maturity) / (
+
+tests/test_spread_gate.py::test_garbage_inputs_never_raise
+  /Users/alizafarianaraki/works/Conda/anaconda3/lib/python3.12/site-packages/optionlab/black_scholes.py:457: RuntimeWarning: divide by zero encountered in divide
+    return (log(s0 / x) + (r - y - vol * vol / 2.0) * years_to_maturity) / (
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_massive_strike_window.py::test_no_pagination_cap_hit_with_window
+============= 1 failed, 401 passed, 4 xfailed, 2 warnings in 5.38s =============
