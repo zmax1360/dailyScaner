@@ -236,8 +236,8 @@ def test_diff_reports_none_qualified_consistently():
     assert "315.0" not in joined, "unqualified put leaked into magnet diff"
 
 
-def test_archive_persists_signal_magnets(tmp_path):
-    os.chdir(tmp_path)
+def test_archive_persists_signal_magnets(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     tf = {"1D": {"rsi": 70.0, "macd": 1.0, "sig": 0.5, "hist": 1.0,
                  "vs": 1.0, "support": 300.0, "resist": 331.0, "price": 330.0}}
     fjson, _ = save_archive(330.02, tf, CURR_CALLS, CURR_PUTS)
