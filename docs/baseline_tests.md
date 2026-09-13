@@ -1,5 +1,20 @@
 # Baseline test results
 
+**Superseded as the runnable baseline.** The capture below is the dirty-tree Session 1 run (HEAD `ce1bf69`): official `pytest` collected 369, **0 executed**, **2 collection errors**. Keep this file and `docs/baseline_tests.txt` — that delta is the evidence.
+
+Current pushed baseline is **`013958b`** (cwd leak fix) / **`e2aff2a`** (this note’s companion log). Verbatim log: `docs/baseline_tests_clean.txt`.
+
+| | dirty-tree (this file / `.txt`) | clean (`013958b` / `e2aff2a`) |
+|---|---|---|
+| collected | 369 + 2 collection errors | 406 |
+| passed | 0 (official); 359 (remainder workaround) | **401** |
+| failed | 0 (official); 6 (remainder) | **1** (`tests/test_massive_strike_window.py::test_no_pagination_cap_hit_with_window`) |
+| xfailed | 0 (official); 4 (remainder) | **4** |
+| collection errors | 2 | **0** |
+| wall | 2.95s official | 5.38s |
+
+---
+
 Captured 2026-09-12. Session 1 of `instruction/CURSOR_DOCUMENT_BASELINE.md`.
 No tests were modified, deleted, or marked.
 
