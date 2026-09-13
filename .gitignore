@@ -8,6 +8,7 @@ data/attribution.db*
 data/portfolio.json
 data/portfolio_closed.json
 data/journal/
+data/pretrade/
 files/
 files.zip
 .env
@@ -18,3 +19,12 @@ data/mark_runner_cursor.json
 logs/
 report/
 backups/
+scheduler.pid
+scheduler.pid.lock
+attribution_report.html
+cha.txt
+data/broker/
+data/journal copy/
+data/journal.bak/
+data/journal.bak-*/
+script/
