@@ -4,6 +4,12 @@ portfolio_store.py — Persist My Open Positions across Streamlit sessions.
 Open ledger:   data/portfolio.json
 Closed ledger: data/portfolio_closed.json  (exit price + realized PnL)
 Daily journal: data/journal/YYYY-MM-DD.json  (append-only buy/sell events per day)
+
+The Journal tab no longer reads this module for P&L. It loads fills via
+scanner.journal_io and derives FIFO P&L via scanner.lot_match /
+scanner.journal_view. journal_dataframe, journal_performance,
+day_performance, and backfill_daily_journal_from_ledgers are superseded
+for that tab (left here for other callers).
 """
 
 from __future__ import annotations
@@ -249,6 +255,9 @@ def backfill_daily_journal_from_ledgers() -> int:
     """
     One-shot: write missing BUY/SELL events from open + closed ledgers
     into daily journal files. Returns number of events newly written.
+
+    SUPERSEDED for the Journal tab — that tab reads fill files directly
+    and does not call this. Left in place for other callers.
     """
     written = 0
     open_df = load_portfolio()
@@ -510,6 +519,12 @@ JOURNAL_COLS = [
     "Bought_At", "Bought_Price", "Sold_At", "Sold_Price",
     "PnL_Pct", "PnL_Dollars", "Unrealized_Pct", "Unrealized_Dollars",
 ]
+
+# SUPERSEDED for the Journal tab (2026-08-26): journal_dataframe,
+# journal_performance, and day_performance assemble a ledger view that
+# sums stored PnL_Dollars. The Journal tab uses scanner.journal_io +
+# scanner.lot_match (FIFO from fill prices) instead. Left here so other
+# callers keep compiling. Do not wire these back into the Journal tab.
 
 
 def journal_dataframe(

@@ -17,12 +17,15 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from time_stop import hold_hours_for_dte
+
 ET = ZoneInfo("America/New_York")
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
-CHECKS_PATH = os.path.join(_BASE, "data", "journal", "pre_trade_checks.json")
-PREFS_PATH = os.path.join(_BASE, "data", "journal", "pre_trade_prefs.json")
-SCANS_PATH = os.path.join(_BASE, "data", "journal", "pretrade_scans.json")
+_PRETRADE_DIR = os.path.join(_BASE, "data", "pretrade")
+CHECKS_PATH = os.path.join(_PRETRADE_DIR, "pre_trade_checks.json")
+PREFS_PATH = os.path.join(_PRETRADE_DIR, "pre_trade_prefs.json")
+SCANS_PATH = os.path.join(_PRETRADE_DIR, "pretrade_scans.json")
 
 STALE_QUOTE_MINUTES = 10
 MAX_STORED_SCANS = 50
@@ -47,6 +50,7 @@ PREFILL_CONTRACT_FIELDS = (
     "theta",
     "theta_units",
     "open_interest",
+    "hold_hours",
 )
 
 PREFILL_WIDGET_KEYS = {
@@ -60,7 +64,39 @@ PREFILL_WIDGET_KEYS = {
     "theta": "ptc_theta",
     "theta_units": "ptc_theta_units",
     "open_interest": "ptc_oi",
+    "hold_hours": "ptc_hold",
 }
+
+# Archive → Pre-Trade: session payload, consumed once (not the scanner snapshot).
+ARCHIVE_PREFILL_KEY = "ptc_archive_prefill"
+ARCHIVE_APPLIED_KEY = "ptc_archive_applied_id"
+ARCHIVE_SOURCE_FLAG = "ptc_prefill_source"
+ARCHIVE_GREEKS_CAPTION = (
+    "Greeks prefilled from archive (modeled). "
+    "Verify against your broker chain before saving."
+)
+# Chart fields that stay blank even for archive prefill. Underlying IS filled
+# from archive spot. Bid/ask come from stored _bid/_ask only when both are
+# usable; never derived from modeled Price. Incomplete pair → both blank.
+ARCHIVE_BLANK_CHART = frozenset({
+    "target_distance",
+    "invalidation_distance",
+    "entry_window",
+})
+
+# Pattern selector — no default. Candidates fill invalidation only on click.
+PATTERN_NONE = ""
+PATTERN_ORB = "ORB break"
+PATTERN_VWAP = "VWAP reclaim"
+PATTERN_EMA = "EMA bounce"
+PATTERN_OTHER = "Other"
+PATTERN_CHOICES = (
+    PATTERN_NONE,
+    PATTERN_ORB,
+    PATTERN_VWAP,
+    PATTERN_EMA,
+    PATTERN_OTHER,
+)
 
 TRADING_HOURS_PER_SESSION = 6.5
 SLIPPAGE = 0.02
@@ -148,6 +184,14 @@ def _abs(x) -> float | None:
     if v is None:
         return None
     return abs(v)
+
+
+def _usable_quote_pair(bid, ask) -> tuple[float | None, float | None]:
+    """Both sides of a quote, or neither. Never a one-sided 0.00 stand-in."""
+    b, a = _f(bid), _f(ask)
+    if b is None or a is None or b <= 0 or a <= 0:
+        return None, None
+    return b, a
 
 
 def _div(n: float | None, d: float | None) -> float | None:
@@ -794,7 +838,187 @@ def contract_prefill_from_row(row: Any, *, ticker: str) -> dict[str, Any]:
     }
     for chart_key in CHART_FIELDS:
         prefill.pop(chart_key, None)
+    # Scanner-computed duration (hours), not copied from the row.
+    prefill["hold_hours"] = hold_hours_for_dte(dte)
     return prefill
+
+
+def archive_greeks_refusal(delta, theta) -> str | None:
+    """
+    Why Check this is disabled for an archive row. Null/NaN/zero Delta or
+    Theta must not be sent through — 0.0000 silently zeroes holding-cost.
+    """
+    d = _f(delta)
+    t = _f(theta)
+    if d is None or d == 0.0:
+        return "Delta unavailable (null IV / 0DTE) — will not prefill 0.0000"
+    if t is None or t == 0.0:
+        return "Theta unavailable (null IV / 0DTE) — will not prefill 0.0000"
+    return None
+
+
+def archive_prefill_from_row(
+    row: Any,
+    *,
+    ticker: str,
+    underlying,
+    scan_ts=None,
+) -> dict[str, Any] | None:
+    """
+    Archive Theta & Gamma row → Pre-Trade contract fields.
+
+    Returns None when Delta or Theta is unusable (caller must disable).
+    Bid/ask come from numeric _bid/_ask only — never the display Bid/Ask
+    cells, never modeled Price. If either quote is missing, both are None.
+    Missing quotes do not refuse the row. Underlying comes from archive
+    spot. Chart distances / hold / account are never set.
+    """
+    delta = _f(_row_get(row, "_delta", "delta", "Delta"))
+    theta = _f(_row_get(row, "_theta", "theta", "Theta"))
+    if archive_greeks_refusal(delta, theta):
+        return None
+    side = str(_row_get(row, "side", "Side", default="CALL") or "CALL").upper()
+    if side not in ("CALL", "PUT"):
+        side = "CALL"
+    units = str(
+        _row_get(row, "_theta_units", "theta_units", default="") or ""
+    ).strip()
+    if units not in THETA_UNITS:
+        return None
+    und = _f(underlying)
+    bid, ask = _usable_quote_pair(
+        _row_get(row, "_bid"),
+        _row_get(row, "_ask"),
+    )
+    prefill = {
+        "symbol": str(
+            ticker or _row_get(row, "symbol", "Ticker", default="") or ""
+        ).upper(),
+        "direction": side,
+        "strike": _f(_row_get(row, "_strike", "strike", "Strike")),
+        "dte": _i(_row_get(row, "_dte", "dte", "DTE")),
+        "expiry": str(_row_get(row, "expiry", "Expiry", default="") or ""),
+        "delta": delta,
+        "theta": theta,
+        "theta_units": units,
+        "open_interest": _f(
+            _row_get(row, "_oi", "openInterest", "open_interest", "OI")
+        ),
+        "underlying": und,
+        "bid": bid,
+        "ask": ask,
+        "hold_hours": hold_hours_for_dte(_i(_row_get(row, "_dte", "dte", "DTE"))),
+    }
+    if scan_ts:
+        prefill["scan_ts"] = scan_ts
+    for chart_key in ARCHIVE_BLANK_CHART:
+        prefill.pop(chart_key, None)
+    return prefill
+
+
+def stage_archive_prefill(
+    st,
+    prefill: dict[str, Any],
+    *,
+    contract_id: str | None = None,
+    scan_ts=None,
+) -> str:
+    """Park a one-shot payload in session_state. Returns the payload id."""
+    pid = str(uuid.uuid4())
+    ts = scan_ts if scan_ts is not None else (prefill or {}).get("scan_ts")
+    st.session_state[ARCHIVE_PREFILL_KEY] = {
+        "id": pid,
+        "prefill": dict(prefill),
+        "contract_id": contract_id,
+        "scan_ts": ts,
+    }
+    try:
+        qp = st.query_params
+        if "candidate" in qp:
+            del qp["candidate"]
+    except Exception:
+        try:
+            st.experimental_set_query_params()
+        except Exception:
+            pass
+    st.session_state.pop("ptc_applied_candidate", None)
+    st.session_state.pop("ptc_nav_done_for", None)
+    return pid
+
+
+def apply_archive_prefill_to_session(st, payload: dict[str, Any]) -> None:
+    """Fill contract + underlying from archive. Quotes only when both sides exist."""
+    prefill = dict((payload or {}).get("prefill") or {})
+    for chart_key in ARCHIVE_BLANK_CHART:
+        prefill.pop(chart_key, None)
+
+    st.session_state["ptc_target"] = 0.0
+    st.session_state["ptc_invalidation"] = 0.0
+    st.session_state["ptc_window"] = ENTRY_WINDOWS[0]
+    st.session_state["ptc_pattern"] = PATTERN_NONE
+
+    und = _f(prefill.get("underlying"))
+    st.session_state["ptc_underlying"] = float(und) if und is not None else 0.0
+
+    st.session_state["ptc_symbol"] = str(prefill.get("symbol") or "").upper()
+    direction = str(prefill.get("direction") or "CALL").upper()
+    st.session_state["ptc_direction"] = (
+        direction if direction in ("CALL", "PUT") else "CALL"
+    )
+
+    def _set_num(field: str, widget: str, default: float = 0.0) -> None:
+        v = _f(prefill.get(field))
+        st.session_state[widget] = float(v) if v is not None else default
+
+    _set_num("strike", "ptc_strike")
+    dte = _i(prefill.get("dte"))
+    st.session_state["ptc_dte"] = int(dte) if dte is not None else 0
+    bid, ask = _usable_quote_pair(prefill.get("bid"), prefill.get("ask"))
+    st.session_state["ptc_bid"] = float(bid) if bid is not None else 0.0
+    st.session_state["ptc_ask"] = float(ask) if ask is not None else 0.0
+    _set_num("delta", "ptc_delta")
+    _set_num("theta", "ptc_theta")
+    units = prefill.get("theta_units")
+    st.session_state["ptc_theta_units"] = (
+        units if units in THETA_UNITS else THETA_UNITS[0]
+    )
+    _set_num("open_interest", "ptc_oi")
+    hold = _f(prefill.get("hold_hours"))
+    if hold is None:
+        hold = hold_hours_for_dte(dte)
+    st.session_state["ptc_hold"] = float(hold)
+
+    original = {k: prefill.get(k) for k in PREFILL_CONTRACT_FIELDS}
+    original["bid"] = bid
+    original["ask"] = ask
+    st.session_state["ptc_prefill_original"] = original
+    st.session_state[ARCHIVE_SOURCE_FLAG] = "archive"
+    st.session_state["ptc_scan_meta"] = {
+        "scan_id": None,
+        "contract_id": payload.get("contract_id"),
+        "scanner_rank": None,
+        "scanner_score": None,
+        "scan_ts": payload.get("scan_ts") or prefill.get("scan_ts"),
+        "expiry": prefill.get("expiry"),
+    }
+
+
+def consume_archive_prefill(st) -> dict[str, Any] | None:
+    """
+    Apply a staged archive payload once, then drop it so a later manual
+    visit cannot reuse it. Returns the consumed payload, or None.
+    """
+    payload = st.session_state.pop(ARCHIVE_PREFILL_KEY, None)
+    if not isinstance(payload, dict):
+        return None
+    pid = str(payload.get("id") or "").strip()
+    if not pid:
+        return None
+    if st.session_state.get(ARCHIVE_APPLIED_KEY) == pid:
+        return None
+    apply_archive_prefill_to_session(st, payload)
+    st.session_state[ARCHIVE_APPLIED_KEY] = pid
+    return payload
 
 
 def _lookup_scored_row(scored_df, side: str, strike, expiry):
@@ -891,7 +1115,11 @@ def load_scan_contract(scan_id: str, contract_id: str) -> dict[str, Any] | None:
         return None
     prefill = dict(entry.get("prefill") or {})
     for chart_key in CHART_FIELDS:
+        if chart_key == "hold_hours":
+            continue
         prefill.pop(chart_key, None)
+    if prefill.get("hold_hours") is None:
+        prefill["hold_hours"] = hold_hours_for_dte(prefill.get("dte"))
     return {
         "scan_id": snap.get("scan_id") or scan_id,
         "contract_id": contract_id,
@@ -947,6 +1175,7 @@ def current_prefill_values(
     theta,
     theta_units: str,
     open_interest,
+    hold_hours=None,
 ) -> dict[str, Any]:
     return {
         "symbol": str(symbol or "").upper(),
@@ -959,6 +1188,7 @@ def current_prefill_values(
         "theta": _f(theta),
         "theta_units": theta_units,
         "open_interest": _f(open_interest),
+        "hold_hours": _f(hold_hours),
     }
 
 
@@ -1007,17 +1237,27 @@ def format_prefill_banner(scan_ts, rank, score) -> str:
     return f"From scan {when} · rank {rank_s} · score {score_s}"
 
 
+def archive_quote_marker(scan_ts) -> str:
+    """Bid/ask from an archive run are reference quotes, not live NBBO."""
+    dt = parse_scan_ts(scan_ts)
+    if dt is None:
+        return "from scanner (stale)"
+    return f"from scanner (stale) · {dt.strftime('%Y-%m-%d %H:%M')}"
+
+
 def apply_candidate_to_session(st, payload: dict[str, Any]) -> None:
-    """Fill contract widgets; leave chart widgets blank. Never fill target/inval."""
+    """Fill contract widgets; leave invalidation/target blank. Hold from DTE window."""
     prefill = dict((payload or {}).get("prefill") or {})
     for chart_key in CHART_FIELDS:
+        if chart_key == "hold_hours":
+            continue
         prefill.pop(chart_key, None)
 
     st.session_state["ptc_underlying"] = 0.0
     st.session_state["ptc_target"] = 0.0
     st.session_state["ptc_invalidation"] = 0.0
-    st.session_state["ptc_hold"] = 0.0
     st.session_state["ptc_window"] = ENTRY_WINDOWS[0]
+    st.session_state["ptc_pattern"] = PATTERN_NONE
 
     st.session_state["ptc_symbol"] = str(prefill.get("symbol") or "").upper()
     direction = str(prefill.get("direction") or "CALL").upper()
@@ -1041,6 +1281,10 @@ def apply_candidate_to_session(st, payload: dict[str, Any]) -> None:
         units if units in THETA_UNITS else THETA_UNITS[0]
     )
     _set_num("open_interest", "ptc_oi")
+    hold = _f(prefill.get("hold_hours"))
+    if hold is None:
+        hold = hold_hours_for_dte(dte)
+    st.session_state["ptc_hold"] = float(hold)
 
     st.session_state["ptc_prefill_original"] = {
         k: prefill.get(k) for k in PREFILL_CONTRACT_FIELDS
@@ -1052,6 +1296,7 @@ def apply_candidate_to_session(st, payload: dict[str, Any]) -> None:
         "scanner_score": payload.get("score"),
         "scan_ts": payload.get("scan_ts"),
     }
+    st.session_state[ARCHIVE_SOURCE_FLAG] = "scanner"
 
 
 def read_candidate_query(st) -> str | None:
@@ -1096,6 +1341,93 @@ def load_checks() -> list[dict[str, Any]]:
     return data
 
 
+def invalidation_from_level(spot, level) -> float | None:
+    """Distance the invalidation widget should receive. None if either side missing."""
+    s, lv = _f(spot), _f(level)
+    if s is None or lv is None or s <= 0:
+        return None
+    return round(abs(s - lv), 2)
+
+
+def _orb_level_for_direction(block: dict | None, direction: str) -> tuple[float | None, str]:
+    """Long (CALL) invalidates at OR low; short (PUT) at OR high."""
+    if not isinstance(block, dict):
+        return None, ""
+    side = "low" if str(direction or "").upper() == "CALL" else "high"
+    return _f(block.get(side)), side
+
+
+def pattern_candidates(
+    pattern: str,
+    *,
+    direction: str = "CALL",
+    or_data: dict | None = None,
+    vwap: float | None = None,
+    emas: dict | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Named candidate levels for the selected pattern.
+
+    Does not pick a default. Empty pattern / Other → no candidates.
+    EMA 21 is not computed anywhere in this repo; existing daily/weekly
+    EMA 14/28/50 from the weekly archive are offered instead.
+    """
+    pat = str(pattern or "").strip()
+    out: list[dict[str, Any]] = []
+    if pat in ("", PATTERN_NONE, PATTERN_OTHER):
+        return out
+
+    if pat == PATTERN_ORB:
+        # 5M OR = 9:30–9:35 ET (one 5m bar). 15M OR = 9:30–9:45 (three 5m bars).
+        specs = (
+            ("5M", "5M OR {side} (9:30–9:35, 5m bar)"),
+            ("15M", "15M OR {side} (9:30–9:45, 5m bars)"),
+        )
+        for key, tmpl in specs:
+            block = (or_data or {}).get(key)
+            level, side = _orb_level_for_direction(block, direction)
+            if level is None:
+                continue
+            forming = str((block or {}).get("bias_dir") or "") == "forming"
+            label = tmpl.format(side=side)
+            if forming:
+                label += " · forming"
+            label = f"{label} {level:.2f}"
+            out.append({"id": f"orb_{key}_{side}", "label": label, "level": level})
+        return out
+
+    if pat == PATTERN_VWAP:
+        v = _f(vwap)
+        if v is not None:
+            out.append({
+                "id": "session_vwap",
+                "label": f"Session VWAP {v:.2f}",
+                "level": v,
+            })
+        return out
+
+    if pat == PATTERN_EMA:
+        block = emas or {}
+        daily = block.get("daily") or {}
+        weekly = block.get("weekly") or {}
+        for tf, src, periods in (
+            ("daily", daily, (14, 28, 50)),
+            ("weekly", weekly, (14, 28, 50)),
+        ):
+            for period in periods:
+                val = _f(src.get(f"ema{period}"))
+                if val is None:
+                    continue
+                out.append({
+                    "id": f"ema_{tf}_{period}",
+                    "label": f"EMA {period} ({tf} close) {val:.2f}",
+                    "level": val,
+                })
+        return out
+
+    return out
+
+
 def save_check(
     result: dict[str, Any],
     *,
@@ -1105,10 +1437,12 @@ def save_check(
     scanner_rank: int | None = None,
     scanner_score: float | None = None,
     prefill_overrides: dict | None = None,
+    pattern: str | None = None,
 ) -> dict[str, Any]:
     """Append one snapshot. Does not overwrite prior checks."""
     rank = _i(scanner_rank)
     score = _f(scanner_score)
+    pat = str(pattern or "").strip() or None
     row = {
         "check_id": str(uuid.uuid4()),
         "ts_et": _now_iso(),
@@ -1127,6 +1461,7 @@ def save_check(
         "scanner_rank": rank,
         "scanner_score": score,
         "prefill_overrides": dict(prefill_overrides or {}),
+        "pattern": pat,
     }
     rows = load_checks()
     rows.insert(0, row)
@@ -1182,14 +1517,21 @@ def _still_prefilled(st, field: str) -> bool:
 
 
 def _marked_kwargs(st, field: str, label: str) -> dict:
-    """Left-border + 'from scanner' while the value still matches prefill."""
+    """Left-border + source tag while the value still matches prefill."""
     if not _still_prefilled(st, field):
         return {}
+    tag = "from scanner"
+    if (
+        field in ("bid", "ask")
+        and st.session_state.get(ARCHIVE_SOURCE_FLAG) == "archive"
+    ):
+        meta = st.session_state.get("ptc_scan_meta") or {}
+        tag = archive_quote_marker(meta.get("scan_ts"))
     st.markdown(
         f'<div style="border-left:3px solid #26a69a;padding:0.05rem 0 0.1rem 0.55rem;'
         f'margin:0.2rem 0 0.05rem">'
         f'<span style="font-size:0.88rem">{label}</span>'
-        f' <span style="color:#26a69a;font-size:0.72rem">from scanner</span></div>',
+        f' <span style="color:#26a69a;font-size:0.72rem">{tag}</span></div>',
         unsafe_allow_html=True,
     )
     return {"label_visibility": "collapsed"}
@@ -1222,10 +1564,21 @@ def _ptc_section(st, title: str) -> None:
     )
 
 
+def _ptc_apply_invalidation_level(level) -> None:
+    """on_click callback — must set the widget key here, not in the button if-branch."""
+    import streamlit as st
+    dist = invalidation_from_level(st.session_state.get("ptc_underlying"), level)
+    if dist is not None:
+        st.session_state["ptc_invalidation"] = dist
+
+
 def render_pre_trade_page(
     *,
     default_ticker: str = "",
     default_spot: float | None = None,
+    or_data: dict | None = None,
+    vwap: float | None = None,
+    emas: dict | None = None,
 ) -> None:
     """Single-screen calculator. Recalculates on every input change."""
     import pandas as pd
@@ -1236,7 +1589,8 @@ def render_pre_trade_page(
     cand_payload = None
     cand_missing = False
     parsed = parse_candidate_ref(cand_ref) if cand_ref else None
-    if parsed:
+    archive_consumed = consume_archive_prefill(st)
+    if parsed and not archive_consumed:
         cand_payload = load_scan_contract(*parsed)
         if cand_payload is None:
             cand_missing = True
@@ -1264,6 +1618,8 @@ def render_pre_trade_page(
     )
 
     meta = st.session_state.get("ptc_scan_meta") or {}
+    if st.session_state.get(ARCHIVE_SOURCE_FLAG) == "archive" or archive_consumed:
+        st.caption(ARCHIVE_GREEKS_CAPTION)
     if cand_payload or (cand_ref and meta):
         src = cand_payload or {}
         banner = format_prefill_banner(
@@ -1316,6 +1672,16 @@ def render_pre_trade_page(
             )
             if impl_t is not None:
                 st.caption(f"→ target price {impl_t:.2f}")
+        _ptc_section(st, "Pattern")
+        pattern = st.selectbox(
+            "Pattern",
+            list(PATTERN_CHOICES),
+            key="ptc_pattern",
+            format_func=lambda p: "—" if p == PATTERN_NONE else p,
+            help="No default. Candidates appear below; they fill invalidation "
+                 "only when you click one. Switching pattern does not change "
+                 "a value you already typed.",
+        )
         invalidation_distance = st.number_input(
             "Invalidation distance ($)", step=0.01, format="%.2f",
             key="ptc_invalidation",
@@ -1334,9 +1700,41 @@ def render_pre_trade_page(
             )
             if impl_s is not None:
                 st.caption(f"→ stop price {impl_s:.2f}")
+        cands = pattern_candidates(
+            pattern,
+            direction=direction,
+            or_data=or_data,
+            vwap=vwap,
+            emas=emas,
+        )
+        if pattern == PATTERN_ORB and not cands:
+            st.caption(
+                "No opening-range level in the latest daily archive "
+                "(5M = 9:30–9:35 bar, 15M = 9:30–9:45 from 5m bars)."
+            )
+        elif pattern == PATTERN_VWAP and not cands:
+            st.caption("Session VWAP unavailable (5m typical price, ET-day reset).")
+        elif pattern == PATTERN_EMA and not cands:
+            st.caption(
+                "EMA 21 is not computed on this scanner. "
+                "Daily/weekly EMA 14/28/50 appear when a weekly archive exists."
+            )
+        elif pattern == PATTERN_OTHER:
+            st.caption("Type the invalidation distance yourself.")
+        elif cands:
+            st.caption("Click a candidate to fill invalidation. Nothing is filled until you click.")
+            for cand in cands:
+                st.button(
+                    cand["label"],
+                    key=f"ptc_cand_{cand['id']}",
+                    on_click=_ptc_apply_invalidation_level,
+                    args=(cand["level"],),
+                )
+        _mk = _marked_kwargs(st, "hold_hours", "Expected hold (hours)")
         hold_hours = st.number_input(
             "Expected hold (hours)", min_value=0.0, step=0.5, format="%.2f",
-            key="ptc_hold", help="e.g. 0.5, 1, 2",
+            key="ptc_hold", help="e.g. 0.5, 1, 2 — duration in hours, not minutes",
+            **_mk,
         )
         entry_window = st.selectbox(
             "Entry window", list(ENTRY_WINDOWS), key="ptc_window",
@@ -1595,6 +1993,7 @@ def render_pre_trade_page(
                     theta=theta,
                     theta_units=theta_units,
                     open_interest=oi,
+                    hold_hours=hold_hours,
                 ),
             )
             row = save_check(
@@ -1604,6 +2003,7 @@ def render_pre_trade_page(
                 scanner_rank=meta.get("scanner_rank"),
                 scanner_score=meta.get("scanner_score"),
                 prefill_overrides=overrides,
+                pattern=pattern,
             )
             st.success(
                 f"Saved {row['verdict']} {symbol or '—'} at {row['ts_et'][:16].replace('T', ' ')} ET"
@@ -1638,6 +2038,7 @@ def render_pre_trade_page(
             "check_id": row.get("check_id"),
             "Date": day,
             "Symbol": inp_r.get("symbol") or "",
+            "Pattern": row.get("pattern") or "",
             "Verdict": row.get("verdict") or "",
             "Ratio": format_ratio(der.get("ratio")),
             "Taken": bool(row.get("taken")),
@@ -1652,6 +2053,7 @@ def render_pre_trade_page(
         column_config={
             "Date": st.column_config.TextColumn(disabled=True),
             "Symbol": st.column_config.TextColumn(disabled=True),
+            "Pattern": st.column_config.TextColumn(disabled=True),
             "Verdict": st.column_config.TextColumn(disabled=True),
             "Ratio": st.column_config.TextColumn(disabled=True),
             "Taken": st.column_config.CheckboxColumn(),
@@ -1661,7 +2063,7 @@ def render_pre_trade_page(
             ),
             "Actual": st.column_config.TextColumn(disabled=True),
         },
-        disabled=["Date", "Symbol", "Verdict", "Ratio", "Actual"],
+        disabled=["Date", "Symbol", "Pattern", "Verdict", "Ratio", "Actual"],
         hide_index=True,
         use_container_width=True,
         key="ptc_history_editor",
