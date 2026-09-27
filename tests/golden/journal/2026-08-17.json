@@ -1,0 +1,13 @@
+[
+  {"Action": "BUY",  "Ticker": "AAPL", "Side": "CALL", "Strike": 230.0, "Expiry": "2026-08-18", "Quantity": 2,
+   "Price": 1.10, "At": "2026-08-17T09:52:00-04:00", "Source": "scanner", "Timestamp_Quality": "exact",
+   "Entry_Price": 1.10},
+  {"Action": "SELL", "Ticker": "AAPL", "Side": "CALL", "Strike": 230.0, "Expiry": "2026-08-18", "Quantity": 2,
+   "Price": 1.32, "At": "2026-08-17T10:47:00-04:00", "Source": "scanner", "Timestamp_Quality": "exact",
+   "Entry_Price": 1.10, "PnL_Pct": 0.20, "PnL_Dollars": 44.0},
+  {"Action": "BUY",  "Ticker": "AAPL", "Side": "PUT", "Strike": 228.0, "Expiry": "2026-08-18", "Quantity": 1,
+   "Price": 0.95, "At": "2026-08-17T13:05:00-04:00", "Source": "discretionary", "Timestamp_Quality": "exact"},
+  {"Action": "SELL", "Ticker": "AAPL", "Side": "PUT", "Strike": 228.0, "Expiry": "2026-08-18", "Quantity": 1,
+   "Price": 0.70, "At": "2026-08-17T14:10:00-04:00", "Source": "discretionary", "Timestamp_Quality": "exact",
+   "PnL_Pct": -0.263, "PnL_Dollars": -25.0}
+]

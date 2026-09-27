@@ -316,7 +316,7 @@ Per-scan Best Value + Magnets + Vol/Expiry + Changes + Catalyst, read from the s
 | D2 | `leverage_norm` — same bug class | No absolute floor; when the whole pool is junk, the best junk still normalises near 1.0. A contract with delta 6.4e-13 once ranked #1 |
 | D3 | Category multiplier inverted | `plus1_itm` (1.3) was the **worst**-performing bucket at −63%; `zero_outlook` (0.3) caps good base scores at 0.30. `base_score` alone correlates better with return (0.355) than final `score` (0.197) — the multiplier layer destroys signal the base score had |
 | D4 | Stored `delta` unreliable | Saturates at ±1.000 for ITM contracts. The 0.35–0.50 display filter may be excluding the best performers, and all delta-bucket attribution is misgrouped |
-| D5 | `engine_sha` never populated | Retroactive version attribution impossible |
+| D5 | ~~`engine_sha` never populated~~ **Resolved** — 4118/4118 runs populated (`docs/data_contract.md` §7) | — |
 | D6 | ~114 t1h marks lost per day | Flags at 15:12/15:14 come due 16:12–16:14, between the last in-window pass and `MARK_WINDOW_END` |
 | D7 | No absolute delta floor anywhere in scoring | Zero-exposure contracts can be promoted to rank 1 |
 

@@ -65,3 +65,17 @@ Defects observed while documenting. No fixes applied.
 | F-S5-01 | `scheduler.py:146`, `dailyScaner.py:309-313` | 2026-09-07 is Labor Day (US markets closed). RO `data/attribution.db`: **127** `runs` / **7500** `flags` (AAPL; 2 EOD). Scheduler `market_is_open` treats Mon–Fri clock hours as open (`:146` Sat/Sun only). Scanner `market_is_open` same weekday test; docstring says holidays are unhandled (`:310-312`). That function is not an abort: `print_report` returns early (`dailyScaner.py:821-830`) after archive + `_log_scan_attribution` already wrote. | P0 |
 | F-S5-02 | `scheduler.py:463`, `scheduler_config.json:8` | 2026-09-08 AAPL **231** runs / **12995** flags vs ~154 / ~8100 on 09-04 and 09-09. Inter-run avg gap **1.7 min** (min 0.0) vs **2.6 min** on 09-04/09-09; ~35 runs/hour vs ~24. Configured `default_interval_min` is 5. Three EOD rows that day vs two on adjacent sessions. | P0 |
 | F-S5-03 | `scheduler.py:132-157`, `tests/test_dailyScaner_regressions.py:159-171` | Cadence and holiday coverage. Config 5 min implies ~12 AAPL runs/hour; observed ~24/hour on normal days (avg gap 2.6 min, min 0.0 — overlapping schedulers). `health_check.py:118-124` expects `rows_today>0` whenever `weekday()<5`, so Labor Day looks healthy. Tests pin `market_is_open` False at 16:32 (`:159`) and Saturday 2026-07-18 (`:169-171`). No test pins a US holiday. Grep of `tests/` finds no `holiday` / `Labor` / `2026-09-07`. | P0 |
+
+## Resolved
+
+Verified on a clean clone with no `.env` and no `data/`: `pytest` → 0 failed, strict xfails unchanged. No scoring files touched; `config_hash(SCORING)` is unaffected by this change.
+
+| id | resolution |
+|---|---|
+| F-S1-01, F-S1-02 | `pre_trade_check.py` restored at root from the `script/` copy (per `docs/tree_cleanup_report.md`). |
+| F-S1-03, F-S1-04 | Tests read synthetic fixtures in `tests/golden/journal/` via the `golden_journal` fixture (`tests/conftest.py`), not gitignored `data/journal/`. Assertions unchanged. |
+| F-S1-06 | Test fixture expiry `2026-08-21` had passed; `sources.massive._today_et` is now pinned to `2026-08-03` in the test. Not a production defect. |
+| — | `telegram_bot.py` no longer calls `sys.exit` at import; the config check runs in `main()` (still fails closed). |
+| — | `pyproject.toml` lists every third-party import; `requirements.txt` points at it. Baseline freeze remains in `docs/baseline_pip_freeze.txt`. |
+
+Still open: F-S1-05 (`test_journal_metrics.py::test_live_journal_concat_fifo_expected_totals`) checks the live journal on the owner's machine and skips on a clean clone. It is a data-integrity check, not a code test.

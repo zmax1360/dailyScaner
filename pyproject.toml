@@ -16,6 +16,9 @@ dependencies = [
     "pytz==2024.1",
     "altair==5.0.1",
     "optionlab==1.6.3",
+    "requests==2.32.5",
+    "anthropic==0.86.0",       # weekly.py
+    "finnhub-python==2.4.29",  # news_service.py (import is guarded, but the feature needs it)
 ]
 
 [project.optional-dependencies]
@@ -23,6 +26,14 @@ dev = [
     "pytest==7.4.4",
     "pytest-cov==7.1.0",
 ]
+schwab = [
+    "cryptography",            # schwab.py local OAuth callback cert (not in the adapter path yet)
+]
+
+[tool.setuptools]
+# Flat layout, run from the checkout: install dependencies only, no packages.
+packages = []
+py-modules = []
 
 
 [tool.pytest.ini_options]

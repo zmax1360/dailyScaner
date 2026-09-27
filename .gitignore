@@ -28,3 +28,6 @@ data/journal copy/
 data/journal.bak/
 data/journal.bak-*/
 script/
+
+# pip install -e . metadata
+*.egg-info/

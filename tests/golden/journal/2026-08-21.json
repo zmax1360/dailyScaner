@@ -1,0 +1,6 @@
+[
+  {"Action": "BUY",  "Ticker": "AAPL", "Side": "CALL", "Strike": 232.5, "Expiry": "2026-08-22", "Quantity": 1,
+   "Price": 0.25, "At": "2026-08-21T15:39:00-04:00", "Source": "scanner", "Timestamp_Quality": "exact"},
+  {"Action": "SELL", "Ticker": "AAPL", "Side": "CALL", "Strike": 232.5, "Expiry": "2026-08-22", "Quantity": 1,
+   "Price": 0.31, "At": "2026-08-21T15:52:00-04:00", "Source": "scanner", "Timestamp_Quality": "exact"}
+]

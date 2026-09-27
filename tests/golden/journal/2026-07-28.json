@@ -1,0 +1,5 @@
+[
+  {"trade_id": "t-0728-1", "ticker": "AAPL", "side": "CALL", "strike": 215.0, "expiry": "2026-07-28",
+   "quantity": 1, "entry_price": 0.85, "exit_price": 1.05,
+   "entry_at": "2026-07-28T10:02:00-04:00", "exit_at": "2026-07-28T10:41:00-04:00", "source": "scanner"}
+]

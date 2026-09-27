@@ -69,13 +69,14 @@ _ALLOWED_CHAT_IDS = {
     if s.strip()
 }
 
-if not TOKEN:
-    log.error("TELEGRAM_BOT_TOKEN not found in .env")
-    sys.exit(1)
-
-if not _ALLOWED_CHAT_IDS:
-    log.error("TELEGRAM_CHAT_ID not found in .env — bot refuses all chats")
-    sys.exit(1)
+def _require_config() -> None:
+    """Fail closed at startup, not at import (tests import this module)."""
+    if not TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN not found in .env")
+        sys.exit(1)
+    if not _ALLOWED_CHAT_IDS:
+        log.error("TELEGRAM_CHAT_ID not found in .env — bot refuses all chats")
+        sys.exit(1)
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 
@@ -895,6 +896,7 @@ def _handle_callback(chat_id: int, msg_id: int, cb_id: str, data: str) -> None:
 
 # ── Main polling loop ───────────────────────────────────────────────────────────
 def main() -> None:
+    _require_config()
     me = _call("getMe")
     if not me.get("ok"):
         log.error(f"Could not connect to Telegram: {me.get('error')}")

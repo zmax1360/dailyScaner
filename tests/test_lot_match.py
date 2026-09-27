@@ -88,8 +88,8 @@ def test_oversell_raises():
         closed_trades(df)
 
 
-def test_legacy_file_drops_stored_pnl():
-    raw = json.loads(Path("data/journal/2026-07-28.json").read_text())
+def test_legacy_file_drops_stored_pnl(golden_journal):
+    raw = json.loads((golden_journal / "2026-07-28.json").read_text())
     df = load_journal_day("2026-07-28")
     assert not df.empty
     for col in ("PnL_Pct", "PnL_Dollars", "Entry_Price"):

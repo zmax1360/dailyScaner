@@ -67,9 +67,11 @@ def test_no_pagination_cap_hit_with_window():
             "next_url": None,
         }
 
-    with patch.object(src, "fetch_spot", return_value=340.0):
-        with patch.object(src, "_request", side_effect=one_page):
-            df = src.fetch_chain("AAPL", max_dte=45)
+    # Fixture expiry is 2026-08-21; pin "today" so the test doesn't expire with it.
+    with patch("sources.massive._today_et", return_value=date(2026, 8, 3)):
+        with patch.object(src, "fetch_spot", return_value=340.0):
+            with patch.object(src, "_request", side_effect=one_page):
+                df = src.fetch_chain("AAPL", max_dte=45)
     assert not df.empty
     assert src.last_chain_pages == 1
     assert src.last_chain_used_strike_window is True
