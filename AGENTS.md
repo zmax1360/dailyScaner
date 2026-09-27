@@ -32,6 +32,8 @@ logs every flag to SQLite, marks outcomes later, reports. Python 3.11+, Streamli
 - **Evidence:** report actual command output. If you didn't run it, say so.
   Never pipe pytest through `tee` and trust the exit code — `tee` returns 0 when pytest fails.
 - **Datetimes:** timezone-aware only (ET). No naive datetimes (`tests/test_no_naive_datetime.py`).
+- **Local state files** (journal, portfolio, pre-trade JSON): read-modify-write only inside
+  `safe_io.locked(path)`; write with `safe_io.write_json_atomic`. Never `open(path, "w")` in place.
 - **Import side effects:** no network calls or `sys.exit` at module import in new code.
 - **Secrets:** never commit `.env` or API keys (Telegram, Finnhub, Massive, Schwab). Check `git diff` first.
 

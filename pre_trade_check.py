@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from safe_io import locked, write_json_atomic
 from time_stop import hold_hours_for_dte
 
 ET = ZoneInfo("America/New_York")
@@ -725,21 +726,8 @@ def _read_json(path: str, default):
 
 
 def _write_json(path: str, data) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    # Unique tmp: Streamlit can overlap reruns; a shared `.tmp` is consumed by
-    # the first os.replace and the second raises FileNotFoundError.
-    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    try:
-        with open(tmp, "w") as fh:
-            json.dump(data, fh, indent=2)
-            fh.write("\n")
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+    """Atomic write. Callers doing read-modify-write must hold ``locked(path)``."""
+    write_json_atomic(path, data)
 
 
 # ── Scanner → Pre-Trade bridge (read-only UI; no scoring changes) ─────────────
@@ -1099,16 +1087,17 @@ def store_scan_snapshot(snapshot: dict[str, Any]) -> None:
     scan_id = str((snapshot or {}).get("scan_id") or "").strip()
     if not scan_id:
         return
-    scans = _read_json(SCANS_PATH, {})
-    if not isinstance(scans, dict):
-        scans = {}
-    if scan_id in scans:
-        del scans[scan_id]
-    scans[scan_id] = snapshot
-    while len(scans) > MAX_STORED_SCANS:
-        oldest = next(iter(scans))
-        del scans[oldest]
-    _write_json(SCANS_PATH, scans)
+    with locked(SCANS_PATH):
+        scans = _read_json(SCANS_PATH, {})
+        if not isinstance(scans, dict):
+            scans = {}
+        if scan_id in scans:
+            del scans[scan_id]
+        scans[scan_id] = snapshot
+        while len(scans) > MAX_STORED_SCANS:
+            oldest = next(iter(scans))
+            del scans[oldest]
+        _write_json(SCANS_PATH, scans)
 
 
 def load_scan_contract(scan_id: str, contract_id: str) -> dict[str, Any] | None:
@@ -1337,10 +1326,11 @@ def load_prefs() -> dict[str, Any]:
 
 
 def save_prefs(*, account_size: float | None) -> None:
-    prefs = load_prefs()
-    if account_size is not None and math.isfinite(float(account_size)):
-        prefs["account_size"] = float(account_size)
-    _write_json(PREFS_PATH, prefs)
+    with locked(PREFS_PATH):
+        prefs = load_prefs()
+        if account_size is not None and math.isfinite(float(account_size)):
+            prefs["account_size"] = float(account_size)
+        _write_json(PREFS_PATH, prefs)
 
 
 def load_checks() -> list[dict[str, Any]]:
@@ -1472,9 +1462,10 @@ def save_check(
         "prefill_overrides": dict(prefill_overrides or {}),
         "pattern": pat,
     }
-    rows = load_checks()
-    rows.insert(0, row)
-    _write_json(CHECKS_PATH, rows)
+    with locked(CHECKS_PATH):
+        rows = load_checks()
+        rows.insert(0, row)
+        _write_json(CHECKS_PATH, rows)
     return row
 
 
@@ -1486,28 +1477,29 @@ def update_check(
     exit_reason: str | None | object = ...,
 ) -> bool:
     """Patch a saved check. Ellipsis means 'leave unchanged'."""
-    rows = load_checks()
-    found = False
-    for row in rows:
-        if str(row.get("check_id")) != str(check_id):
-            continue
-        found = True
-        if taken is not None:
-            row["taken"] = bool(taken)
-        if actual_exit_price is not ...:
-            row["actual_exit_price"] = (
-                None if actual_exit_price is None else _f(actual_exit_price)
-            )
-        if exit_reason is not ...:
-            reason = None if exit_reason in (None, "") else str(exit_reason)
-            if reason is not None and reason not in EXIT_REASONS:
-                reason = "other"
-            row["exit_reason"] = reason
-        break
-    if not found:
-        return False
-    _write_json(CHECKS_PATH, rows)
-    return True
+    with locked(CHECKS_PATH):
+        rows = load_checks()
+        found = False
+        for row in rows:
+            if str(row.get("check_id")) != str(check_id):
+                continue
+            found = True
+            if taken is not None:
+                row["taken"] = bool(taken)
+            if actual_exit_price is not ...:
+                row["actual_exit_price"] = (
+                    None if actual_exit_price is None else _f(actual_exit_price)
+                )
+            if exit_reason is not ...:
+                reason = None if exit_reason in (None, "") else str(exit_reason)
+                if reason is not None and reason not in EXIT_REASONS:
+                    reason = "other"
+                row["exit_reason"] = reason
+            break
+        if not found:
+            return False
+        _write_json(CHECKS_PATH, rows)
+        return True
 
 
 # ── Streamlit page ────────────────────────────────────────────────────────────

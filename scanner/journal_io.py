@@ -19,6 +19,8 @@ from typing import Any
 
 import pandas as pd
 
+from safe_io import locked, write_json_atomic
+
 log = logging.getLogger("scanner.journal_io")
 
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -146,11 +148,7 @@ def _read_raw(day: str) -> list[Any]:
 def _write_raw(day: str, rows: list[Any]) -> None:
     os.makedirs(JOURNAL_DIR, exist_ok=True)
     path = journal_path_for_day(day)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(rows, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
+    write_json_atomic(path, rows)
 
 
 def _fill_for_write(fill: dict[str, Any]) -> dict[str, Any]:
@@ -214,10 +212,11 @@ def append_fills(day: str, fills: list[dict[str, Any]]) -> str:
     Warns if lot_match.open_inventory() is non-empty after the write.
     """
     day_s = str(day).strip()[:10]
-    existing = _read_raw(day_s)
-    for fill in fills:
-        existing.append(_fill_for_write(fill))
-    _write_raw(day_s, existing)
+    with locked(journal_path_for_day(day_s)):
+        existing = _read_raw(day_s)
+        for fill in fills:
+            existing.append(_fill_for_write(fill))
+        _write_raw(day_s, existing)
 
     from scanner.lot_match import open_inventory
 

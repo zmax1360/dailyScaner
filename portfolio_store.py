@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from safe_io import write_json_atomic
+
 ET = ZoneInfo("America/New_York")
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
@@ -148,8 +150,7 @@ def save_portfolio(df: pd.DataFrame) -> None:
             ),
         }
         records.append(rec)
-    with open(PORTFOLIO_PATH, "w") as fh:
-        json.dump(records, fh, indent=2)
+    write_json_atomic(PORTFOLIO_PATH, records)
 
 
 def save_closed(df: pd.DataFrame) -> None:
@@ -180,8 +181,7 @@ def save_closed(df: pd.DataFrame) -> None:
             "PnL_Pct": _num_or_none(r.get("PnL_Pct")),
             "PnL_Dollars": _num_or_none(r.get("PnL_Dollars")),
         })
-    with open(CLOSED_PATH, "w") as fh:
-        json.dump(records, fh, indent=2)
+    write_json_atomic(CLOSED_PATH, records)
 
 
 def _num_or_none(v) -> float | None:
