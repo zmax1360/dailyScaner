@@ -725,12 +725,21 @@ def _read_json(path: str, default):
 
 
 def _write_json(path: str, data) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(data, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # Unique tmp: Streamlit can overlap reruns; a shared `.tmp` is consumed by
+    # the first os.replace and the second raises FileNotFoundError.
+    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 # ── Scanner → Pre-Trade bridge (read-only UI; no scoring changes) ─────────────
