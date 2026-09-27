@@ -21,6 +21,14 @@ across versions when measuring lift.
 
 Do not pool v1.3 rows with v1.4.
 
+## EMA stack banner (display only)
+
+15-min EMA 9/21/50 trend rule shown at the top of every app page (`ema_stack.py`):
+9 > 21 > 50 → bullish, calls only; 9 < 21 < 50 → bearish, puts only; anything else → no trade.
+EMAs are computed from the scanner's existing 15-min bars and stored in the archive
+(`timeframes.15M.ema9/ema21/ema50`). Not a scoring input — `config_hash` unchanged
+(`tests/test_ema_stack.py::test_ema_stack_is_not_a_scoring_input`).
+
 ## Picks ledger (report)
 
 `picks_ledger.py` is the daily 1DTE+ report. Default `eod_report.py` / `nightly.sh` path delegates here (`--legacy` keeps the old aggregate).

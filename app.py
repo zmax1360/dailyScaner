@@ -24,6 +24,7 @@ import streamlit as st
 from logging_config import LOG_DIR, setup_logging
 
 import data_adapter
+import ema_stack
 import snapshot_store as ss
 from spread_gate import evaluate_spread_gate
 from dailyScaner import market_is_open, proximity_filter, MIN_OI_FOR_MAGNET
@@ -906,6 +907,21 @@ def _services_alert() -> None:
         f"Restart with `python3 scheduler.py` / `python3 telegram_bot.py`.",
         icon="🔴",
     )
+
+
+def _ema_stack_banner(cfg: dict) -> None:
+    """15-min EMA 9/21/50 trend rule, shown on every page. Display only."""
+    info = ema_stack.banner_for_archive(cfg.get("latest_archive"), now=datetime.now(ET))
+    ticker = str(cfg.get("ticker") or "").upper()
+    when = f" (scan {info['as_of'].astimezone(ET):%H:%M} ET)" if info.get("as_of") else ""
+    stale = " ⚠️ Scan is over 30 min old — the trend may have changed." if info.get("stale") else ""
+    text = f"**{ticker} {info['headline']}**{when} — {info['reason']}{stale}"
+    show = {
+        ema_stack.BULL: (st.success, "🟢"),
+        ema_stack.BEAR: (st.error, "🔴"),
+        ema_stack.NO_TRADE: (st.warning, "⛔"),
+    }.get(info["state"], (st.info, "ℹ️"))
+    show[0](text, icon=show[1])
 
 
 def _sidebar() -> dict:
@@ -5837,6 +5853,7 @@ def main():
 
     # Service-down alerts sit above tabs so they're visible on every page
     _services_alert()
+    _ema_stack_banner(cfg)
 
     labels = _main_tab_labels()
     journal_label = labels[-1]
