@@ -1,0 +1,14 @@
+---
+description: Scoring engine rules
+globs: best_value.py,strategy_engine.py,scoring_pool.py,config.py,greeks.py,cost_distribution.py,pov_leakage.py,spread_gate.py
+alwaysApply: false
+---
+- These modules are pure: no network, no file I/O, no `yfinance`, no clock reads beyond passed-in timestamps.
+- Normalisation is **within pool**: `dte == 0` → `0DTE`, `dte >= 1` → `1DTE+` (`scoring_pool.py`).
+  NULL `dte` is excluded, not pooled. Pools below `min_pool_size` are not ranked and not merged.
+- Weights and multipliers were hand-authored and are unvalidated. Do not retune them by inspection.
+  Changes must be measured against attribution outcomes and land as a new engine tag in `CHANGES.md`.
+- `greeks.bs_delta` is correct. Time-to-expiry units must match what it expects (0DTE bugs came from
+  a days/years mismatch in `_t_days`).
+- Display-only layers must not affect rank. If a change touches both display and ranking, split it.
+- Print `config_hash(SCORING)` before and after any session in these files and report both.

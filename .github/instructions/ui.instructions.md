@@ -1,0 +1,11 @@
+---
+applyTo: "app.py,best_value_ui.py,dashboard.py,telegram_bot.py,notify_delivery.py"
+description: UI and delivery rules
+---
+<!-- GENERATED from .cursor/rules/ui.mdc by scripts/sync_agent_rules.py — do not edit -->
+- The UI is a pure display layer. It reads archive JSON; it never recomputes signals or scores.
+- `app.py` never imports `yfinance`. `telegram_bot.py` reads the archive, never builds its own scored frame
+  (that once bypassed every quality gate).
+- Table row selection must map by contract identity, not by display position.
+- `_render_add_position_form`, `portfolio_store` and journal writes must behave identically after UI changes.
+- `app.py` is very large: state which line ranges you read before editing, and verify in the browser, not only pytest.

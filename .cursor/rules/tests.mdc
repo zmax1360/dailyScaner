@@ -1,0 +1,19 @@
+---
+description: Test rules and strict xfails
+globs: tests/**
+alwaysApply: false
+---
+- Run with `pytest` (testpaths = `tests`). Tests are network-free (fixture source + `tests/golden/`).
+- Never weaken, skip or delete a test. Every `xfail(strict=True)` documents a real defect
+  (see its `reason=`). It may only be removed in the same commit that fixes that defect, with the
+  fix recorded in `CHANGES.md` (as engine-v1.3 did for the score-range defect). If one XPASSes
+  unexpectedly, report it — don't delete the marker.
+- The suite is expected to be fully green on a clean clone. Any failure is a regression.
+- Journal tests use synthetic fixtures in `tests/golden/journal/` via the `golden_journal` fixture
+  (`tests/conftest.py`). Never copy real `data/journal/` files into the repo — it is public.
+- Tests that depend on today's date must pin the clock (patch `_today_et` or equivalent);
+  hard-coded expiry dates otherwise turn into failures once they pass.
+- `test_journal_metrics.py::test_live_journal_concat_fifo_expected_totals` checks the owner's live
+  journal and skips when it's absent. It's a data-integrity check; don't make it pass by editing thresholds.
+- Guards are tested against real captures in `tests/golden/`, not synthetic data.
+- New tests must not read `data/` or the network. Put fixtures in `tests/golden/`.
