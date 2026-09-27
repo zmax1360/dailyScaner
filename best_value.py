@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+import logging
 
 import pandas as pd
 import pytz
@@ -20,6 +21,8 @@ from scoring_pool import (
     POOL_1DTE,
     scoring_pool,
 )
+
+log = logging.getLogger("best_value")
 
 
 def _contract_price(c: dict) -> float:
@@ -451,7 +454,7 @@ def calculate_best_value(
             continue
         work.at[idx, "extrinsic"] = mid - intrinsic
 
-    # Per-row multiplier breakdown (product must reproduce Value_Score)
+    # Per-row multiplier breakdown (product reproduces Value_Score until score_cap)
     mults: dict[Any, dict[str, float]] = {
         idx: {"_base": 1.0} for idx in work.index
     }
@@ -674,6 +677,21 @@ def calculate_best_value(
     work["_multipliers"] = [mults[idx] for idx in work.index]
 
     work["Value_Score"] = work["Value_Score"].round(4)
+    cap = float(SCORING.get("score_cap", 1.0))
+    work["Value_Score"] = work["Value_Score"].clip(upper=cap)
+    max_spread = float(cfg.get("max_spread_pct", 0.25))
+    if "bid" in work.columns and "ask" in work.columns:
+        bid_s = pd.to_numeric(work["bid"], errors="coerce")
+        ask_s = pd.to_numeric(work["ask"], errors="coerce")
+        spread = (ask_s - bid_s) / ask_s
+        bad_quote = ask_s.gt(0) & spread.notna() & spread.gt(max_spread)
+        if bool(bad_quote.any()):
+            n_rej = int(bad_quote.sum())
+            log.info(
+                "quote gate: rejecting %d contracts with spread_pct > %.2f",
+                n_rej, max_spread,
+            )
+            work.loc[bad_quote, "Value_Score"] = float("nan")
     work["Status"] = ""
     work["_rank"] = pd.NA
     # Rank within pool + one BEST VALUE star per ranked pool

@@ -1,7 +1,7 @@
 # Scoring spec
 
 Behavior of the scoring pipeline as implemented on HEAD `ce1bf691f82c5f84bff93e948dfaeb77c34238e5`.
-`config_hash(SCORING)` at write time: `243ecda68cfc8618`.
+`config_hash(SCORING)` at write time: `0384124ff1be03b1` (engine-v1.4). Prior: `d60c1855a9ca0923` (engine-v1.3), `243ecda68cfc8618` (engine-v1.2).
 
 This document does not describe intended behavior.
 
@@ -210,7 +210,7 @@ Blend (`best_value.py:412-415`):
 Value_Score = _nlev * w_lev + _nflow * w_flow
 ```
 
-Then `_base_score = Value_Score.copy()` **before** multipliers (`best_value.py:418-419`). After multipliers, `Value_Score` is `round(4)` (`:676`). `_base_score` is not rounded at that line.
+Then `_base_score = Value_Score.copy()` **before** multipliers (`best_value.py:418-419`). After multipliers, `Value_Score` is `round(4)` then `clip(upper=score_cap)` (`:676-678`) before rank. `_base_score` is not rounded at that line.
 
 ---
 
@@ -348,7 +348,7 @@ The filtered frame first appears at `app.py:2726`. Attribution never receives it
 |---|---|
 | F-S1-07 | NaN `dVol` filled to 1.0 (`best_value.py:346-353`) — new entrants / decrease-suspect sit at ×1 on the raw dVol scale. |
 | F-S1-08 | `_minmax` is per-pool per-scan (`best_value.py:359-411`) — `Value_Score` is a rank-like level. |
-| F-S1-09 | Multipliers apply after the blend (`best_value.py:418` then `:459-666`); product is uncapped. |
+| F-S1-09 | Multipliers apply after the blend (`best_value.py:418` then `:459-666`); product is clipped at `score_cap` 1.0 before rank (`best_value.py:676-678`, engine-v1.3). |
 | F-S2-01 | `best_value.py:5` says `telegram_bot.py` imports this module; `telegram_bot.py` does not call `calculate_best_value` / `build_best_value_df`. |
 | F-S2-02 | Stored `score` is `round(4)` (`best_value.py:676`); `base_score * Π(multipliers)` differs at ~1e-5. |
 | F-S2-03 | `build_best_value_df` maps missing `dte` to `0` (`best_value.py:753`), which `scoring_pool` treats as `0DTE` (`scoring_pool.py:52-53`). |

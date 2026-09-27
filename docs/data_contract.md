@@ -84,7 +84,7 @@ The current `_SCHEMA` already contains columns that also appear on the migrate l
 
 ### `_FLAG_MIGRATE_COLS` (`attribution.py:224-255`)
 
-`nlev, nflow, base_score, marked_t1h_at, marked_t1d_at, marked_exp_at, dte, volume, open_interest, iv, mark_close, marked_close_at, close_method, delta, leverage_raw, flow_raw, leverage_norm, flow_norm, extrinsic, realized_vol_20d, iv_premium, pool, mark_t15m, marked_t15m_at, method_t15m, mark_t30m, marked_t30m_at, method_t30m`.
+`nlev, nflow, base_score, marked_t1h_at, marked_t1d_at, marked_exp_at, dte, volume, open_interest, iv, mark_close, marked_close_at, close_method, delta, leverage_raw, flow_raw, leverage_norm, flow_norm, extrinsic, realized_vol_20d, iv_premium, pool, mark_t15m, marked_t15m_at, method_t15m, mark_t30m, marked_t30m_at, method_t30m, paired_flag_id, pinned`.
 
 ### `_RUN_MIGRATE_COLS` (`attribution.py:257-261`)
 

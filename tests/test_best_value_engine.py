@@ -183,9 +183,6 @@ def test_score_is_stable_when_an_unrelated_contract_joins_the_universe():
     assert run_a[250.0] == pytest.approx(run_b[250.0], rel=1e-9)
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: multipliers are applied AFTER "
-                                       "normalisation and compound without a "
-                                       "cap, so Value_Score escapes [0, 1]")
 def test_value_score_stays_within_its_documented_range():
     s = score([contract(252.5, 3.0), contract(255, 3.0), contract(257.5, 3.0)],
               daily_bias="HEAVY BULLISH", news_bias="BULLISH",
@@ -203,6 +200,24 @@ def test_two_row_universe_produces_degenerate_scores():
         pad=False,
     )
     assert s.dropna().empty
+
+
+def test_spread_above_25pct_is_rejected_before_rank():
+    rows = [
+        contract(250, 3.0, bid=1.0, ask=2.0),
+        contract(252.5, 3.0, bid=1.90, ask=2.00),
+        contract(255, 3.0, bid=1.90, ask=2.00),
+        contract(257.5, 3.0, bid=1.90, ask=2.00),
+    ]
+    out = calculate_best_value(
+        pd.DataFrame(pad_min_pool(rows)), spot_price=SPOT, now_et=NOW,
+    )
+    wide = out.loc[out["strike"] == 250.0]
+    tight = out.loc[out["strike"] == 252.5]
+    assert wide["Value_Score"].isna().all()
+    assert tight["Value_Score"].notna().any()
+    if "_rank" in out.columns:
+        assert wide["_rank"].isna().all()
 
 
 # ── 5. Directional multipliers ───────────────────────────────────────────────

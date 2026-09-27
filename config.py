@@ -13,9 +13,13 @@ from __future__ import annotations
 SCORING: dict[str, float | int | str] = {
     # engine-v1.2: separate 0DTE / 1DTE+ normalisation pools.
     # Prior: v1.1 = 1e191ea1832c2c9a (abs-delta); v1 = dc2906741dbb2b15.
-    "engine_tag": "engine-v1.2",
+    "engine_tag": "engine-v1.4",
     # Min survivors (delta+flow) to rank a DTE pool; below → no picks (not merged).
     "min_pool_size": 5,
+    # Clip after the multiplier product so rank never sees score > 1.0 (F-03 / F-S1-09).
+    "score_cap": 1.0,
+    # Reject stale/unusable quotes before ranking (v4 §4b).
+    "max_spread_pct": 0.25,
     # Base blend
     "w_lev": 0.4,
     "w_flow": 0.6,

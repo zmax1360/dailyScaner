@@ -143,6 +143,7 @@ def _log_scan_attribution(
             engine_sha_val=engine_sha(),
             run_kind=run_kind,
             daily_closes=daily_closes,
+            chain_df=chain,
         )
         if (run_kind or "").lower() == "eod":
             log.info(

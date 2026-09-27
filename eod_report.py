@@ -57,7 +57,6 @@ OUTLIER = 1.0                # returns >= +100% treated as tail events
 FACTOR_LOW_N = 30            # buckets below this get "(low n)"
 # Collection window — factor section aggregates from here through report date.
 WINDOW_START = "2026-08-10"
-WINDOW_END_NOTE = "2026-08-28"
 SHORT_MARK_OK = ("quote", "trade")  # usable exit observations only
 
 # ── Paper-strategy analysis parameters (NOT in config.py — must not move hash)
@@ -1947,8 +1946,7 @@ def section_factor_separation(
     b = DocBuilder(doc)
     b.section("FACTOR SEPARATION")
     b.lines(
-        "diagnostic only — do not act on these until the window closes "
-        f"{WINDOW_END_NOTE}",
+        "diagnostic only — does not feed scoring",
         callout=True,
     )
     obs = _load_factor_observations(
@@ -2076,9 +2074,11 @@ def _cap_hit_flag_line(filt: ReportFilter) -> str | None:
     if filt.on_date:
         hits = load_cap_hits(on_date=filt.on_date)
     elif filt.since:
-        hits = load_cap_hits(since=filt.since, until=date.today().isoformat())
+        from picks_ledger import session_date_et
+        hits = load_cap_hits(since=filt.since, until=session_date_et())
     else:
-        hits = load_cap_hits(on_date=date.today().isoformat())
+        from picks_ledger import session_date_et
+        hits = load_cap_hits(on_date=session_date_et())
     if not hits:
         return None
     by_h: dict[str, list[int]] = defaultdict(list)
@@ -2210,14 +2210,16 @@ def section_flags(
 
 def parse_filter(a: argparse.Namespace) -> tuple[ReportFilter, str, str]:
     """Return (filter, human span label, filename span_key)."""
+    from picks_ledger import session_date_et
+    today_et = session_date_et()
     if a.days:
-        since = (date.today() - timedelta(days=a.days)).isoformat()
+        since = (date.fromisoformat(today_et) - timedelta(days=a.days)).isoformat()
         filt = ReportFilter(
             since=since,
             ticker=a.ticker.upper() if a.ticker else None,
         )
         return filt, f"last {a.days} days", f"last{a.days}d"
-    d = a.date or date.today().isoformat()
+    d = a.date or today_et
     filt = ReportFilter(
         on_date=d,
         ticker=a.ticker.upper() if a.ticker else None,
@@ -2226,8 +2228,23 @@ def parse_filter(a: argparse.Namespace) -> tuple[ReportFilter, str, str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(argv if argv is not None else sys.argv[1:])
+    legacy = "--legacy" in raw or any(
+        a == "--days" or a.startswith("--days=") for a in raw
+    )
+    if not legacy:
+        from picks_ledger import main as ledger_main
+        return ledger_main(raw)
+    raw = [a for a in raw if a != "--legacy"]
+    return _legacy_main(raw)
+
+
+def _legacy_main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--date", help="YYYY-MM-DD (default: today)")
+    p.add_argument(
+        "--date", "--session", dest="date",
+        help="YYYY-MM-DD trading session in ET (default: ET today)",
+    )
     p.add_argument("--days", type=int, help="rolling window instead of one day")
     p.add_argument("--ticker")
     p.add_argument("--db", default=DB)
@@ -2256,7 +2273,8 @@ def main(argv: list[str] | None = None) -> int:
     if filt.on_date:
         factor_until = filt.on_date
     else:
-        factor_until = date.today().isoformat()
+        from picks_ledger import session_date_et
+        factor_until = session_date_et()
     if factor_since > factor_until:
         factor_since = factor_until
 

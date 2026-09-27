@@ -100,7 +100,10 @@ CREATE TABLE IF NOT EXISTS flags (
     open_interest INTEGER,
     iv            REAL,
     notes       TEXT,
-    CHECK (is_control IN (0, 1))
+    paired_flag_id INTEGER,
+    pinned      INTEGER NOT NULL DEFAULT 0,
+    CHECK (is_control IN (0, 1)),
+    CHECK (pinned IN (0, 1))
 );
 
 CREATE INDEX IF NOT EXISTS idx_flags_run ON flags(run_id);
@@ -252,6 +255,9 @@ _FLAG_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
     ("mark_t30m", "REAL"),
     ("marked_t30m_at", "TEXT"),
     ("method_t30m", "TEXT"),
+    # Opposite-side flag in the same scan (same expiry, nearest strike).
+    ("paired_flag_id", "INTEGER"),
+    ("pinned", "INTEGER"),
 )
 
 _RUN_MIGRATE_COLS: tuple[tuple[str, str], ...] = (
@@ -644,6 +650,7 @@ def log_run(
     ts_et: datetime | None = None,
     run_kind: str = "intraday",
     daily_closes: list[float] | None = None,
+    chain_df: pd.DataFrame | None = None,
 ) -> str:
     """
     Append one run + every scored contract + control rows.
@@ -872,8 +879,180 @@ def log_run(
             """,
             flag_rows,
         )
+        _link_paired_flags(conn, run_id)
+        if kind != "eod":
+            _pin_prior_picks(
+                conn,
+                run_id=run_id,
+                ts_iso=ts_iso,
+                ticker=ticker.upper(),
+                scored=scored,
+                chain_df=chain_df,
+                spot=spot,
+                rv_20d=rv_20d,
+            )
 
     return run_id
+
+
+def _pin_prior_picks(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    ts_iso: str,
+    ticker: str,
+    scored: pd.DataFrame,
+    chain_df: pd.DataFrame | None,
+    spot: float,
+    rv_20d: float | None,
+) -> None:
+    """Re-snapshot today's top-10 contracts even if they did not re-qualify.
+
+    pinned=1 rows are quote continuation, not a new live selection.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(flags)")}
+    if "pinned" not in cols or chain_df is None or chain_df.empty:
+        return
+    session = ts_iso[:10]
+    prior = conn.execute(
+        """
+        SELECT DISTINCT side, strike, expiry
+        FROM flags
+        WHERE ticker = ?
+          AND substr(ts_et, 1, 10) = ?
+          AND COALESCE(is_control, 0) = 0
+          AND rank BETWEEN 1 AND 10
+        """,
+        (ticker, session),
+    ).fetchall()
+    if not prior:
+        return
+
+    def _key(side: Any, strike: Any, expiry: Any) -> tuple[str, float, str]:
+        exp = str(expiry or "").strip()[:10]
+        try:
+            k = round(float(strike), 4)
+        except (TypeError, ValueError):
+            k = 0.0
+        return (str(side or "").upper(), k, exp)
+
+    have: set[tuple[str, float, str]] = set()
+    for row in conn.execute(
+        "SELECT side, strike, expiry FROM flags WHERE run_id=?", (run_id,),
+    ):
+        have.add(_key(row[0], row[1], row[2]))
+
+    chain_map: dict[tuple[str, float, str], pd.Series] = {}
+    for _, r in chain_df.iterrows():
+        chain_map[_key(
+            r.get("side") or r.get("Side"),
+            r.get("strike") if "strike" in r.index else r.get("Strike"),
+            r.get("expiry") or r.get("Expiry"),
+        )] = r
+
+    from features.realized_vol import iv_premium as _iv_premium
+    from scoring_pool import scoring_pool as _sp
+
+    pin_rows: list[tuple] = []
+    for side, strike, expiry in prior:
+        key = _key(side, strike, expiry)
+        if key in have:
+            continue
+        r = chain_map.get(key)
+        if r is None:
+            continue
+        bid = _row_float(r, "bid")
+        ask = _row_float(r, "ask")
+        mid = _mid_from_row(r)
+        dte_i, vol_i, oi_i, iv_f = _flag_state_from_row(r)
+        pool_s = _sp(dte_i)
+        ivp = _iv_premium(iv_f, rv_20d)
+        pin_rows.append((
+            run_id, ts_iso, ticker, key[0], key[1], key[2],
+            None, None, None, None, None,
+            json.dumps({"pinned": 1.0}),
+            mid, bid, ask, float(spot) if spot else None, 0, "pinned",
+            dte_i, vol_i, oi_i, iv_f,
+            _row_float(r, "delta"), None, None, None, None, None,
+            rv_20d, ivp, pool_s, 1,
+        ))
+    if not pin_rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO flags (
+            run_id, ts_et, ticker, side, strike, expiry,
+            score, rank, nlev, nflow, base_score, multipliers,
+            mid, bid, ask, spot, is_control, notes,
+            dte, volume, open_interest, iv,
+            delta, leverage_raw, flow_raw, leverage_norm, flow_norm,
+            extrinsic, realized_vol_20d, iv_premium, pool, pinned
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?
+        )
+        """,
+        pin_rows,
+    )
+
+
+def _link_paired_flags(conn: sqlite3.Connection, run_id: str) -> None:
+    """Link CALL/PUT flags in the same run: same expiry, nearest strike.
+
+    Two picks (both keep their own row). Historical rows stay NULL until a
+    future scan writes the column; the ledger also pairs at report time.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(flags)")}
+    if "paired_flag_id" not in cols:
+        return
+    rows = conn.execute(
+        """
+        SELECT flag_id, side, strike, expiry
+        FROM flags
+        WHERE run_id = ? AND is_control = 0
+        """,
+        (run_id,),
+    ).fetchall()
+    by_exp: dict[str, dict[str, list[tuple[int, float]]]] = {}
+    for flag_id, side, strike, expiry in rows:
+        side_u = str(side or "").upper()
+        if side_u not in ("CALL", "PUT"):
+            continue
+        try:
+            k = float(strike)
+        except (TypeError, ValueError):
+            continue
+        bucket = by_exp.setdefault(str(expiry or ""), {"CALL": [], "PUT": []})
+        bucket[side_u].append((int(flag_id), k))
+    updates: list[tuple[int, int]] = []
+    for sides in by_exp.values():
+        calls = list(sides["CALL"])
+        puts = list(sides["PUT"])
+        used_puts: set[int] = set()
+        for cid, cstrike in calls:
+            best_id: int | None = None
+            best_d: float | None = None
+            for pid, pstrike in puts:
+                if pid in used_puts:
+                    continue
+                d = abs(pstrike - cstrike)
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best_id = pid
+            if best_id is None:
+                continue
+            used_puts.add(best_id)
+            updates.append((best_id, cid))
+            updates.append((cid, best_id))
+    if updates:
+        conn.executemany(
+            "UPDATE flags SET paired_flag_id = ? WHERE flag_id = ?",
+            updates,
+        )
 
 
 def _row_float(r: pd.Series, *keys: str) -> float | None:

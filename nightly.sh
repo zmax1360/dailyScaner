@@ -54,7 +54,7 @@ if [ -z "${SKIP_PRUNE:-}" ]; then
     [ "$PRUNED" -gt 0 ] && log "pruned $PRUNED backups older than $KEEP_DAYS days"
 fi
 
-# ── 2. Daily report ──────────────────────────────────────────────────────────
+# ── 2. Daily report (picks ledger; use --legacy / --days for the old aggregate)
 cd "$REPO" || { log "FATAL: cannot cd to $REPO"; exit 1; }
 
 if "$PY" eod_report.py --ticker AAPL >> "$LOG" 2>&1; then

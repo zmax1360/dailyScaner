@@ -1,6 +1,6 @@
 # Architecture (as implemented)
 
-`config_hash(SCORING)` at documentation: `243ecda68cfc8618`.
+`config_hash(SCORING)` at documentation: `0384124ff1be03b1` (engine-v1.4).
 
 Evidence-only. Line refs are the lines that were read. Claims without a line sit under `## Unverified`.
 

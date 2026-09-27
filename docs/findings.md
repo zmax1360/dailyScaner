@@ -12,7 +12,7 @@ Defects observed while documenting. No fixes applied.
 | F-S1-06 | `tests/test_massive_strike_window.py:73` | Mocked Massive `fetch_chain` returned an empty frame; `assert not df.empty` failed. | P1 |
 | F-S1-07 | `tests/test_best_value_engine.py:129` | Marked xfail-strict: NaN `dVol` filled as 1.0 ranks new entrants last. | P1 |
 | F-S1-08 | `tests/test_best_value_engine.py:170` | Marked xfail-strict: per-snapshot min-max makes `Value_Score` a rank, not a level. | P1 |
-| F-S1-09 | `tests/test_best_value_engine.py:186` | Marked xfail-strict: multiplier product after normalisation leaves `[0, 1]`. | P1 |
+| F-S1-09 | `tests/test_best_value_engine.py:186` | Fixed engine-v1.3: `score_cap` 1.0 after multiplier product; xfail removed. | P1 |
 | F-S1-10 | `pyproject.toml:23` vs running env | `pyproject.toml` pins `pytest==7.4.4`; suite ran under `pytest-9.1.1`. Pins `yfinance==1.2.0`; `pip freeze` has `yfinance==1.5.2`. | P2 |
 | F-S1-11 | official invoke `pytest … \| tee` | Pipeline exit code is `tee`'s 0; pytest collection interrupt is hidden from `$?`. | P2 |
 | F-S2-01 | `best_value.py:5` vs `telegram_bot.py` | Module docstring says `telegram_bot.py` imports the scoring engine; that file has no `calculate_best_value` / `build_best_value_df` call. | P2 |
@@ -45,7 +45,7 @@ Defects observed while documenting. No fixes applied.
 | F-S1-06 | `tests/test_massive_strike_window.py:73` | Mocked Massive `fetch_chain` returned an empty frame; `assert not df.empty` failed. | P1 |
 | F-S1-07 | `tests/test_best_value_engine.py:129` | Marked xfail-strict: NaN `dVol` filled as 1.0 ranks new entrants last. | P1 |
 | F-S1-08 | `tests/test_best_value_engine.py:170` | Marked xfail-strict: per-snapshot min-max makes `Value_Score` a rank, not a level. | P1 |
-| F-S1-09 | `tests/test_best_value_engine.py:186` | Marked xfail-strict: multiplier product after normalisation leaves `[0, 1]`. | P1 |
+| F-S1-09 | `tests/test_best_value_engine.py:186` | Fixed engine-v1.3: `score_cap` 1.0 after multiplier product; xfail removed. | P1 |
 | F-S1-10 | `pyproject.toml:23` vs running env | `pyproject.toml` pins `pytest==7.4.4`; suite ran under `pytest-9.1.1`. Pins `yfinance==1.2.0`; `pip freeze` has `yfinance==1.5.2`. | P2 |
 | F-S1-11 | official invoke `pytest … \| tee` | Pipeline exit code is `tee`'s 0; pytest collection interrupt is hidden from `$?`. | P2 |
 | F-S2-01 | `best_value.py:5` vs `telegram_bot.py` | Module docstring says `telegram_bot.py` imports the scoring engine; that file has no `calculate_best_value` / `build_best_value_df` call. | P2 |

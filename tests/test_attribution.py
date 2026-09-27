@@ -40,8 +40,8 @@ def _sample_chain(spot: float = 250.0, expiry: str = "2026-08-21") -> pd.DataFra
                 "expiry": expiry,
                 "dte": 32,
                 "last": abs(spot - k) * 0.02 + 1.5,
-                "bid": 1.0,
-                "ask": 2.0,
+                "bid": 1.90,
+                "ask": 2.00,
                 "volume": 800,
                 "openInterest": 1000,
                 "iv": 0.35,
@@ -94,7 +94,9 @@ def test_multipliers_are_recorded():
     prod = base
     for v in m.values():
         prod *= v
-    assert round(prod, 4) == pytest.approx(scored["Value_Score"].iloc[0], abs=1e-9)
+    cap = float(SCORING.get("score_cap", 1.0))
+    expected = min(round(prod, 4), cap)
+    assert expected == pytest.approx(scored["Value_Score"].iloc[0], abs=1e-9)
 
 
 def test_control_is_deterministic():
@@ -171,6 +173,36 @@ def test_log_run_reconciles_counts(tmp_path):
     assert missing_base == 0
 
 
+def test_log_run_writes_paired_flag_id(tmp_path):
+    db = str(tmp_path / "pair.db")
+    chain = _sample_chain()
+    scored = calculate_best_value(chain, spot_price=250.0, now_et=NOW)
+    run_id = log_run(
+        ticker="TEST",
+        scored_df=scored,
+        cfg=SCORING,
+        spot=250.0,
+        db_path=db,
+        ts_et=NOW,
+    )
+    with _db(db) as c:
+        rows = c.execute(
+            """
+            SELECT flag_id, side, expiry, paired_flag_id
+            FROM flags WHERE run_id=? AND is_control=0
+            """,
+            (run_id,),
+        ).fetchall()
+    by_id = {r[0]: r for r in rows}
+    paired = [r for r in rows if r[3] is not None]
+    assert paired, "CALL/PUT same scan should link via paired_flag_id"
+    for flag_id, side, expiry, pid in paired:
+        other = by_id[pid]
+        assert other[1] != side
+        assert other[2] == expiry
+        assert other[3] == flag_id
+
+
 def test_db_row_multipliers_reproduce_score(tmp_path):
     """A2: a stored flags row alone must reproduce score (VERIFY load-bearing check)."""
     db = str(tmp_path / "a2.db")
@@ -202,14 +234,15 @@ def test_db_row_multipliers_reproduce_score(tmp_path):
             (run_id,),
         ).fetchall()
     assert rows
+    cap = float(SCORING.get("score_cap", 1.0))
     for r in rows:
         rebuilt = score_from_flag_parts(
             r["nlev"], r["nflow"], r["multipliers"], base_score=r["base_score"],
         )
-        assert rebuilt == pytest.approx(r["score"], abs=1e-9)
+        assert min(rebuilt, cap) == pytest.approx(r["score"], abs=1e-9)
         # also via nlev/nflow + config weights
         rebuilt2 = score_from_flag_parts(r["nlev"], r["nflow"], r["multipliers"])
-        assert rebuilt2 == pytest.approx(r["score"], abs=1e-9)
+        assert min(rebuilt2, cap) == pytest.approx(r["score"], abs=1e-9)
 
 
 def test_alert_attribution_failure_never_raises(monkeypatch):
@@ -472,3 +505,53 @@ def test_control_rows_also_carry_state(tmp_path):
         assert row["volume"] == 800
         assert row["open_interest"] == 1000
         assert row["iv"] == pytest.approx(0.35)
+
+
+def test_pin_prior_picks_on_followup_scan(tmp_path):
+    """A top-10 name missing from a later scored set is re-snapshotted pinned=1."""
+    db = str(tmp_path / "pin.db")
+    chain = _sample_chain()
+    scored = calculate_best_value(chain, spot_price=250.0, now_et=NOW)
+    log_run(
+        ticker="TEST", scored_df=scored, cfg=SCORING, spot=250.0,
+        db_path=db, ts_et=NOW, chain_df=chain,
+    )
+    with _db(db) as c:
+        n_pin0 = c.execute(
+            "SELECT COUNT(*) FROM flags WHERE COALESCE(pinned,0)=1"
+        ).fetchone()[0]
+        top = c.execute(
+            """
+            SELECT side, strike, expiry FROM flags
+            WHERE COALESCE(is_control,0)=0 AND rank BETWEEN 1 AND 10
+            ORDER BY rank LIMIT 1
+            """
+        ).fetchone()
+    assert n_pin0 == 0
+    assert top is not None
+    side, strike, expiry = top[0], top[1], top[2]
+    drop = (
+        scored["side"].astype(str).str.upper().eq(str(side).upper())
+        & scored["strike"].astype(float).eq(float(strike))
+        & scored["expiry"].astype(str).str[:10].eq(str(expiry)[:10])
+    )
+    scored2 = scored.loc[~drop].copy()
+    later = NOW + timedelta(minutes=2)
+    log_run(
+        ticker="TEST", scored_df=scored2, cfg=SCORING, spot=250.0,
+        db_path=db, ts_et=later, chain_df=chain,
+    )
+    with _db(db) as c:
+        pins = c.execute(
+            """
+            SELECT pinned, rank, notes, side, strike, expiry
+            FROM flags WHERE COALESCE(pinned,0)=1
+            """
+        ).fetchall()
+    assert len(pins) >= 1
+    pin = pins[0]
+    assert int(pin[0]) == 1
+    assert pin[1] is None
+    assert pin[2] == "pinned"
+    assert str(pin[3]).upper() == str(side).upper()
+    assert float(pin[4]) == pytest.approx(float(strike))
