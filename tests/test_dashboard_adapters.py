@@ -12,6 +12,8 @@ import os
 import sys
 import tempfile
 from datetime import date, datetime, timedelta
+
+from attribution import now_et
 from pathlib import Path
 
 import pandas as pd
@@ -41,11 +43,11 @@ def _df(*rows):
 
 
 def _today_ts():
-    return datetime.now().isoformat()
+    return now_et().isoformat()
 
 
 def _yesterday_ts():
-    return (datetime.now() - timedelta(days=1)).isoformat()
+    return (now_et() - timedelta(days=1)).isoformat()
 
 
 # ── 1. Same-day deltas are computed ──────────────────────────────────────────
@@ -149,7 +151,7 @@ def test_snapshot_round_trip(tmp_path, monkeypatch):
     assert set(loaded["strike"]) == set(df["strike"])
     assert ts is not None
     # Timestamp is today
-    assert datetime.fromisoformat(ts).date() == date.today()
+    assert datetime.fromisoformat(ts).date() == now_et().date()
 
 
 def test_load_snapshot_missing_file(tmp_path, monkeypatch):
