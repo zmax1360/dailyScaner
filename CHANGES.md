@@ -21,6 +21,15 @@ across versions when measuring lift.
 
 Do not pool v1.3 rows with v1.4.
 
+## Full-chain volume history (recording only)
+
+Every scan now stores each traded contract (volume > 0) with volume, open interest, bid/ask,
+last and IV in `data/volume_history.db` (`volume_history.py`), after the scan passes its
+quality gates. Archives still keep only the top 30 per side; this is what makes per-contract
+history and "building positions" (OI rising day after day) possible. Missing values are NULL,
+never 0. Recording is fail-soft and never aborts a scan. Not a scoring input — `config_hash`
+unchanged. Roughly 20 MB per trading day for AAPL + NVDA.
+
 ## EMA stack banner (display only)
 
 15-min EMA 9/21/50 trend rule shown at the top of every app page (`ema_stack.py`):

@@ -954,6 +954,23 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
 
     return fname, fname.replace(".json", ".txt")
 
+def _record_volume_history(fname_json, calls_all, puts_all, *, source_name):
+    """Store every traded contract of this scan. Never raises into the scan."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        import volume_history
+        stem = os.path.splitext(os.path.basename(fname_json))[0]      # AAPL_20260928_104502
+        ts = datetime.strptime(stem.split("_", 1)[1], "%Y%m%d_%H%M%S").replace(
+            tzinfo=ZoneInfo("America/New_York"))
+        n = volume_history.record_scan(
+            calls_all, puts_all, ticker=TICKER, scan_id=stem, ts=ts, source=source_name,
+        )
+        log.info("volume_history: recorded %d contracts for %s", n, stem)
+    except Exception:
+        log.exception("volume_history recording failed (scan continues)")
+
+
 # ?? MAIN ??????????????????????????????????????????????????????????????????????
 def run(source=None):
     # Scan activity lands in logs/scheduler.log (subprocess of scheduler),
@@ -1312,6 +1329,9 @@ def run(source=None):
         quote_source=_quote_source,
         best_value=_bv_payload,
     )
+
+    # Full-chain volume/OI history (fail-soft; display only, never scoring).
+    _record_volume_history(fname_json, calls_all, puts_all, source_name=_curr_source)
 
     # Attribution: every scored contract + ATM controls (fail-soft)
     vol_curr = {

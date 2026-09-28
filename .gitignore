@@ -35,3 +35,6 @@ script/
 # safe_io lock files and interrupted atomic writes
 *.json.lock
 .*.json.*.tmp
+
+# Full-chain volume history (local data, can be large)
+data/volume_history.db*
