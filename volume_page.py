@@ -6,7 +6,7 @@ Reads data/volume_history.db (written by the scanner). Display only.
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Callable
 
 import pandas as pd
@@ -32,6 +32,7 @@ def render_volume_page(
     spot: float | None,
     scan_ts: str | None,
     greeks_fn: Callable[..., tuple[float | None, float | None, float | None]],
+    today: date | None = None,
 ) -> None:
     ticker = str(ticker or "").upper()
     st.subheader(f"{ticker} volume & open interest")
@@ -49,22 +50,28 @@ def render_volume_page(
         "Volume is cumulative for the day; OI is the previous session's close."
     )
 
-    today = datetime.now(tz).date()
+    today = today or datetime.now(tz).date()
     table = vh.explorer_table(vh.latest_scan(ticker), vh.daily_summary(ticker), today=today)
+    table = table[table["dte"] >= 1].reset_index(drop=True)          # no 0DTE on this page
     if table.empty:
-        st.caption("No unexpired contracts in the latest scan.")
+        st.caption("No contracts expiring after today in the latest scan.")
         return
 
     # ── filters ──────────────────────────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1, 1.4])
+    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1, 1.6])
     vmax = int(table["volume"].max() or 0)
     min_vol = c1.number_input("Min volume", min_value=0, max_value=max(vmax, 0), value=0,
                               step=100, key="vol_min")
     max_vol = c2.number_input("Max volume", min_value=0, max_value=max(vmax, 0), value=vmax,
                               step=100, key="vol_max")
     side = c3.radio("Side", ["All", "Calls", "Puts"], horizontal=True, key="vol_side")
-    dte_hi = int(table["dte"].max())
-    dte_rng = c4.slider("DTE", 0, max(dte_hi, 1), (0, max(dte_hi, 1)), key="vol_dte")
+    exp_dates = pd.to_datetime(table["expiry"]).dt.date
+    first_exp, last_exp = exp_dates.min(), exp_dates.max()
+    picked = c4.date_input("Expiry from – to", value=(first_exp, last_exp),
+                           min_value=first_exp, max_value=last_exp, key="vol_expiry")
+    picked = tuple(picked) if isinstance(picked, (tuple, list)) else (picked,)
+    exp_from = picked[0] if picked else first_exp
+    exp_to = picked[1] if len(picked) > 1 else exp_from          # while picking the 2nd date
 
     c5, c6 = st.columns([2, 1])
     strike_q = c5.text_input("Strike (e.g. 350 or 340-360)", key="vol_strike").strip()
@@ -74,7 +81,7 @@ def render_volume_page(
                               if status["sessions"] < 3 else None)
 
     view = table[(table["volume"] >= min_vol) & (table["volume"] <= max_vol)
-                 & table["dte"].between(*dte_rng)]
+                 & exp_dates.between(exp_from, exp_to)]
     if side != "All":
         view = view[view["side"] == ("CALL" if side == "Calls" else "PUT")]
     if strike_q:

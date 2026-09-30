@@ -26,6 +26,7 @@ def _seed(db: str) -> None:
             calls = _leg([
                 (360.0, 11.8, int(900 * frac), oi_build, 0.258, 11.75, 12.0, "2027-01-15"),
                 (340.0, 4.6, int(3000 * frac), oi_flat, 0.203, 4.45, 4.65, "2026-10-02"),
+                (335.0, 1.5, int(9000 * frac), 4000, 0.116, 1.48, 1.53, "2026-09-30"),   # 0DTE on day 3
             ])
             puts = _leg([(335.0, 2.1, int(700 * frac), 3000, 0.21, 2.05, 2.15, "2026-09-29")])
             ts = datetime.strptime(f"{d} {hm}", "%Y-%m-%d %H:%M").replace(tzinfo=ET)
@@ -44,7 +45,7 @@ def test_status_and_latest_scan(seeded):
     s = vh.recording_status("aapl")
     assert s["scans"] == 6 and s["sessions"] == 3
     assert s["last_scan_id"] == "AAPL_20260930_154500"
-    assert len(vh.latest_scan("AAPL")) == 3
+    assert len(vh.latest_scan("AAPL")) == 4
 
 
 def test_explorer_table_counts_dte_from_today_and_flags_building(seeded):
@@ -55,7 +56,7 @@ def test_explorer_table_counts_dte_from_today_and_flags_building(seeded):
     assert jan.oi_change == 900 and jan.oi_up_days == 2
     oct_ = t[(t.strike == 340.0)].iloc[0]
     assert oct_.oi_change == 0 and oct_.oi_up_days == 0
-    assert t.iloc[0].strike == 340.0                                 # default sort: volume desc
+    assert t.iloc[0].strike == 335.0                                 # default sort: volume desc
 
 
 def test_unknown_previous_oi_gives_unknown_change_not_zero():
@@ -75,6 +76,7 @@ def test_unknown_previous_oi_gives_unknown_change_not_zero():
 
 _SCRIPT = """
 import streamlit as st, volume_history as vh, volume_page
+from datetime import date
 from zoneinfo import ZoneInfo
 vh.DB_PATH = {db!r}
 def greeks(S, K, iv, dte, r=0.05, is_call=True):
@@ -87,25 +89,47 @@ def test_page_renders_empty_state(tmp_path):
     from streamlit.testing.v1 import AppTest
 
     body = ("volume_page.render_volume_page('AAPL', tz=ZoneInfo('America/New_York'), spot=345.0,"
-            " scan_ts=None, greeks_fn=greeks)")
+            " scan_ts=None, greeks_fn=greeks, today=date(2026, 9, 30))")
     at = AppTest.from_string(_SCRIPT.format(db=str(tmp_path / "none.db"), body=body)).run()
     assert not at.exception
     assert any("No volume history" in i.value for i in at.info)
 
 
-def test_page_renders_table_with_filters(seeded):
+def _page(db):
     from streamlit.testing.v1 import AppTest
 
     body = ("volume_page.render_volume_page('AAPL', tz=ZoneInfo('America/New_York'), spot=345.0,"
-            " scan_ts=None, greeks_fn=greeks)")
-    at = AppTest.from_string(_SCRIPT.format(db=seeded, body=body)).run()
-    assert not at.exception
-    assert len(at.dataframe) == 1
-    assert at.number_input(key="vol_min") is not None and at.text_input(key="vol_strike") is not None
-    at.number_input(key="vol_min").set_value(2000).run()           # search by volume
-    assert not at.exception
+            " scan_ts=None, greeks_fn=greeks, today=date(2026, 9, 30))")
+    at = AppTest.from_string(_SCRIPT.format(db=db, body=body)).run()
+    assert not at.exception, at.exception
+    return at
+
+
+def test_page_hides_0dte(seeded):
+    at = _page(seeded)
     shown = at.dataframe[0].value
-    assert list(shown["strike"]) == [340.0]
+    assert "2026-09-30" not in set(shown["expiry"])                 # today's expiry never listed
+    assert (shown["dte"] >= 1).all()
+    assert set(shown["expiry"]) == {"2026-10-02", "2027-01-15"}
+
+
+def test_page_filters_by_volume(seeded):
+    at = _page(seeded)
+    at.number_input(key="vol_min").set_value(2000).run()             # search by volume
+    assert not at.exception
+    assert list(at.dataframe[0].value["strike"]) == [340.0]
+
+
+def test_page_filters_by_expiry_date_range(seeded):
+    at = _page(seeded)
+    di = at.date_input(key="vol_expiry")
+    assert tuple(di.value) == (date(2026, 10, 2), date(2027, 1, 15))  # defaults: all non-0DTE
+    di.set_value((date(2026, 11, 1), date(2027, 1, 31))).run()
+    assert not at.exception
+    assert list(at.dataframe[0].value["expiry"]) == ["2027-01-15"]
+    at.date_input(key="vol_expiry").set_value((date(2026, 10, 2),)).run()   # mid-selection: one date
+    assert not at.exception
+    assert list(at.dataframe[0].value["expiry"]) == ["2026-10-02"]
 
 
 def test_contract_history_and_pretrade_handoff(seeded):
