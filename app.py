@@ -25,6 +25,7 @@ from logging_config import LOG_DIR, setup_logging
 
 import data_adapter
 import ema_stack
+import volume_page
 import snapshot_store as ss
 from spread_gate import evaluate_spread_gate
 from dailyScaner import market_is_open, proximity_filter, MIN_OI_FOR_MAGNET
@@ -221,6 +222,7 @@ def _main_tab_labels() -> list[str]:
             ":material/science: Spread Gate",
             ":material/list_alt: Tickers",
             ":material/newspaper: Market News",
+            ":material/bar_chart: Volume",
             ":material/menu_book: Journal",
         ]
     return [
@@ -229,6 +231,7 @@ def _main_tab_labels() -> list[str]:
         "🔬 Spread Gate",
         "📁 Tickers",
         "📰 Market News",
+        "📊 Volume",
         "📓 Journal",
     ]
 
@@ -5888,6 +5891,12 @@ def main():
         _render_tab4()
     elif page == labels[4]:
         _render_tab5(cfg)
+    elif page == labels[5]:
+        _latest = cfg.get("latest_archive") or {}
+        volume_page.render_volume_page(
+            cfg["ticker"], tz=ET, spot=_latest.get("spot"),
+            scan_ts=_latest.get("timestamp"), greeks_fn=_bs_greeks,
+        )
     else:
         jpage = _choice_control(
             "Journal page", journal_pages, default=journal_pages[0],

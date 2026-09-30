@@ -201,3 +201,77 @@ def building_positions(daily: pd.DataFrame, *, min_days: int = 3) -> pd.DataFram
         })
     return pd.DataFrame(out).sort_values("oi_change", ascending=False, ignore_index=True) \
         if out else building_positions(pd.DataFrame())
+
+
+# ── Volume page data (pure) ──────────────────────────────────────────────────
+
+def recording_status(ticker: str, *, db_path: str | None = None) -> dict[str, Any]:
+    """First/last scan, number of scans and sessions recorded for ``ticker``."""
+    path = db_path or DB_PATH
+    empty = {"first_ts": None, "last_ts": None, "last_scan_id": None, "scans": 0, "sessions": 0}
+    if not os.path.exists(path):
+        return empty
+    with closing(sqlite3.connect(path, timeout=30)) as con:
+        row = con.execute(
+            "SELECT MIN(ts_et), MAX(ts_et), COUNT(DISTINCT scan_id), COUNT(DISTINCT session_date)"
+            " FROM contract_scans WHERE ticker=?", (ticker.upper(),)).fetchone()
+        if not row or not row[2]:
+            return empty
+        last_id = con.execute(
+            "SELECT scan_id FROM contract_scans WHERE ticker=? AND ts_et=? LIMIT 1",
+            (ticker.upper(), row[1])).fetchone()[0]
+    return {"first_ts": row[0], "last_ts": row[1], "last_scan_id": last_id,
+            "scans": int(row[2]), "sessions": int(row[3])}
+
+
+def latest_scan(ticker: str, *, db_path: str | None = None) -> pd.DataFrame:
+    """Every contract recorded in the most recent scan."""
+    path = db_path or DB_PATH
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    with closing(sqlite3.connect(path, timeout=30)) as con:
+        return pd.read_sql_query(
+            "SELECT side, strike, expiry, volume, open_interest, bid, ask, last, iv, ts_et, scan_id"
+            " FROM contract_scans WHERE ticker=? AND ts_et=(SELECT MAX(ts_et) FROM contract_scans"
+            " WHERE ticker=?)", con, params=(ticker.upper(), ticker.upper()))
+
+
+def explorer_table(latest: pd.DataFrame, daily: pd.DataFrame, *, today) -> pd.DataFrame:
+    """Rows for the Volume page: latest scan + OI change vs the previous session + OI streak.
+
+    ``today`` is the ET session date; DTE is counted from it (not from the scan date).
+    OI change is NaN when the previous session's OI is unknown — never 0.
+    """
+    cols = ["side", "strike", "expiry", "dte", "volume", "open_interest", "oi_change",
+            "oi_up_days", "bid", "ask", "last", "iv"]
+    if latest is None or latest.empty:
+        return pd.DataFrame(columns=cols)
+    df = latest.copy()
+    exp = pd.to_datetime(df["expiry"], errors="coerce")
+    df["dte"] = (exp - pd.Timestamp(today)).dt.days
+    df = df[df["dte"] >= 0]
+
+    df["oi_change"] = float("nan")
+    df["oi_up_days"] = 0
+    if daily is not None and not daily.empty:
+        sessions = sorted(daily["session_date"].unique())
+        key = ["side", "strike", "expiry"]
+        by_contract = {k: dict(zip(g["session_date"], g["open_interest"]))
+                       for k, g in daily.groupby(key)}
+        changes, streaks = [], []
+        for r in df.itertuples(index=False):
+            hist = by_contract.get((r.side, r.strike, r.expiry), {})
+            seq = [hist.get(d) for d in sessions]
+            cur = seq[-1] if seq else None
+            prev = seq[-2] if len(seq) > 1 else None
+            ok = lambda v: v is not None and not pd.isna(v)
+            changes.append(float(cur) - float(prev) if ok(cur) and ok(prev) else float("nan"))
+            streak = 0
+            for a, b in zip(reversed(seq[:-1]), reversed(seq[1:])):
+                if not (ok(a) and ok(b)) or b <= a:
+                    break
+                streak += 1
+            streaks.append(streak)
+        df["oi_change"] = changes
+        df["oi_up_days"] = streaks
+    return df[cols].sort_values("volume", ascending=False, ignore_index=True)
