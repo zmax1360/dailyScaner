@@ -28,7 +28,8 @@ last and IV in `data/volume_history.db` (`volume_history.py`), after the scan pa
 quality gates. Archives still keep only the top 30 per side; this is what makes per-contract
 history and "building positions" (OI rising day after day) possible. Missing values are NULL,
 never 0. Recording is fail-soft and never aborts a scan. Not a scoring input — `config_hash`
-unchanged. Roughly 20 MB per trading day for AAPL + NVDA.
+unchanged. At most one snapshot per ticker every 15 minutes, plus every end-of-day scan
+(AAPL scans every 3 min; recording every scan was ~100 MB/day for AAPL alone).
 
 ## EMA stack banner (display only)
 

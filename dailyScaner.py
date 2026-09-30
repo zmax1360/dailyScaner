@@ -954,7 +954,7 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
 
     return fname, fname.replace(".json", ".txt")
 
-def _record_volume_history(fname_json, calls_all, puts_all, *, source_name):
+def _record_volume_history(fname_json, calls_all, puts_all, *, source_name, force=False):
     """Store every traded contract of this scan. Never raises into the scan."""
     try:
         from zoneinfo import ZoneInfo
@@ -965,8 +965,10 @@ def _record_volume_history(fname_json, calls_all, puts_all, *, source_name):
             tzinfo=ZoneInfo("America/New_York"))
         n = volume_history.record_scan(
             calls_all, puts_all, ticker=TICKER, scan_id=stem, ts=ts, source=source_name,
+            min_interval_min=volume_history.RECORD_EVERY_MIN, force=force,
         )
-        log.info("volume_history: recorded %d contracts for %s", n, stem)
+        log.info("volume_history: recorded %d contracts for %s%s", n, stem,
+                 "" if n else " (skipped: recorded < %d min ago)" % volume_history.RECORD_EVERY_MIN)
     except Exception:
         log.exception("volume_history recording failed (scan continues)")
 
@@ -1331,7 +1333,7 @@ def run(source=None):
     )
 
     # Full-chain volume/OI history (fail-soft; display only, never scoring).
-    _record_volume_history(fname_json, calls_all, puts_all, source_name=_curr_source)
+    _record_volume_history(fname_json, calls_all, puts_all, source_name=_curr_source, force=IS_EOD)
 
     # Attribution: every scored contract + ATM controls (fail-soft)
     vol_curr = {

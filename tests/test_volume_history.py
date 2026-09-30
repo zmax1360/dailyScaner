@@ -137,3 +137,44 @@ def test_volume_history_is_not_a_scoring_input():
     root = Path(__file__).resolve().parent.parent
     for mod in ("best_value.py", "strategy_engine.py", "scoring_pool.py", "config.py"):
         assert "volume_history" not in (root / mod).read_text(), mod
+
+
+# ── recording throttle ───────────────────────────────────────────────────────
+
+def test_throttle_records_at_most_every_interval_but_always_eod(tmp_path):
+    db = str(tmp_path / "vh.db")
+    written = []
+    for hm in ["10:00", "10:03", "10:06", "10:15", "10:18", "15:57"]:
+        ts = _ts("2026-09-28", hm)
+        written.append(vh.record_scan(CALLS, PUTS, ticker="AAPL", scan_id=f"AAPL_{hm}", ts=ts,
+                                      db_path=db, min_interval_min=15))
+    assert [w > 0 for w in written] == [True, False, False, True, False, True]
+    eod = vh.record_scan(CALLS, PUTS, ticker="AAPL", scan_id="AAPL_eod", ts=_ts("2026-09-28", "16:00"),
+                         db_path=db, min_interval_min=15, force=True)
+    assert eod > 0                                                   # EOD always recorded
+    nxt = vh.record_scan(CALLS, PUTS, ticker="AAPL", scan_id="AAPL_next", ts=_ts("2026-09-29", "09:45"),
+                         db_path=db, min_interval_min=15)
+    assert nxt > 0                                                   # new session starts fresh
+
+
+def test_throttle_is_per_ticker(tmp_path):
+    db = str(tmp_path / "vh.db")
+    a = vh.record_scan(CALLS, PUTS, ticker="AAPL", scan_id="a", ts=_ts("2026-09-28", "10:00"),
+                       db_path=db, min_interval_min=15)
+    n = vh.record_scan(CALLS, PUTS, ticker="NVDA", scan_id="n", ts=_ts("2026-09-28", "10:03"),
+                       db_path=db, min_interval_min=15)
+    assert a > 0 and n > 0
+
+
+def test_scanner_helper_applies_throttle_and_eod_force(tmp_path, monkeypatch):
+    import dailyScaner
+
+    db = str(tmp_path / "vh.db")
+    monkeypatch.setattr(vh, "DB_PATH", db)
+    dailyScaner._record_volume_history("archive/AAPL_20260928_100000.json", CALLS, PUTS, source_name="y")
+    dailyScaner._record_volume_history("archive/AAPL_20260928_100300.json", CALLS, PUTS, source_name="y")
+    dailyScaner._record_volume_history("archive/AAPL_20260928_100600.json", CALLS, PUTS, source_name="y",
+                                       force=True)
+    with sqlite3.connect(db) as con:
+        scans = [r[0] for r in con.execute("SELECT DISTINCT scan_id FROM contract_scans ORDER BY 1")]
+    assert scans == ["AAPL_20260928_100000", "AAPL_20260928_100600"]

@@ -48,6 +48,11 @@ CREATE INDEX IF NOT EXISTS ix_contract ON contract_scans (ticker, side, strike, 
 CREATE INDEX IF NOT EXISTS ix_session  ON contract_scans (ticker, session_date);
 """
 
+# AAPL scans every 3 min; a full snapshot every scan is ~100 MB/day. History charts only
+# need ~15-min resolution, so record at most one snapshot per ticker per interval, plus
+# every end-of-day scan (force=True).
+RECORD_EVERY_MIN = 15
+
 _COLS = {  # legacy scanner leg column -> table column
     "volume": "volume", "openInterest": "open_interest", "bid": "bid", "ask": "ask",
     "lastPrice": "last", "impliedVolatility": "iv",
@@ -96,8 +101,14 @@ def record_scan(
     ts: datetime,
     source: str | None = None,
     db_path: str | None = None,
+    min_interval_min: float | None = None,
+    force: bool = False,
 ) -> int:
-    """Store every traded contract from one scan. Returns rows written; never raises."""
+    """Store every traded contract from one scan. Returns rows written; never raises.
+
+    With ``min_interval_min``, a scan is skipped (returns 0) when the same ticker was
+    recorded less than that many minutes earlier in the same session, unless ``force``.
+    """
     try:
         if ts.tzinfo is None:
             raise ValueError("ts must be timezone-aware (ET)")
@@ -107,6 +118,12 @@ def record_scan(
         ts_iso = ts.isoformat()
         base = (ticker.upper(), scan_id, ts_iso, ts_iso[:10])
         with closing(_connect(db_path or DB_PATH)) as con, con:
+            if min_interval_min and not force:
+                last = con.execute(
+                    "SELECT MAX(ts_et) FROM contract_scans WHERE ticker=? AND session_date=?",
+                    (base[0], base[3])).fetchone()[0]
+                if last and (ts - datetime.fromisoformat(last)).total_seconds() < min_interval_min * 60:
+                    return 0
             con.executemany(
                 "INSERT OR IGNORE INTO contract_scans (ticker, scan_id, ts_et, session_date, side,"
                 " strike, expiry, volume, open_interest, bid, ask, last, iv, source)"
