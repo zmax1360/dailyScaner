@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
 import gex
+import gex_page
 import volume_history as vh
 from config import SCORING
 from zero_dte_gex import bs_gamma
@@ -17,7 +18,7 @@ from zero_dte_gex import bs_gamma
 ET = ZoneInfo("America/New_York")
 SPOT = 333.0
 AS_OF = datetime(2026, 10, 2, 10, 0, tzinfo=ET)       # Friday, 6h to the close
-TODAY, MONDAY = "2026-10-02", "2026-10-05"
+TODAY, MONDAY, NEXT_FRI, LATER = "2026-10-02", "2026-10-05", "2026-10-09", "2026-10-16"
 
 
 def _c(side, strike, expiry, oi, iv=0.30, volume=1000):
@@ -30,142 +31,182 @@ def _latest(rows):
     return pd.DataFrame(rows)
 
 
+def _table(rows, **kw):
+    return gex.gex_table(_latest(rows), spot=SPOT, as_of=kw.pop("as_of", AS_OF), **kw)
+
+
 # ── time ────────────────────────────────────────────────────────────────────
 
 def test_years_to_expiry_counts_the_hours_left_today():
-    same_day = gex.years_to_expiry(TODAY, AS_OF)
-    assert same_day == pytest.approx(6 / (365 * 24))
-    monday = gex.years_to_expiry(MONDAY, AS_OF)
-    assert monday == pytest.approx((3 * 24 + 6) / (365 * 24))    # not a flat 3 days
+    assert gex.years_to_expiry(TODAY, AS_OF) == pytest.approx(6 / (365 * 24))
+    # Friday 10:00 -> Monday 16:00 is 3 days + 6 hours, not a flat 3 days.
+    assert gex.years_to_expiry(MONDAY, AS_OF) == pytest.approx((3 * 24 + 6) / (365 * 24))
 
 
-def test_years_to_expiry_floors_near_the_close_and_rejects_the_past():
+def test_years_to_expiry_floors_just_before_the_close():
     late = datetime(2026, 10, 2, 15, 59, tzinfo=ET)
     assert gex.years_to_expiry(TODAY, late) == pytest.approx(15 / (365 * 24 * 60))
-    assert gex.years_to_expiry("2026-10-01", AS_OF) is None
+
+
+@pytest.mark.parametrize("as_of", [
+    datetime(2026, 10, 2, 16, 0, tzinfo=ET),      # at the close
+    datetime(2026, 10, 2, 16, 5, tzinfo=ET),      # end-of-day scan
+    datetime(2026, 10, 3, 14, 0, tzinfo=ET),      # next day
+])
+def test_years_to_expiry_is_none_once_expired(as_of):
+    assert gex.years_to_expiry(TODAY, as_of) is None
+
+
+def test_years_to_expiry_rejects_bad_dates_and_naive_datetimes():
     assert gex.years_to_expiry("not-a-date", AS_OF) is None
-
-
-def test_years_to_expiry_refuses_naive_datetimes():
     with pytest.raises(ValueError):
         gex.years_to_expiry(TODAY, AS_OF.replace(tzinfo=None))
 
 
 # ── per-contract GEX ────────────────────────────────────────────────────────
 
-def test_gex_matches_the_formula_and_calls_are_positive():
-    t = gex.gex_table(_latest([_c("CALL", 335.0, MONDAY, 2000)]), spot=SPOT, as_of=AS_OF)
-    g = bs_gamma(SPOT, 335.0, 0.30, t_years=gex.years_to_expiry(MONDAY, AS_OF),
-                 r=float(SCORING["risk_free_rate"]))
+def _gamma(strike, expiry, iv=0.30):
+    return bs_gamma(SPOT, strike, iv, t_years=gex.years_to_expiry(expiry, AS_OF),
+                    r=float(SCORING["risk_free_rate"]))
+
+
+def test_default_unit_is_dollars_per_one_dollar_move():
+    t = _table([_c("CALL", 335.0, MONDAY, 2000)])
+    g = _gamma(335.0, MONDAY)
     assert t.loc[0, "gamma"] == pytest.approx(g)
-    assert t.loc[0, "gex"] == pytest.approx(g * 2000 * 100 * SPOT * SPOT * 0.01)
-    assert t.loc[0, "gex"] > 0
-    assert t.loc[0, "dte"] == 3
+    assert t.loc[0, "gex"] == pytest.approx(g * 2000 * 100 * SPOT)
+    assert t.loc[0, "gex"] > 0 and t.loc[0, "dte"] == 3
+
+
+def test_percent_unit_is_spot_over_100_times_the_dollar_unit():
+    usd = _table([_c("CALL", 335.0, MONDAY, 2000)]).loc[0, "gex"]
+    pct = _table([_c("CALL", 335.0, MONDAY, 2000)], unit=gex.UNIT_PCT).loc[0, "gex"]
+    assert pct == pytest.approx(_gamma(335.0, MONDAY) * 2000 * 100 * SPOT * SPOT * 0.01)
+    assert pct / usd == pytest.approx(SPOT / 100)
+
+
+def test_unknown_unit_is_rejected():
+    with pytest.raises(ValueError):
+        _table([_c("CALL", 335.0, MONDAY, 2000)], unit="shares")
 
 
 def test_puts_are_negative_and_mirror_calls():
-    t = gex.gex_table(
-        _latest([_c("CALL", 335.0, MONDAY, 2000), _c("PUT", 335.0, MONDAY, 2000)]),
-        spot=SPOT, as_of=AS_OF,
-    )
+    t = _table([_c("CALL", 335.0, MONDAY, 2000), _c("PUT", 335.0, MONDAY, 2000)])
     call, put = t.loc[t.side == "CALL", "gex"].iloc[0], t.loc[t.side == "PUT", "gex"].iloc[0]
     assert put < 0 and put == pytest.approx(-call)      # same strike, same IV -> same gamma
 
 
 def test_gex_scales_linearly_with_open_interest():
-    a = gex.gex_table(_latest([_c("CALL", 335.0, MONDAY, 5000)]), spot=SPOT, as_of=AS_OF)
-    b = gex.gex_table(_latest([_c("CALL", 335.0, MONDAY, 1000)]), spot=SPOT, as_of=AS_OF)
+    a = _table([_c("CALL", 335.0, MONDAY, 5000)])
+    b = _table([_c("CALL", 335.0, MONDAY, 1000)])
     assert a.loc[0, "gex"] == pytest.approx(5 * b.loc[0, "gex"])
 
 
 @pytest.mark.parametrize("oi, iv", [(None, 0.30), (float("nan"), 0.30), (2000, None),
                                     (2000, float("nan")), (2000, 0.0), (2000, 0.001)])
 def test_missing_inputs_are_nan_never_zero(oi, iv):
-    t = gex.gex_table(_latest([_c("CALL", 335.0, MONDAY, oi, iv=iv)]), spot=SPOT, as_of=AS_OF)
+    t = _table([_c("CALL", 335.0, MONDAY, oi, iv=iv)])
     assert len(t) == 1 and math.isnan(t.loc[0, "gex"])
     assert gex.coverage(t) == {"contracts": 1, "used": 0, "excluded": 1}
 
 
 def test_zero_open_interest_is_a_real_zero():
-    t = gex.gex_table(_latest([_c("CALL", 335.0, MONDAY, 0)]), spot=SPOT, as_of=AS_OF)
-    assert t.loc[0, "gex"] == 0.0
-    assert gex.coverage(t)["used"] == 1
+    t = _table([_c("CALL", 335.0, MONDAY, 0)])
+    assert t.loc[0, "gex"] == 0.0 and gex.coverage(t)["used"] == 1
 
 
-def test_expired_contracts_are_dropped_and_no_spot_gives_an_empty_table():
-    t = gex.gex_table(_latest([_c("CALL", 335.0, "2026-10-01", 2000)]), spot=SPOT, as_of=AS_OF)
-    assert t.empty
+def test_no_spot_gives_an_empty_table():
     for bad in (None, 0.0, float("nan")):
         assert gex.gex_table(_latest([_c("CALL", 335.0, MONDAY, 2000)]),
                              spot=bad, as_of=AS_OF).empty
 
 
-# ── matrix and walls ────────────────────────────────────────────────────────
+def test_expiry_dead_at_the_snapshot_is_dropped_not_shown_as_zeros():
+    """Regression: Friday's end-of-day snapshot must not show Friday's expiry."""
+    eod = datetime(2026, 10, 2, 16, 5, tzinfo=ET)
+    t = _table([_c("CALL", 335.0, TODAY, 9000), _c("CALL", 335.0, MONDAY, 2000)], as_of=eod)
+    assert set(t["expiry"]) == {MONDAY}
+
+
+def test_expiry_before_today_is_dropped_when_a_snapshot_is_viewed_later():
+    """Regression: a Friday-morning snapshot viewed on Saturday hides Friday's expiry."""
+    rows = [_c("CALL", 335.0, TODAY, 9000), _c("CALL", 335.0, MONDAY, 2000)]
+    assert set(_table(rows)["expiry"]) == {TODAY, MONDAY}
+    assert set(_table(rows, today=date(2026, 10, 3))["expiry"]) == {MONDAY}
+
+
+# ── expiries, matrix and walls ──────────────────────────────────────────────
 
 def _chain():
-    return _latest([
-        _c("CALL", 335.0, TODAY, 9000), _c("PUT", 335.0, TODAY, 1000),
-        _c("CALL", 332.5, TODAY, 3000), _c("PUT", 332.5, TODAY, 500),
-        _c("CALL", 327.5, TODAY, 200), _c("PUT", 327.5, TODAY, 6000),
-        _c("CALL", 340.0, MONDAY, 4000),
-        _c("PUT", 325.0, MONDAY, 5000),
-        _c("CALL", 400.0, MONDAY, 99999),                 # outside the strike window
-        _c("CALL", 336.0, MONDAY, None),                  # unusable
-    ])
+    return [
+        _c("CALL", 335.0, MONDAY, 9000), _c("PUT", 335.0, MONDAY, 1000),
+        _c("CALL", 332.5, MONDAY, 3000), _c("PUT", 332.5, MONDAY, 500),
+        _c("CALL", 327.5, MONDAY, 200), _c("PUT", 327.5, MONDAY, 6000),
+        _c("CALL", 340.0, NEXT_FRI, 4000),
+        _c("PUT", 325.0, NEXT_FRI, 5000),
+        _c("CALL", 400.0, NEXT_FRI, 99999),               # far from spot
+        _c("CALL", 336.0, NEXT_FRI, None),                # unusable
+        _c("CALL", 335.0, LATER, 1000),
+    ]
+
+
+def test_available_expiries_and_current_week():
+    table = _table(_chain())
+    assert gex.available_expiries(table) == [MONDAY, NEXT_FRI, LATER]
+    assert gex.current_week([MONDAY, NEXT_FRI, LATER]) == [MONDAY, NEXT_FRI]
+    assert gex.current_week([]) == [] and gex.available_expiries(pd.DataFrame()) == []
+    only_unusable = _table([_c("CALL", 336.0, MONDAY, None)])
+    assert gex.available_expiries(only_unusable) == []
 
 
 def test_matrix_nets_calls_and_puts_per_strike_and_expiry():
-    table = gex.gex_table(_chain(), spot=SPOT, as_of=AS_OF)
-    m = gex.gex_matrix(table, spot=SPOT, window_pct=0.06, max_expiries=4)
-    assert list(m.columns) == [TODAY, MONDAY]                      # nearest first
-    assert list(m.index) == sorted(m.index, reverse=True)          # strikes descending
-    assert 400.0 not in m.index and 336.0 not in m.index
-    want = table[(table.strike == 335.0) & (table.expiry == TODAY)]["gex"].sum()
-    assert m.loc[335.0, TODAY] == pytest.approx(want)
-    assert m.loc[327.5, TODAY] < 0 < m.loc[335.0, TODAY]
+    table = _table(_chain())
+    m = gex.gex_matrix(table, spot=SPOT, n_strikes=None)
+    assert list(m.columns) == [MONDAY, NEXT_FRI, LATER]             # nearest first
+    assert list(m.index) == sorted(m.index, reverse=True)           # strikes descending
+    assert 336.0 not in m.index                                     # unusable contract
+    want = table[(table.strike == 335.0) & (table.expiry == MONDAY)]["gex"].sum()
+    assert m.loc[335.0, MONDAY] == pytest.approx(want)
+    assert m.loc[327.5, MONDAY] < 0 < m.loc[335.0, MONDAY]
 
 
 def test_matrix_cell_without_a_usable_contract_is_nan_not_zero():
-    m = gex.gex_matrix(gex.gex_table(_chain(), spot=SPOT, as_of=AS_OF), spot=SPOT)
-    assert math.isnan(m.loc[340.0, TODAY])
-    assert math.isnan(m.loc[335.0, MONDAY])
+    m = gex.gex_matrix(_table(_chain()), spot=SPOT, n_strikes=None)
+    assert math.isnan(m.loc[340.0, MONDAY]) and math.isnan(m.loc[332.5, NEXT_FRI])
 
 
-def test_matrix_respects_window_and_expiry_limit():
-    table = gex.gex_table(_chain(), spot=SPOT, as_of=AS_OF)
-    one = gex.gex_matrix(table, spot=SPOT, max_expiries=1)
-    assert list(one.columns) == [TODAY]
-    wide = gex.gex_matrix(table, spot=SPOT, window_pct=0.25)
-    assert 400.0 in wide.index
+def test_matrix_keeps_the_n_strikes_closest_to_spot():
+    table = _table(_chain())
+    m = gex.gex_matrix(table, spot=SPOT, n_strikes=3)
+    assert list(m.index) == [335.0, 332.5, 327.5]
+    assert 400.0 in gex.gex_matrix(table, spot=SPOT, n_strikes=None).index
+    assert 400.0 not in gex.gex_matrix(table, spot=SPOT, n_strikes=5).index
+
+
+def test_matrix_expiry_filter():
+    table = _table(_chain())
+    assert list(gex.gex_matrix(table, spot=SPOT, expiries=[NEXT_FRI]).columns) == [NEXT_FRI]
+    assert gex.gex_matrix(table, spot=SPOT, expiries=["2027-01-15"]).empty
     assert gex.gex_matrix(pd.DataFrame(), spot=SPOT).empty
 
 
 def test_walls_and_net_per_expiry():
-    m = gex.gex_matrix(gex.gex_table(_chain(), spot=SPOT, as_of=AS_OF), spot=SPOT)
+    m = gex.gex_matrix(_table(_chain()), spot=SPOT, n_strikes=None)
     w = gex.walls(m)
-    assert w[TODAY]["call_wall"] == 335.0
-    assert w[TODAY]["put_wall"] == 327.5
-    assert w[TODAY]["net"] == pytest.approx(m[TODAY].sum())
-    assert w[MONDAY] == {"call_wall": 340.0, "put_wall": 325.0,
-                         "net": pytest.approx(m[MONDAY].sum())}
-
-
-def test_walls_are_none_when_one_side_is_absent():
-    m = gex.gex_matrix(
-        gex.gex_table(_latest([_c("CALL", 335.0, MONDAY, 2000)]), spot=SPOT, as_of=AS_OF),
-        spot=SPOT,
-    )
-    assert gex.walls(m)[MONDAY]["put_wall"] is None
+    assert w[MONDAY]["call_wall"] == 335.0 and w[MONDAY]["put_wall"] == 327.5
+    assert w[MONDAY]["net"] == pytest.approx(m[MONDAY].sum())
+    assert w[LATER]["put_wall"] is None                              # no puts there
 
 
 def test_nearest_strike_and_money_format():
-    m = gex.gex_matrix(gex.gex_table(_chain(), spot=SPOT, as_of=AS_OF), spot=SPOT)
+    m = gex.gex_matrix(_table(_chain()), spot=SPOT)
     assert gex.nearest_strike(m, SPOT) == 332.5
     assert gex.nearest_strike(pd.DataFrame(), SPOT) is None
-    assert gex.fmt_money(25_400_000) == "25.40M"
-    assert gex.fmt_money(-399_216) == "-399K"
-    assert gex.fmt_money(8356) == "8,356"
+    assert gex.fmt_money(13_940_000) == "13.94M"
+    assert gex.fmt_money(-399_264) == "-399,264"
+    assert gex.fmt_money(8354) == "8,354"
     assert gex.fmt_money(1.5e9) == "1.50B"
+    assert gex.fmt_money(-0.2) == "0" and gex.fmt_money(0.0) == "0"   # never "-0"
     assert gex.fmt_money(float("nan")) == "" and gex.fmt_money(None) == ""
 
 
@@ -180,13 +221,37 @@ def test_gex_is_not_a_scoring_input():
         assert "import gex" not in src and "from gex" not in src
 
 
+# ── page helpers ────────────────────────────────────────────────────────────
+
+def test_pick_expiries_modes():
+    av = [MONDAY, NEXT_FRI, LATER]
+    assert gex_page.pick_expiries(gex_page.EXP_CURRENT, av, None) == [MONDAY]
+    assert gex_page.pick_expiries(gex_page.EXP_WEEK, av, None) == [MONDAY, NEXT_FRI]
+    assert gex_page.pick_expiries(gex_page.EXP_ALL, av, None) == av
+    assert gex_page.pick_expiries(gex_page.EXP_PICK, av, [LATER]) == [LATER]
+    assert gex_page.pick_expiries(gex_page.EXP_PICK, av, []) == [MONDAY]   # nothing picked yet
+
+
+def test_style_matrix_marks_walls_spot_and_net_row():
+    m = gex.gex_matrix(_table(_chain()), spot=SPOT, n_strikes=None)
+    styler = gex_page.style_matrix(m, gex.walls(m), spot_strike=332.5)
+    assert styler.data.index[-1] == gex_page.NET_LABEL
+    assert styler.data.loc[gex_page.NET_LABEL, MONDAY] == pytest.approx(m[MONDAY].sum())
+    html = styler.to_html()
+    assert "rgb(250, 204, 21)" in html and "rgb(45, 212, 191)" in html    # call / put wall
+    assert "◀ spot" in html
+    assert gex_page._cell_css(float("nan"), 1.0) == ""
+
+
 # ── page ────────────────────────────────────────────────────────────────────
 
 _SCRIPT = """
 import streamlit as st, volume_history as vh, gex_page
+from datetime import date
 from zoneinfo import ZoneInfo
 vh.DB_PATH = {db!r}
-gex_page.render_gex_page('AAPL', tz=ZoneInfo('America/New_York'), spot={spot!r})
+gex_page.render_gex_page('AAPL', tz=ZoneInfo('America/New_York'), spot={spot!r},
+                         today=date(2026, 10, 3))
 """
 
 
@@ -198,14 +263,17 @@ def _leg(rows):
 
 @pytest.fixture
 def seeded(tmp_path):
+    """Friday's end-of-day snapshot, viewed on Saturday (the reported case)."""
     db = str(tmp_path / "vh.db")
-    calls = _leg([(335.0, 1.2, 5000, 9000, 0.30, 1.15, 1.25, TODAY),
-                  (332.5, 2.4, 4000, 3000, 0.30, 2.35, 2.45, TODAY),
-                  (340.0, 1.9, 2000, 4000, 0.28, 1.85, 1.95, MONDAY)])
-    puts = _leg([(327.5, 0.4, 3000, 6000, 0.33, 0.38, 0.42, TODAY),
-                 (325.0, 1.1, 1500, 5000, 0.31, 1.05, 1.15, MONDAY)])
-    vh.record_scan(calls, puts, ticker="AAPL", scan_id="AAPL_20261002_100000", ts=AS_OF,
-                   db_path=db)
+    calls = _leg([(335.0, 0.01, 5000, 9000, 0.30, 0.01, 0.02, TODAY),      # expired
+                  (335.0, 1.2, 5000, 9000, 0.30, 1.15, 1.25, MONDAY),
+                  (332.5, 2.4, 4000, 3000, 0.30, 2.35, 2.45, MONDAY),
+                  (340.0, 1.9, 2000, 4000, 0.28, 1.85, 1.95, NEXT_FRI),
+                  (335.0, 4.0, 1500, 1000, 0.27, 3.95, 4.05, LATER)])
+    puts = _leg([(327.5, 0.4, 3000, 6000, 0.33, 0.38, 0.42, MONDAY),
+                 (325.0, 1.1, 1500, 5000, 0.31, 1.05, 1.15, NEXT_FRI)])
+    vh.record_scan(calls, puts, ticker="AAPL", scan_id="AAPL_20261002_160500",
+                   ts=datetime(2026, 10, 2, 16, 5, tzinfo=ET), db_path=db)
     return db
 
 
@@ -228,32 +296,45 @@ def test_page_refuses_without_spot(seeded):
     assert len(at.dataframe) == 0
 
 
-def test_page_renders_metrics_and_one_matrix(seeded):
+def test_page_default_view_is_current_week_without_the_dead_expiry(seeded):
     at = _run(seeded)
-    labels = {m.label: m.value for m in at.metric}
-    assert labels["Spot"] == "$333.00"
-    assert labels["Call wall"] == "$335"
-    assert labels["Put wall"] == "$327.5"
     assert len(at.dataframe) == 1
     shown = at.dataframe[0].value
-    assert list(shown.columns) == [TODAY, MONDAY]
+    assert list(shown.columns) == [MONDAY, NEXT_FRI]          # no 2026-10-02, no later week
+    assert shown.index[-1] == gex_page.NET_LABEL
     assert sum("◀ spot" in str(i) for i in shown.index) == 1
-    assert any("5 of 5 contracts used" in c.value for c in at.caption)
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Spot"] == "$333.00"
+    assert metrics["Call wall · Oct 5"] == "$335"
+    assert metrics["Put wall · Oct 5"] == "$327.5"
+    assert "-0" not in set(shown.map(gex.fmt_money).values.ravel())
 
 
-def test_page_expiry_control_narrows_the_matrix(seeded):
+def test_page_expiration_filter(seeded):
     at = _run(seeded)
-    at.radio(key="gex_n_exp").set_value(1).run()
+    at.radio(key="gex_exp_mode").set_value(gex_page.EXP_CURRENT).run()
+    assert list(at.dataframe[0].value.columns) == [MONDAY]
+    at.radio(key="gex_exp_mode").set_value(gex_page.EXP_ALL).run()
+    assert list(at.dataframe[0].value.columns) == [MONDAY, NEXT_FRI, LATER]
+    at.radio(key="gex_exp_mode").set_value(gex_page.EXP_PICK).run()
+    at.multiselect(key="gex_exp_pick").set_value([LATER]).run()
     assert not at.exception
-    assert list(at.dataframe[0].value.columns) == [TODAY]
+    assert list(at.dataframe[0].value.columns) == [LATER]
 
 
-def test_style_matrix_marks_the_wall_and_leaves_missing_cells_unstyled(seeded):
-    import gex_page
+def test_page_strike_count_filter(seeded):
+    at = _run(seeded)
+    at.radio(key="gex_exp_mode").set_value(gex_page.EXP_ALL).run()
+    full = len(at.dataframe[0].value) - 1                       # minus the NET row
+    assert full == 5
+    at.radio(key="gex_strikes").set_value("All").run()
+    assert len(at.dataframe[0].value) - 1 == 5
 
-    table = gex.gex_table(vh.latest_scan("AAPL", db_path=seeded), spot=SPOT, as_of=AS_OF)
-    m = gex.gex_matrix(table, spot=SPOT)
-    html = gex_page.style_matrix(m, gex.walls(m), spot_strike=332.5).to_html()
-    assert "rgb(250, 204, 21)" in html                       # wall highlight
-    assert "◀ spot" in html
-    assert gex_page._cell_css(float("nan"), 1.0) == ""
+
+def test_page_unit_toggle_rescales_by_spot_over_100(seeded):
+    at = _run(seeded)
+    usd = at.dataframe[0].value.loc[gex_page.NET_LABEL, MONDAY]
+    at.radio(key="gex_unit").set_value("Per 1% move").run()
+    assert not at.exception
+    pct = at.dataframe[0].value.loc[gex_page.NET_LABEL, MONDAY]
+    assert pct / usd == pytest.approx(SPOT / 100)
