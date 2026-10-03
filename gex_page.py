@@ -24,6 +24,7 @@ NET_LABEL = "NET $"
 EXP_CURRENT, EXP_WEEK, EXP_ALL, EXP_PICK = "Current", "Current week", "All", "Pick dates"
 STRIKE_CHOICES = ["8", "16", "32", "64", "All"]
 UNIT_LABELS = {"Per $1 move": gex.UNIT_DOLLAR, "Per 1% move": gex.UNIT_PCT}
+IV_LABELS = {"Vendor": gex.IV_VENDOR, "From quotes": gex.IV_QUOTE}
 
 
 def _cell_css(v, vmax: float) -> str:
@@ -95,8 +96,12 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
     # ── panel settings (tucked away, like the reference view) ───────────────
     with settings.popover("Panel settings", use_container_width=True):
         unit_label = st.radio("Units", list(UNIT_LABELS), horizontal=True, key="gex_unit")
+        iv_label = st.radio("Implied volatility", list(IV_LABELS), horizontal=True,
+                            key="gex_iv_source",
+                            help="'From quotes' solves IV from each contract's bid/ask mid; "
+                                 "'Vendor' uses the IV the data source reports.")
         table = gex.gex_table(latest, spot=spot, as_of=as_of, unit=UNIT_LABELS[unit_label],
-                              today=today)
+                              today=today, iv_source=IV_LABELS[iv_label])
         available = gex.available_expiries(table)
         mode = st.radio("Expirations", [EXP_CURRENT, EXP_WEEK, EXP_ALL, EXP_PICK], index=1,
                         horizontal=True, key="gex_exp_mode")
@@ -145,7 +150,8 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
         f"Snapshot {as_of.astimezone(tz):%a %b %d %H:%M ET} · "
         f"{len(matrix.columns)} of {len(available)} expiries · {len(matrix)} strikes · "
         f"{cov['used']} of {cov['contracts']} contracts used · "
-        f"$ of dealer hedging {unit_label.lower()}"
+        + (f"IV from quotes on {cov['iv_from_quote']} · " if cov["iv_from_quote"] else "")
+        + f"$ of dealer hedging {unit_label.lower()}"
     )
 
     # ── panel 3: how to read it ──────────────────────────────────────────────

@@ -107,7 +107,7 @@ def test_gex_scales_linearly_with_open_interest():
 def test_missing_inputs_are_nan_never_zero(oi, iv):
     t = _table([_c("CALL", 335.0, MONDAY, oi, iv=iv)])
     assert len(t) == 1 and math.isnan(t.loc[0, "gex"])
-    assert gex.coverage(t) == {"contracts": 1, "used": 0, "excluded": 1}
+    assert gex.coverage(t) == {"contracts": 1, "used": 0, "excluded": 1, "iv_from_quote": 0}
 
 
 def test_zero_open_interest_is_a_real_zero():
@@ -133,6 +133,50 @@ def test_expiry_before_today_is_dropped_when_a_snapshot_is_viewed_later():
     rows = [_c("CALL", 335.0, TODAY, 9000), _c("CALL", 335.0, MONDAY, 2000)]
     assert set(_table(rows)["expiry"]) == {TODAY, MONDAY}
     assert set(_table(rows, today=date(2026, 10, 3))["expiry"]) == {MONDAY}
+
+
+# ── IV source ───────────────────────────────────────────────────────────────
+
+def _quoted(side, strike, expiry, oi, *, vendor_iv, true_iv):
+    """Contract whose bid/ask is centred on the BS price at ``true_iv``."""
+    from greeks import bs_price
+
+    t_days = gex.years_to_expiry(expiry, AS_OF) * 365.0
+    p = bs_price(side, SPOT, strike, t_days, true_iv, r=float(SCORING["risk_free_rate"]))
+    row = _c(side, strike, expiry, oi, iv=vendor_iv)
+    row.update(bid=p - 0.02, ask=p + 0.02)
+    return row
+
+
+def test_vendor_iv_is_the_default_and_ignores_quotes():
+    t = _table([_quoted("CALL", 335.0, MONDAY, 2000, vendor_iv=0.15, true_iv=0.30)])
+    assert t.loc[0, "iv"] == 0.15 and not t.loc[0, "iv_from_quote"]
+
+
+def test_quote_iv_recovers_the_market_iv_and_changes_gamma():
+    row = _quoted("CALL", 335.0, MONDAY, 2000, vendor_iv=0.15, true_iv=0.30)
+    vendor = _table([row])
+    quote = _table([row], iv_source=gex.IV_QUOTE)
+    assert quote.loc[0, "iv"] == pytest.approx(0.30, abs=2e-3)
+    assert bool(quote.loc[0, "iv_from_quote"])
+    assert quote.loc[0, "gamma"] == pytest.approx(_gamma(335.0, MONDAY, iv=0.30), rel=1e-2)
+    assert quote.loc[0, "gex"] != pytest.approx(vendor.loc[0, "gex"])
+    assert gex.coverage(quote)["iv_from_quote"] == 1
+
+
+@pytest.mark.parametrize("bid, ask", [(None, None), (0.0, 1.0), (1.2, 1.0),
+                                      (SPOT + 1.0, SPOT + 2.0)])     # last: no IV fits
+def test_quote_iv_falls_back_to_vendor_without_a_usable_quote(bid, ask):
+    row = _c("CALL", 335.0, MONDAY, 2000, iv=0.25)
+    row.update(bid=bid, ask=ask)
+    t = _table([row], iv_source=gex.IV_QUOTE)
+    assert t.loc[0, "iv"] == 0.25 and not t.loc[0, "iv_from_quote"]
+    assert not math.isnan(t.loc[0, "gex"])
+
+
+def test_unknown_iv_source_is_rejected():
+    with pytest.raises(ValueError):
+        _table([_c("CALL", 335.0, MONDAY, 2000)], iv_source="guess")
 
 
 # ── expiries, matrix and walls ──────────────────────────────────────────────
@@ -338,3 +382,11 @@ def test_page_unit_toggle_rescales_by_spot_over_100(seeded):
     assert not at.exception
     pct = at.dataframe[0].value.loc[gex_page.NET_LABEL, MONDAY]
     assert pct / usd == pytest.approx(SPOT / 100)
+
+
+def test_page_iv_source_toggle(seeded):
+    at = _run(seeded)
+    assert not any("IV from quotes" in c.value for c in at.caption)
+    at.radio(key="gex_iv_source").set_value("From quotes").run()
+    assert not at.exception
+    assert any("IV from quotes on" in c.value for c in at.caption)

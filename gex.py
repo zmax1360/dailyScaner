@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from config import SCORING
+from greeks import implied_vol
 from zero_dte_gex import bs_gamma
 
 ET = ZoneInfo("America/New_York")
@@ -35,7 +36,11 @@ MOVE_PCT = 0.01               # exposure is quoted per 1% move in spot
 UNIT_DOLLAR = "dollar"        # $ of delta hedging per $1 move in spot
 UNIT_PCT = "pct"              # $ of delta hedging per 1% move in spot
 
-TABLE_COLS = ["side", "strike", "expiry", "dte", "open_interest", "iv", "gamma", "gex"]
+IV_VENDOR = "vendor"          # IV as reported by the data source
+IV_QUOTE = "quote"            # IV solved from the bid/ask mid (vendor IV as fallback)
+
+TABLE_COLS = ["side", "strike", "expiry", "dte", "open_interest", "iv", "iv_from_quote",
+              "gamma", "gex"]
 
 
 def _f(v: Any) -> float | None:
@@ -74,15 +79,22 @@ def gex_table(
     as_of: datetime,
     unit: str = UNIT_DOLLAR,
     today: date | None = None,
+    iv_source: str = IV_VENDOR,
 ) -> pd.DataFrame:
     """One row per contract with its gamma and signed dollar GEX.
 
     ``gex`` is NaN when open interest, IV or gamma is unusable. Contracts already
     expired at ``as_of`` are dropped, and so are expiries before ``today`` (so a
     snapshot viewed on a later day does not show dead expiries).
+
+    ``iv_source`` "quote" solves IV from the bid/ask mid with the exact time to
+    expiry, and falls back to the vendor IV when there is no usable two-sided
+    quote or no IV reproduces the mid.
     """
     if unit not in (UNIT_DOLLAR, UNIT_PCT):
         raise ValueError(f"unknown unit {unit!r}")
+    if iv_source not in (IV_VENDOR, IV_QUOTE):
+        raise ValueError(f"unknown iv_source {iv_source!r}")
     s = _f(spot)
     if latest is None or latest.empty or s is None or s <= 0:
         return pd.DataFrame(columns=TABLE_COLS)
@@ -103,6 +115,13 @@ def gex_table(
             continue
         oi = _f(rec.get("open_interest"))
         iv = _f(rec.get("iv"))
+        from_quote = False
+        if iv_source == IV_QUOTE:
+            bid, ask = _f(rec.get("bid")), _f(rec.get("ask"))
+            if bid is not None and ask is not None and bid > 0 and ask >= bid:
+                solved = implied_vol(side, s, strike, t * 365.0, 0.5 * (bid + ask), r=r)
+                if solved is not None and solved >= min_iv:
+                    iv, from_quote = solved, True
         gamma = None
         if iv is not None and iv >= min_iv:
             gamma = bs_gamma(s, strike, iv, t_years=t, r=r)
@@ -115,6 +134,7 @@ def gex_table(
             "dte": (date.fromisoformat(expiry) - snap_day).days,
             "open_interest": float("nan") if oi is None else oi,
             "iv": float("nan") if iv is None else iv,
+            "iv_from_quote": from_quote,
             "gamma": float("nan") if gamma is None else gamma,
             "gex": gex,
         })
@@ -125,7 +145,8 @@ def coverage(table: pd.DataFrame) -> dict[str, int]:
     """How many contracts actually contributed — the map is only as good as this."""
     n = int(len(table))
     used = int(table["gex"].notna().sum()) if n else 0
-    return {"contracts": n, "used": used, "excluded": n - used}
+    from_quote = int(table["iv_from_quote"].sum()) if n else 0
+    return {"contracts": n, "used": used, "excluded": n - used, "iv_from_quote": from_quote}
 
 
 def available_expiries(table: pd.DataFrame) -> list[str]:
