@@ -25,6 +25,7 @@ from logging_config import LOG_DIR, setup_logging
 
 import data_adapter
 import ema_stack
+import gex_page
 import volume_page
 import snapshot_store as ss
 from spread_gate import evaluate_spread_gate
@@ -223,6 +224,7 @@ def _main_tab_labels() -> list[str]:
             ":material/list_alt: Tickers",
             ":material/newspaper: Market News",
             ":material/bar_chart: Volume",
+            ":material/grid_on: Gamma",
             ":material/menu_book: Journal",
         ]
     return [
@@ -232,6 +234,7 @@ def _main_tab_labels() -> list[str]:
         "📁 Tickers",
         "📰 Market News",
         "📊 Volume",
+        "🧱 Gamma",
         "📓 Journal",
     ]
 
@@ -5897,6 +5900,9 @@ def main():
             cfg["ticker"], tz=ET, spot=_latest.get("spot"),
             scan_ts=_latest.get("timestamp"), greeks_fn=_bs_greeks,
         )
+    elif page == labels[6]:
+        _latest = cfg.get("latest_archive") or {}
+        gex_page.render_gex_page(cfg["ticker"], tz=ET, spot=_latest.get("spot"))
     else:
         jpage = _choice_control(
             "Journal page", journal_pages, default=journal_pages[0],
