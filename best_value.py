@@ -302,7 +302,7 @@ def calculate_best_value(
         return df
 
     from chain_quality import iv_degraded_for_1sd
-    from greeks import bs_delta, effective_dte_days
+    from greeks import contract_delta, effective_dte_days
 
     # Emit / refresh delta via Black-Scholes (never default to 0.5)
     r_free = float(cfg.get("risk_free_rate", 0.045))
@@ -315,12 +315,14 @@ def calculate_best_value(
         dte = r.get("dte") if "dte" in r.index else r.get("DTE")
         exp = r.get("expiry") if "expiry" in r.index else r.get("Expiry")
         try:
-            d = bs_delta(
+            d = contract_delta(
                 str(side),
                 float(spot_price),
                 float(strike or 0),
                 effective_dte_days(dte, expiry=exp, now_et=now_et),
                 float(iv if iv is not None else 0),
+                bid=r.get("bid") if "bid" in r.index else None,
+                ask=r.get("ask") if "ask" in r.index else None,
                 r=r_free,
             )
         except (TypeError, ValueError):
@@ -760,7 +762,7 @@ def build_best_value_df(
     pov_info: dict | None = None,
 ) -> pd.DataFrame:
     """Build flat contracts DF from archive volume blocks, then score."""
-    from greeks import bs_delta, effective_dte_days
+    from greeks import contract_delta, effective_dte_days
 
     rows: list[dict[str, Any]] = []
     r_free = float(SCORING.get("risk_free_rate", 0.045))
@@ -773,7 +775,10 @@ def build_best_value_df(
             strike_f = float(c.get("strike") or 0)
             exp = c.get("expiry", "")
             t_days = effective_dte_days(dte_i, expiry=exp, now_et=now_et)
-            d = bs_delta(side, float(spot), strike_f, t_days, iv_f, r=r_free)
+            d = contract_delta(
+                side, float(spot), strike_f, t_days, iv_f,
+                bid=c.get("bid"), ask=c.get("ask"), r=r_free,
+            )
             def _quote_f(key: str) -> float:
                 v = c.get(key)
                 if v is None:

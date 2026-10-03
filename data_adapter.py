@@ -97,7 +97,7 @@ def fetch_full_chain(
     if not rows:
         return _empty_frame()
 
-    from greeks import bs_delta, effective_dte_days
+    from greeks import contract_delta, effective_dte_days
     from config import SCORING
     from attribution import now_et
 
@@ -109,9 +109,10 @@ def fetch_full_chain(
             t_days = effective_dte_days(
                 row["dte"], expiry=row["expiry"], now_et=asof,
             )
-            d = bs_delta(
+            d = contract_delta(
                 row["side"], spot, row["strike"], t_days,
-                row["impliedVolatility"], r=r_free,
+                row["impliedVolatility"],
+                bid=row["bid"], ask=row["ask"], r=r_free,
             )
         else:
             d = None

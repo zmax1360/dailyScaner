@@ -11,6 +11,38 @@ across versions when measuring lift.
 | engine-v1.3  | `d60c1855a9ca0923` | from next session after land | `score_cap` 1.0 after multiplier product (F-03 / F-S1-09) |
 | engine-v1.4  | `0384124ff1be03b1` | from next session after land | `max_spread_pct` 0.25 pre-rank quote gate |
 
+## engine-v1.5 — quote-repaired IV for delta (code landed, NOT ACTIVE)
+
+**Bug (handover D4):** stored `delta` pins at ±1.000 for contracts that are barely in the
+money. Vendor IV on those rows is junk-low (it prices the contract below its live bid), and
+`bs_delta` at that IV rounds to ±1.000. Attribution query on `flags` (`ABS(delta) >= 0.9995`):
+165 of 302 saturated contracts had `iv < 0.15`, including 95 0DTE contracts within 1% of spot
+and 17 1DTE+ contracts 1–3% in the money. The same defect gives OTM contracts ~zero delta.
+
+**Fix:** `greeks.contract_delta` is now the single delta entry point (`best_value.py` both
+sites, `data_adapter.py`). With `SCORING["delta_iv_source"] = "quote_repair"`, a contract whose
+vendor-IV BS price is below its live bid gets IV re-solved from the bid/ask mid
+(`greeks.quote_repaired_iv`). Narrow on purpose — unchanged when the vendor IV is missing or
+below `min_iv_usable`, when there is no usable two-sided quote, or when the vendor price is at
+or above the bid. Repair needed but unsolvable → delta NaN (excluded), never a default.
+
+**Not active.** The key is absent from `config.SCORING`, so the mode is `"vendor"`:
+behaviour and `config_hash` (`0384124ff1be03b1`) are unchanged by this commit.
+
+**To activate (start of a collection window only):**
+1. Add `"delta_iv_source": "quote_repair"` to `config.SCORING`; record the new `config_hash`
+   here and in the table above as engine-v1.5.
+2. `tests/test_golden_master.py::test_golden_master_matches_expected` will then diverge:
+   10 of the 42 synthetic contracts in `tests/golden/chain_aapl.json` carry quotes their IV
+   cannot reproduce. Regenerate `scored_expected.json` deliberately; do not edit assertions.
+3. Do not pool v1.4 rows with v1.5. Re-run delta-bucket attribution on v1.5 rows only;
+   historical `flags.delta` is not rewritten.
+
+**Unmeasured:** how many live contracts the repair touches per scan. Legitimate saturation
+(deep ITM, or 0DTE late in the session) is preserved by design and remains ±1.000.
+
+**Tests:** `tests/test_delta_quote_repair.py`.
+
 ## engine-v1.4
 
 **Bug:** stale quotes with `spread_pct > 0.25` were ranked as tradeable (2026-09-14 rank 1 was 40.6%).
