@@ -86,9 +86,16 @@ def test_percent_unit_is_spot_over_100_times_the_dollar_unit():
     assert pct / usd == pytest.approx(SPOT / 100)
 
 
+def test_shares_unit_is_the_dollar_unit_divided_by_spot():
+    usd = _table([_c("CALL", 335.0, MONDAY, 2000)]).loc[0, "gex"]
+    shares = _table([_c("CALL", 335.0, MONDAY, 2000)], unit=gex.UNIT_SHARES).loc[0, "gex"]
+    assert shares == pytest.approx(_gamma(335.0, MONDAY) * 2000 * 100)
+    assert usd / shares == pytest.approx(SPOT)
+
+
 def test_unknown_unit_is_rejected():
     with pytest.raises(ValueError):
-        _table([_c("CALL", 335.0, MONDAY, 2000)], unit="shares")
+        _table([_c("CALL", 335.0, MONDAY, 2000)], unit="furlongs")
 
 
 def test_puts_are_negative_and_mirror_calls():
@@ -400,7 +407,7 @@ def test_page_strike_count_filter(seeded):
 def test_page_unit_toggle_rescales_by_spot_over_100(seeded):
     at = _run(seeded)
     usd = at.dataframe[0].value.loc[gex_page.NET_LABEL, MONDAY]
-    at.radio(key="gex_unit").set_value("Per 1% move").run()
+    at.radio(key="gex_unit").set_value("Dollars per 1%").run()
     assert not at.exception
     pct = at.dataframe[0].value.loc[gex_page.NET_LABEL, MONDAY]
     assert pct / usd == pytest.approx(SPOT / 100)
@@ -420,3 +427,15 @@ def test_page_caption_escapes_dollar_signs(seeded):
     cap = next(c.value for c in at.caption if "Snapshot" in c.value)
     assert "dollars of dealer hedging per \\$1 move" in cap
     assert cap.count("$") == cap.count("\\$")
+
+
+def test_page_shares_unit_relabels_the_net_row_and_caption(seeded):
+    at = _run(seeded)
+    usd = at.dataframe[0].value.loc[gex_page.NET_LABEL, MONDAY]
+    at.radio(key="gex_unit").set_value("Shares per $1").run()
+    assert not at.exception
+    shown = at.dataframe[0].value
+    assert shown.index[-1] == "NET sh"
+    assert usd / shown.loc["NET sh", MONDAY] == pytest.approx(SPOT)
+    cap = next(c.value for c in at.caption if "Snapshot" in c.value)
+    assert "shares of dealer hedging per \\$1 move" in cap

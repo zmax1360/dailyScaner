@@ -1,6 +1,7 @@
 """gex — net gamma exposure (GEX) per strike and expiry from open interest.
 
-    per $1 move:  GEX = gamma x open_interest x 100 x spot
+    shares:       GEX = gamma x open_interest x 100            (shares per $1 move)
+    per $1 move:  GEX = gamma x open_interest x 100 x spot     (dollars per $1 move)
     per 1% move:  GEX = gamma x open_interest x 100 x spot^2 x 0.01
 
 Calls count positive, puts negative. That sign is the standard dealer-positioning
@@ -35,6 +36,8 @@ MOVE_PCT = 0.01               # exposure is quoted per 1% move in spot
 
 UNIT_DOLLAR = "dollar"        # $ of delta hedging per $1 move in spot
 UNIT_PCT = "pct"              # $ of delta hedging per 1% move in spot
+UNIT_SHARES = "shares"        # shares of delta hedging per $1 move in spot
+UNITS = (UNIT_DOLLAR, UNIT_PCT, UNIT_SHARES)
 
 IV_VENDOR = "vendor"          # IV as reported by the data source
 IV_QUOTE = "quote"            # IV solved from the bid/ask mid (vendor IV as fallback)
@@ -93,7 +96,7 @@ def gex_table(
     and removed: penny quotes in the far wings solve to inflated IVs, and spreading
     those to unquoted strikes overstated wing gamma several-fold.)
     """
-    if unit not in (UNIT_DOLLAR, UNIT_PCT):
+    if unit not in UNITS:
         raise ValueError(f"unknown unit {unit!r}")
     if iv_source not in (IV_VENDOR, IV_QUOTE):
         raise ValueError(f"unknown iv_source {iv_source!r}")
@@ -103,7 +106,7 @@ def gex_table(
     r = float(SCORING.get("risk_free_rate", 0.045))
     min_iv = float(SCORING.get("min_iv_usable", 0.01))
     snap_day = as_of.astimezone(ET).date()
-    scale = s if unit == UNIT_DOLLAR else s * s * MOVE_PCT
+    scale = {UNIT_DOLLAR: s, UNIT_PCT: s * s * MOVE_PCT, UNIT_SHARES: 1.0}[unit]
 
     # pass 1: parse, and (quote mode) solve IV from each contract's own mid
     parsed = []

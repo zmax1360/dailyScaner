@@ -23,7 +23,12 @@ NET_LABEL = "NET $"
 
 EXP_CURRENT, EXP_WEEK, EXP_ALL, EXP_PICK = "Current", "Current week", "All", "Pick dates"
 STRIKE_CHOICES = ["8", "16", "32", "64", "All"]
-UNIT_LABELS = {"Per $1 move": gex.UNIT_DOLLAR, "Per 1% move": gex.UNIT_PCT}
+UNIT_LABELS = {"Dollars per $1": gex.UNIT_DOLLAR, "Shares per $1": gex.UNIT_SHARES,
+               "Dollars per 1%": gex.UNIT_PCT}
+UNIT_CAPTION = {gex.UNIT_DOLLAR: "dollars of dealer hedging per $1 move",
+                gex.UNIT_SHARES: "shares of dealer hedging per $1 move",
+                gex.UNIT_PCT: "dollars of dealer hedging per 1% move"}
+NET_LABELS = {gex.UNIT_DOLLAR: "NET $", gex.UNIT_SHARES: "NET sh", gex.UNIT_PCT: "NET $"}
 IV_LABELS = {"From quotes": gex.IV_QUOTE, "Vendor": gex.IV_VENDOR}
 
 
@@ -35,7 +40,8 @@ def _cell_css(v, vmax: float) -> str:
     return f"background-color: rgba({r},{g},{b},{alpha:.2f}); color: #fff;"
 
 
-def style_matrix(matrix: pd.DataFrame, wall_map: dict, *, spot_strike: float | None = None):
+def style_matrix(matrix: pd.DataFrame, wall_map: dict, *, spot_strike: float | None = None,
+                 net_label: str = NET_LABEL):
     """Colour by sign and size, mark each expiry's walls, append a NET row.
 
     Returns a Styler whose row labels are the strikes (the one nearest spot is marked).
@@ -44,7 +50,7 @@ def style_matrix(matrix: pd.DataFrame, wall_map: dict, *, spot_strike: float | N
     labels = [f"{k:g}  ◀ spot" if k == spot_strike else f"{k:g}" for k in matrix.index]
     shown = matrix.copy()
     shown.index = labels
-    shown.loc[NET_LABEL] = [
+    shown.loc[net_label] = [
         (wall_map.get(str(exp)) or {}).get("net", float("nan")) for exp in matrix.columns
     ]
     css = pd.DataFrame("", index=shown.index, columns=shown.columns)
@@ -57,7 +63,7 @@ def style_matrix(matrix: pd.DataFrame, wall_map: dict, *, spot_strike: float | N
                 css.loc[label, exp] = PUT_WALL_CSS
             else:
                 css.loc[label, exp] = _cell_css(matrix.loc[strike, exp], vmax)
-        css.loc[NET_LABEL, exp] = NET_CSS
+        css.loc[net_label, exp] = NET_CSS
     return shown.style.apply(lambda _: css, axis=None).format(gex.fmt_money, na_rep="")
 
 
@@ -100,7 +106,8 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
                             key="gex_iv_source",
                             help="'From quotes' solves IV from each contract's bid/ask mid; "
                                  "'Vendor' uses the IV the data source reports.")
-        table = gex.gex_table(latest, spot=spot, as_of=as_of, unit=UNIT_LABELS[unit_label],
+        unit = UNIT_LABELS[unit_label]
+        table = gex.gex_table(latest, spot=spot, as_of=as_of, unit=unit,
                               today=today, iv_source=IV_LABELS[iv_label])
         available = gex.available_expiries(table)
         mode = st.radio("Expirations", [EXP_CURRENT, EXP_WEEK, EXP_ALL, EXP_PICK], index=1,
@@ -140,7 +147,8 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
                    else "Net negative: dealer hedging tends to amplify moves.")
 
     # ── panel 2: the map ─────────────────────────────────────────────────────
-    styled = style_matrix(matrix, wall_map, spot_strike=gex.nearest_strike(matrix, spot))
+    styled = style_matrix(matrix, wall_map, spot_strike=gex.nearest_strike(matrix, spot),
+                          net_label=NET_LABELS[unit])
     st.dataframe(
         styled, use_container_width=True, key=f"gex_matrix_{ticker}",
         height=min(36 * (len(matrix) + 2) + 4, 1200),
@@ -152,7 +160,7 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
         f"{cov['used']} of {cov['contracts']} contracts used · "
         + (f"IV from quotes on {cov['iv_from_quote']} of {cov['used']} · "
            if cov["iv_from_quote"] else "")
-        + f"dollars of dealer hedging {unit_label.lower()}".replace("$", "\\$")
+        + UNIT_CAPTION[unit].replace("$", "\\$")
     )
 
     # ── panel 3: how to read it ──────────────────────────────────────────────
