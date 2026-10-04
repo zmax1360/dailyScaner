@@ -43,7 +43,7 @@ IV_VENDOR = "vendor"          # IV as reported by the data source
 IV_QUOTE = "quote"            # IV solved from the bid/ask mid (vendor IV as fallback)
 
 TABLE_COLS = ["side", "strike", "expiry", "dte", "open_interest", "iv", "iv_from_quote",
-              "gamma", "gex"]
+              "iv_from_pair", "gamma", "gex"]
 
 
 def _f(v: Any) -> float | None:
@@ -91,10 +91,11 @@ def gex_table(
     snapshot viewed on a later day does not show dead expiries).
 
     ``iv_source`` "quote" solves IV from each contract's bid/ask mid with the exact
-    time to expiry, and keeps the vendor IV when there is no usable two-sided quote
-    or no IV reproduces the mid. (Borrowing IV from neighbouring strikes was tried
-    and removed: penny quotes in the far wings solve to inflated IVs, and spreading
-    those to unquoted strikes overstated wing gamma several-fold.)
+    time to expiry. An in-the-money contract whose own quote gives no IV takes the IV
+    solved from the out-of-the-money contract at the same strike and expiry (flagged
+    ``iv_from_pair``). Otherwise the vendor IV is kept. IV is never borrowed from a
+    different strike: penny quotes in the far wings solve to inflated IVs, and spreading
+    those to neighbours overstated wing gamma several-fold.
     """
     if unit not in UNITS:
         raise ValueError(f"unknown unit {unit!r}")
@@ -130,12 +131,28 @@ def gex_table(
                        "oi": _f(rec.get("open_interest")), "vendor_iv": _f(rec.get("iv")),
                        "solved": solved})
 
+    # IV solved from the out-of-the-money contract at each strike. A call and a put at
+    # one strike share an implied volatility, and the OTM quote is the reliable one.
+    otm_iv: dict[tuple[str, float], float] = {}
+    for p in parsed:
+        is_otm = (p["side"] == "CALL") == (p["strike"] > s)
+        if is_otm and p["solved"] is not None:
+            otm_iv[(p["expiry"], p["strike"])] = p["solved"]
+
     rows = []
     for p in parsed:
         side, strike, expiry, t, oi = p["side"], p["strike"], p["expiry"], p["t"], p["oi"]
-        iv, from_quote = p["vendor_iv"], False
+        iv, from_quote, from_pair = p["vendor_iv"], False, False
         if p["solved"] is not None:
             iv, from_quote = p["solved"], True
+        elif iv_source == IV_QUOTE:
+            # In-the-money contract whose own quote gives no IV (wide or stale, mid under
+            # intrinsic): take the IV of its OTM pair at the same strike. Never the other
+            # way round, and never from a different strike.
+            is_itm = (side == "CALL") == (strike < s)
+            pair = otm_iv.get((expiry, strike))
+            if is_itm and pair is not None:
+                iv, from_quote, from_pair = pair, True, True
         gamma = None
         if iv is not None and iv >= min_iv:
             gamma = bs_gamma(s, strike, iv, t_years=t, r=r)
@@ -149,6 +166,7 @@ def gex_table(
             "open_interest": float("nan") if oi is None else oi,
             "iv": float("nan") if iv is None else iv,
             "iv_from_quote": from_quote,
+            "iv_from_pair": from_pair,
             "gamma": float("nan") if gamma is None else gamma,
             "gex": gex,
         })
@@ -160,7 +178,9 @@ def coverage(table: pd.DataFrame) -> dict[str, int]:
     n = int(len(table))
     used = int(table["gex"].notna().sum()) if n else 0
     from_quote = int(table["iv_from_quote"].sum()) if n else 0
-    return {"contracts": n, "used": used, "excluded": n - used, "iv_from_quote": from_quote}
+    from_pair = int(table["iv_from_pair"].sum()) if n else 0
+    return {"contracts": n, "used": used, "excluded": n - used,
+            "iv_from_quote": from_quote, "iv_from_pair": from_pair}
 
 
 def available_expiries(table: pd.DataFrame) -> list[str]:

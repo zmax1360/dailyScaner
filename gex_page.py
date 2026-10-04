@@ -208,8 +208,9 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
         f"Snapshot {as_of.astimezone(tz):%a %b %d %H:%M ET} · "
         f"{len(matrix.columns)} of {len(available)} expiries · {len(matrix)} strikes · "
         f"{cov['used']} of {cov['contracts']} contracts used · "
-        + (f"IV from quotes on {cov['iv_from_quote']} of {cov['used']} · "
-           if cov["iv_from_quote"] else "")
+        + (f"IV from quotes on {cov['iv_from_quote']} of {cov['used']}"
+           + (f" ({cov['iv_from_pair']} via the same-strike pair)" if cov["iv_from_pair"] else "")
+           + " · " if cov["iv_from_quote"] else "")
         + UNIT_CAPTION[unit].replace("$", "\\$")
     )
 

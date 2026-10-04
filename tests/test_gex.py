@@ -115,7 +115,8 @@ def test_gex_scales_linearly_with_open_interest():
 def test_missing_inputs_are_nan_never_zero(oi, iv):
     t = _table([_c("CALL", 335.0, MONDAY, oi, iv=iv)])
     assert len(t) == 1 and math.isnan(t.loc[0, "gex"])
-    assert gex.coverage(t) == {"contracts": 1, "used": 0, "excluded": 1, "iv_from_quote": 0}
+    assert gex.coverage(t) == {"contracts": 1, "used": 0, "excluded": 1,
+                               "iv_from_quote": 0, "iv_from_pair": 0}
 
 
 def test_zero_open_interest_is_a_real_zero():
@@ -201,6 +202,78 @@ def test_quote_mode_falls_back_to_vendor_without_a_usable_quote(bid, ask):
     t = _table([row], iv_source=gex.IV_QUOTE)
     assert t.loc[0, "iv"] == 0.25 and not t.loc[0, "iv_from_quote"]
     assert not math.isnan(t.loc[0, "gex"])
+
+
+# Four real rows from the 2026-10-04 17:32 ET snapshot (AAPL, spot 333.69, Oct 5 expiry).
+# Both calls are in the money with wide quotes whose mid is below intrinsic value.
+_REAL_AS_OF = datetime(2026, 10, 4, 17, 32, 43, tzinfo=ET)
+_REAL_SPOT = 333.69
+
+
+def _real(side, strike, oi, bid, ask, iv):
+    return {"side": side, "strike": strike, "expiry": MONDAY, "volume": 1000,
+            "open_interest": oi, "bid": bid, "ask": ask, "last": (bid + ask) / 2, "iv": iv}
+
+
+_REAL_ROWS = [
+    _real("CALL", 325.0, 1713, 7.75, 9.15, 0.308112387695312),
+    _real("PUT", 325.0, 2073, 0.10, 0.13, 0.224128852539062),
+    _real("CALL", 327.5, 2184, 5.70, 6.70, 0.25196060546875),
+    _real("PUT", 327.5, 1754, 0.22, 0.26, 0.204597797851562),
+]
+
+
+def _real_table(**kw):
+    return gex.gex_table(_latest(_REAL_ROWS), spot=_REAL_SPOT, as_of=_REAL_AS_OF, **kw)
+
+
+def test_itm_call_with_an_unusable_quote_takes_its_otm_puts_iv():
+    t = _real_table().set_index(["strike", "side"])
+    for strike in (325.0, 327.5):
+        call, put = t.loc[(strike, "CALL")], t.loc[(strike, "PUT")]
+        assert bool(put["iv_from_quote"]) and not put["iv_from_pair"]
+        assert bool(call["iv_from_pair"]) and call["iv"] == put["iv"]
+        assert call["gamma"] == pytest.approx(put["gamma"])        # same strike, same IV
+    assert gex.coverage(_real_table())["iv_from_pair"] == 2
+
+
+def test_same_strike_iv_reproduces_the_reference_value_at_327_5():
+    """With the pair's IV, $327.5 nets to +512K; the reference tool showed +508,970.
+    With the vendor IV on the call (the old fallback) it was +185K."""
+    m = gex.gex_matrix(_real_table(), spot=_REAL_SPOT, n_strikes=None)
+    assert m.loc[327.5, MONDAY] == pytest.approx(512_165, rel=0.01)
+    assert m.loc[327.5, MONDAY] == pytest.approx(508_970, rel=0.02)
+    assert m.loc[325.0, MONDAY] == pytest.approx(-230_279, rel=0.01)
+
+
+def test_net_at_a_paired_strike_is_gamma_times_the_open_interest_difference():
+    t = _real_table().set_index(["strike", "side"])
+    gamma = t.loc[(327.5, "PUT"), "gamma"]
+    m = gex.gex_matrix(_real_table(), spot=_REAL_SPOT, n_strikes=None)
+    assert m.loc[327.5, MONDAY] == pytest.approx(gamma * (2184 - 1754) * 100 * _REAL_SPOT)
+
+
+def test_pairing_is_off_in_vendor_mode():
+    t = _real_table(iv_source=gex.IV_VENDOR)
+    assert not t["iv_from_pair"].any() and not t["iv_from_quote"].any()
+    assert t.set_index(["strike", "side"]).loc[(325.0, "CALL"), "iv"] == pytest.approx(0.3081, abs=1e-4)
+
+
+def test_an_otm_contract_never_borrows_from_its_itm_pair():
+    """A far OTM call with no bid keeps the vendor IV even if the deep ITM put solves."""
+    call = _c("CALL", 345.0, MONDAY, 1000, iv=0.22)
+    call.update(bid=0.0, ask=0.03)                              # no usable quote
+    put = _quoted("PUT", 345.0, MONDAY, 1000, vendor_iv=0.10, true_iv=0.60)   # ITM, solves
+    t = _table([call, put], iv_source=gex.IV_QUOTE).set_index("side")
+    assert t.loc["CALL", "iv"] == 0.22 and not t.loc["CALL", "iv_from_pair"]
+
+
+def test_an_itm_contract_with_its_own_usable_quote_keeps_its_own_iv():
+    call = _quoted("CALL", 331.0, MONDAY, 1000, vendor_iv=0.10, true_iv=0.28)   # ITM, solves
+    put = _quoted("PUT", 331.0, MONDAY, 1000, vendor_iv=0.10, true_iv=0.34)
+    t = _table([call, put], iv_source=gex.IV_QUOTE).set_index("side")
+    assert t.loc["CALL", "iv"] == pytest.approx(0.28, abs=3e-3)
+    assert not t.loc["CALL", "iv_from_pair"]
 
 
 def test_unknown_iv_source_is_rejected():
