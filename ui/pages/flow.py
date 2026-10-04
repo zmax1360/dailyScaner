@@ -29,7 +29,6 @@ from distribution import prob_beyond_strike
 from news_service import get_news_sentiment
 from pov_leakage import URGENCY_TAG
 from pov_leakage import fetch_pov_leakage
-from pov_leakage import render_pov_leakage_chart
 from strategy_engine import attach_optimal_strategy
 from strategy_engine import recommend_strategy
 from strategy_engine import resolve_has_catalyst
@@ -41,11 +40,10 @@ from ui.market import _build_best_value_df
 from ui.market import _cached_vwap_state
 from ui.market import _market_is_closed
 from ui.market import _rsi_plain
-from ui.widgets import _choice_control
-from volume_analysis import CHART_TIMEFRAMES
 from volume_analysis import fetch_intraday_vwap_df
+from ui.components import price_chart
+from ui.context import ScanContext
 from volume_analysis import get_stock_volume_analysis
-from volume_analysis import render_vwap_chart
 from zero_dte_gex import STATE_CASCADE
 from zero_dte_gex import STATE_SQUEEZE
 from zero_dte_gex import calculate_0dte_gamma_flow
@@ -2204,24 +2202,11 @@ def render(cfg: dict):
     # ZONE 2 — Main Workspace Grid
     # ══════════════════════════════════════════════════════════════════════════
     with st.container():
-        chart_tf = _choice_control(
-            "Chart timeframe",
-            list(CHART_TIMEFRAMES),
-            default="5M",
-            key=f"chart_tf_{ticker}",
-            help="Candlestick + VWAP interval (10M/45M resampled from 5m; 4H from 1h)",
-        )
-        chart_df = _cached_vwap_chart_df(ticker, chart_tf)
-        if chart_df is not None and not chart_df.empty:
-            fig = render_vwap_chart(chart_df, ticker=ticker, timeframe=chart_tf)
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        else:
-            st.caption(f"{chart_tf} VWAP chart unavailable right now.")
+        # One chart: candles + EMA 9/21/50 + VWAP, volume with participation, stochastic.
+        price_chart.render(ScanContext(ticker=ticker, curr=curr, prev=prev, top_n=int(top_n)))
 
-        # Institutional POV leakage (always 5m participation math)
+        # Institutional POV leakage read-out (5-minute participation math)
         if pov_df is not None and not pov_df.empty:
-            pov_fig = render_pov_leakage_chart(pov_df, ticker=ticker)
-            st.plotly_chart(pov_fig, use_container_width=True, config={"displayModeBar": False})
             if pov_info.get("urgency"):
                 st.caption(
                     f"**{URGENCY_TAG}** · last bar POV "
@@ -2229,12 +2214,10 @@ def render(cfg: dict):
                 )
             elif pov_info.get("ratio") is not None:
                 st.caption(
-                    f"POV last bar: **{pov_info.get('ratio')}×** "
+                    f"POV last 5-minute bar: **{pov_info.get('ratio')}×** "
                     f"(leakage threshold {3.0:.1f}×) · "
                     f"{'above' if pov_info.get('above_vwap') else 'below/at'} VWAP"
                 )
-        else:
-            st.caption("POV leakage chart unavailable (no 5m volume).")
 
     # Same row: Volume Analysis | Multi-Timeframe | My Open Positions
     sub_c1, sub_c2, sub_c3 = st.columns(3)

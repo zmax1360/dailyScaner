@@ -36,6 +36,7 @@ MENU: list[tuple[str, list[Entry]]] = [
         Entry("pretrade", "Pre-Trade Check", "fact_check", "✅"),
     ]),
     ("Market", [
+        Entry("price_chart", "Chart", "show_chart", "📉"),
         Entry("flow_magnets", "Flow Magnets", "attractions", "🧲"),
         Entry("expiry_breakdown", "Expiration Breakdown", "calendar_month", "📅"),
         Entry("cost_distribution", "Cost Distribution", "stacked_bar_chart", "💰"),

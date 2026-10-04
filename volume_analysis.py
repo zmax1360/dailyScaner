@@ -218,6 +218,7 @@ def compute_intraday_vwap(df: pd.DataFrame, *, session_reset: bool = True) -> pd
 _CHART_TF_SPEC: dict[str, dict[str, Any]] = {
     "5M":  {"interval": "5m", "period": "5d",  "resample": None,    "last_session": True,  "vwap_reset": True},
     "10M": {"interval": "5m", "period": "5d",  "resample": "10min", "last_session": True,  "vwap_reset": True},
+    "15M": {"interval": "5m", "period": "5d",  "resample": "15min", "last_session": True,  "vwap_reset": True},
     "45M": {"interval": "5m", "period": "5d",  "resample": "45min", "last_session": True,  "vwap_reset": True},
     "1H":  {"interval": "1h", "period": "30d", "resample": None,    "last_session": False, "vwap_reset": True},
     "4H":  {"interval": "1h", "period": "60d", "resample": "4h",    "last_session": False, "vwap_reset": True},
@@ -251,8 +252,8 @@ def fetch_intraday_vwap_df(
     """
     Fetch OHLC for *ticker* at *timeframe* and attach a VWAP column.
 
-    Supported timeframes: 5M, 10M, 45M, 1H, 4H, 1D.
-    10M/45M are resampled from 5m; 4H from 1h.
+    Supported timeframes: 5M, 10M, 15M, 45M, 1H, 4H, 1D.
+    10M/15M/45M are resampled from 5m; 4H from 1h.
 
     Returns a DataFrame with Open/High/Low/Close/Volume/VWAP, or empty on failure.
     """
