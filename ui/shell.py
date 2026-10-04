@@ -36,6 +36,9 @@ MENU: list[tuple[str, list[Entry]]] = [
         Entry("pretrade", "Pre-Trade Check", "fact_check", "✅"),
     ]),
     ("Market", [
+        Entry("flow_magnets", "Flow Magnets", "attractions", "🧲"),
+        Entry("expiry_breakdown", "Expiration Breakdown", "calendar_month", "📅"),
+        Entry("cost_distribution", "Cost Distribution", "stacked_bar_chart", "💰"),
         Entry("gamma", "Gamma", "grid_on", "🧱"),
         Entry("volume", "Volume", "bar_chart", "📊"),
         Entry("news", "Market News", "newspaper", "📰"),
@@ -81,6 +84,7 @@ def go(st, page_id: str) -> None:
 
 MENU_CSS = """
 <style>
+section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] { gap: 0.15rem; }
 section[data-testid="stSidebar"] div.stButton > button {
     justify-content: flex-start; text-align: left; border: 0; border-radius: 6px;
     background: transparent; padding: 0.45rem 0.75rem; font-weight: 500;

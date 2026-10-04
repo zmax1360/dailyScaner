@@ -28,6 +28,10 @@ import ema_stack
 import gex_page
 import volume_page
 from ui import shell
+from ui.components import REGISTRY as COMPONENTS
+from ui.components import cost_distribution, expiry_breakdown, flow_magnets
+from ui.components.cost_distribution import cached_cost_distribution as _cached_cost_distribution
+from ui.context import ScanContext, load_scan_context
 import snapshot_store as ss
 from spread_gate import evaluate_spread_gate
 from dailyScaner import market_is_open, proximity_filter, MIN_OI_FOR_MAGNET
@@ -1108,85 +1112,6 @@ def _load_archive_chain(ticker: str = "AAPL") -> tuple[pd.DataFrame, dict | None
     return pd.DataFrame(rows), payload
 
 
-def _render_pc_term_chart(chart_pc: dict[str, float | None]) -> None:
-    """
-    Altair bar chart — P/C ratio per expiry.
-    - Bars blue when < 1 (call-heavy), red when ≥ 1 (put-heavy).
-    - Dashed reference line at y = 1.0.
-    - ⚠ text marker above any expiry whose P/C is None (data gap).
-    - Expiries with either side's volume = 0 are rendered as gap markers only.
-    Data comes exclusively from chart_pc (already aggregated from archive).
-    All ET-aware dates are preserved as-is from the archive expiry strings.
-    """
-    import altair as alt
-
-    valid = {exp: pc for exp, pc in chart_pc.items() if pc is not None}
-    gaps  = [exp for exp, pc in chart_pc.items() if pc is None]
-
-    layers = []
-
-    if valid:
-        bar_df = pd.DataFrame([
-            {"expiry": exp, "pc": pc, "side": "Put-heavy" if pc >= 1 else "Call-heavy"}
-            for exp, pc in sorted(valid.items())
-        ])
-        bars = (
-            alt.Chart(bar_df)
-            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-            .encode(
-                x=alt.X("expiry:O",
-                         sort=sorted(valid.keys()),
-                         axis=alt.Axis(labelAngle=-40, title=None)),
-                y=alt.Y("pc:Q",
-                         title="P/C ratio",
-                         scale=alt.Scale(domainMin=0)),
-                color=alt.Color(
-                    "side:N",
-                    scale=alt.Scale(
-                        domain=["Call-heavy", "Put-heavy"],
-                        range=["#1565c0", "#c62828"],
-                    ),
-                    legend=alt.Legend(title=None, orient="top-right"),
-                ),
-                tooltip=[
-                    alt.Tooltip("expiry:O", title="Expiry"),
-                    alt.Tooltip("pc:Q", format=".3f", title="P/C"),
-                    alt.Tooltip("side:N", title="Bias"),
-                ],
-            )
-        )
-        layers.append(bars)
-
-    # Dashed reference line at y = 1.0
-    rule = (
-        alt.Chart(pd.DataFrame({"y": [1.0]}))
-        .mark_rule(strokeDash=[6, 3], color="#888", strokeWidth=1.5)
-        .encode(y="y:Q")
-    )
-    layers.append(rule)
-
-    # ⚠ gap markers
-    if gaps:
-        gap_df = pd.DataFrame({"expiry": sorted(gaps), "label": ["⚠"] * len(gaps), "y": [0.05] * len(gaps)})
-        gap_marks = (
-            alt.Chart(gap_df)
-            .mark_text(fontSize=14, color="#ff6d00", dy=-6)
-            .encode(
-                x=alt.X("expiry:O", sort=sorted(chart_pc.keys())),
-                y=alt.Y("y:Q"),
-                text=alt.Text("label:N"),
-                tooltip=[alt.Tooltip("expiry:O", title="Data gap — zero volume on one side")],
-            )
-        )
-        layers.append(gap_marks)
-
-    if layers:
-        chart = alt.layer(*layers).properties(height=200)
-        st.altair_chart(chart, use_container_width=True)
-        gap_note = f"  ·  ⚠ = data gap: {', '.join(sorted(gaps))}" if gaps else ""
-        st.caption(f"< 1 call-heavy · > 1 put-heavy{gap_note}")
-
-
 def _rsi_plain(rsi: float | None) -> str:
     """Plain text RSI label (no HTML) for use in DataFrames."""
     if rsi is None:
@@ -1196,44 +1121,6 @@ def _rsi_plain(rsi: float | None) -> str:
     if rsi >= 45:  return f"NEUTRAL ({rsi:.1f})"
     if rsi >= 30:  return f"BEARISH ({rsi:.1f})"
     return f"OVERSOLD ({rsi:.1f})"
-
-
-def _voi_style(val: str) -> str:
-    """Pandas Styler cell function — heat-gradient background for VOL/OI column."""
-    try:
-        v = float(str(val).replace("x", "").replace("🔥", "").strip())
-    except (ValueError, AttributeError):
-        return ""
-    if v >= 100: return "background-color:#7f0000;color:#fff;font-weight:bold"
-    if v >= 50:  return "background-color:#b71c1c;color:#fff;font-weight:bold"
-    if v >= 20:  return "background-color:#d50000;color:#fff;font-weight:bold"
-    if v >= 10:  return "background-color:#e65100;color:#fff;font-weight:bold"
-    if v >= 5:   return "background-color:#ff6d00;color:#fff;font-weight:bold"
-    if v >= 2:   return "background-color:#ffa726;color:#000;font-weight:bold"
-    return ""
-
-
-def _contracts_table(contracts: list, n: int = 5) -> pd.DataFrame | None:
-    """Build a styled DataFrame from a top_calls / top_puts list."""
-    rows = []
-    for c in contracts[:n]:
-        v   = int(c.get("volume") or 0)
-        oi  = max(int(c.get("openInterest") or 0), 1)
-        voi = v / oi
-        rows.append({
-            "EXPIRY":  c.get("expiry", ""),
-            "STRIKE":  f"${float(c.get('strike', 0)):.1f}",
-            "PRICE":   f"${float(c.get('lastPrice') or 0):.2f}",
-            "VOLUME":  f"{v:,}",
-            "OI":      f"{oi:,}",
-            "VOL/OI":  f"{voi:.2f}x 🔥" if voi >= 2 else f"{voi:.2f}x",
-            "_voi":    voi,
-        })
-    if not rows:
-        return None
-    df = pd.DataFrame(rows)
-    styled = df.drop(columns=["_voi"]).style.map(_voi_style, subset=["VOL/OI"])
-    return styled
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1397,12 +1284,6 @@ def _cached_vwap_chart_df(ticker: str, timeframe: str = "5M") -> pd.DataFrame:
 def _cached_pov_leakage(ticker: str) -> tuple[pd.DataFrame, dict]:
     """Cached 5m POV participation metrics + urgency flag (1 min TTL)."""
     return fetch_pov_leakage(ticker, last_session_only=True)
-
-
-@st.cache_data(ttl=3600)
-def _cached_cost_distribution(ticker: str, spot: float | None = None) -> dict:
-    """Cached 6-month cost distribution / overhead supply profile (1 hr TTL)."""
-    return calculate_cost_distribution(ticker, days=180, spot=spot)
 
 
 def _fmt_compact_shares(n: float | int) -> str:
@@ -3167,144 +3048,6 @@ def _render_add_position_form(ticker: str) -> None:
         st.rerun()
 
 
-def _render_cost_distribution_panel(
-    ticker: str,
-    spot: float,
-    cost_info: dict | None = None,
-) -> None:
-    """Zone 5 — Macro Cost Distribution & Overhead Supply metrics + chart."""
-    st.markdown("### 📊 Macro Cost Distribution & Overhead Supply")
-    st.caption(
-        "6-month daily volume profile by Typical Price (H+L+C)/3 · "
-        "teal = cost below spot (in profit) · orange = overhead supply"
-    )
-
-    info = cost_info or _cached_cost_distribution(ticker, spot if spot > 0 else None)
-    poc = info.get("Average_Cost_POC")
-    prof = info.get("Profited_Shares_Pct")
-    r90 = info.get("Cost_Range_90") or (None, None)
-    r70 = info.get("Cost_Range_70") or (None, None)
-    prices = info.get("price_bins") or []
-    vols = info.get("volume_bins") or []
-
-    if not prices or poc is None:
-        st.info("Cost distribution unavailable — daily history fetch failed.")
-        return
-
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("Average Cost (POC)", f"${float(poc):.2f}")
-    with m2:
-        delta = None
-        if prof is not None and float(prof) >= 95.0:
-            delta = "near zero overhead"
-        st.metric(
-            "Profited Shares %",
-            f"{float(prof):.1f}%" if prof is not None else "—",
-            delta=delta,
-        )
-    with m3:
-        if r90[0] is not None and r90[1] is not None:
-            st.metric(
-                "90% Cost Range",
-                f"${float(r90[0]):.2f} – ${float(r90[1]):.2f}",
-            )
-        else:
-            st.metric("90% Cost Range", "—")
-
-    if r70[0] is not None and r70[1] is not None:
-        st.caption(
-            f"70% Cost Range: **${float(r70[0]):.2f} – ${float(r70[1]):.2f}** · "
-            f"{info.get('days', '—')} sessions · "
-            f"total vol {int(info.get('total_volume') or 0):,}"
-        )
-
-    spot_px = float(info.get("spot") or spot or 0)
-    fig = render_cost_distribution_chart(
-        prices,
-        vols,
-        spot_price=spot_px,
-        avg_cost=float(poc),
-        range_70=r70 if r70[0] is not None else None,
-        range_90=r90 if r90[0] is not None else None,
-        ticker=ticker,
-    )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-
-def _build_expiry_table(
-    vol: dict, prev_vol: dict | None, overall_pc: float
-) -> tuple[list[dict], dict[str, float]]:
-    """
-    Group top_calls + top_puts by expiry, compute P/C and Δ vs previous run.
-    Returns (rows_for_table, {expiry: pc_ratio}) for the bar chart.
-    """
-    curr_exp: dict[str, dict] = {}
-    for side_key, vol_key in [("call_vol", "top_calls"), ("put_vol", "top_puts")]:
-        for c in (vol.get(vol_key) or []):
-            exp = c.get("expiry", "?")
-            dte = int(c.get("dte", 0))
-            v   = int(c.get("volume") or 0)
-            if exp not in curr_exp:
-                curr_exp[exp] = {"dte": dte, "call_vol": 0, "put_vol": 0}
-            curr_exp[exp][side_key] += v
-
-    prev_exp: dict[str, dict] = {}
-    if prev_vol:
-        for side_key, vol_key in [("call_vol", "top_calls"), ("put_vol", "top_puts")]:
-            for c in (prev_vol.get(vol_key) or []):
-                exp = c.get("expiry", "?")
-                v   = int(c.get("volume") or 0)
-                prev_exp.setdefault(exp, {"call_vol": 0, "put_vol": 0})[side_key] += v
-
-    rows, chart_pc = [], {}
-    for exp in sorted(curr_exp):
-        d  = curr_exp[exp]
-        cv, pv  = d["call_vol"], d["put_vol"]
-        dte     = d["dte"]
-        data_gap = (cv == 0 or pv == 0)
-        pc       = (pv / cv) if not data_gap else None
-        chart_pc[exp] = pc   # None means data gap — caller must handle
-
-        if pc is None:
-            bias = ""
-        elif pc < 0.7:   bias = "▲ BULLISH"
-        elif pc < 0.9: bias = "▲ MILD BULLISH"
-        elif pc < 1.1: bias = "— NEUTRAL"
-        elif pc < 1.5: bias = "▼ MILD BEARISH"
-        else:          bias = "▼ BEARISH"
-
-        notable = (
-            abs(pc - overall_pc) > 0.25
-            if (pc is not None and overall_pc > 0)
-            else False
-        )
-
-        pd_   = prev_exp.get(exp, {})
-        cv_d  = cv - pd_.get("call_vol", 0) if prev_vol else None
-        pv_d  = pv - pd_.get("put_vol",  0) if prev_vol else None
-
-        def _ds(v):
-            if v is None: return "·0"
-            if v > 0: return f"▲+{v:,}"
-            if v < 0: return f"▼{v:,}"
-            return "·0"
-
-        rows.append({
-            "EXPIRY":   exp,
-            "DTE":      f"{dte}d",
-            "CALL VOL": f"{cv:,}",
-            "PUT VOL":  f"{pv:,}",
-            "P/C":      f"{pc:.2f}" if pc is not None else "n/a",
-            "BIAS":     bias,
-            "NOTABLE":  "⚠ data gap" if data_gap else ("◄ notable" if notable else ""),
-            "CALL Δ":   _ds(cv_d),
-            "PUT Δ":    _ds(pv_d),
-        })
-
-    return rows, chart_pc
-
-
 def _render_0dte_gamma_kpi(odte_info: dict | None) -> None:
     """Hero KPI card: 0DTE Gamma Flow state + Call/Put dominance bar."""
     info = odte_info or {}
@@ -3689,57 +3432,15 @@ def _render_tab1(cfg: dict):
         "📊 Cost Distribution",
     ])
 
+    _ctx = ScanContext(ticker=ticker, curr=curr, prev=prev, top_n=int(top_n))
     with tab_magnets:
-        st.markdown(f"### The Magnets — Top {top_n} Calls / Top {top_n} Puts")
-        st.caption("🔥 Vol/OI heatmap — values ≥ 2.0x glow hot (unusual vs open interest)")
-        call_col, put_col = st.columns(2, gap="small")
-        for col, key, label in [
-            (call_col, "top_calls", f"🟢 Top {top_n} CALLS"),
-            (put_col,  "top_puts",  f"🔴 Top {top_n} PUTS"),
-        ]:
-            contracts = vol.get(key) or []
-            with col:
-                st.markdown(f"**{label}**")
-                styled = _contracts_table(contracts, n=top_n)
-                if styled is not None:
-                    st.dataframe(styled, use_container_width=True, hide_index=True)
-                else:
-                    st.caption("No data")
+        flow_magnets.render(_ctx)
 
     with tab_expiry:
-        st.markdown("### Volume by Expiry — P/C term structure")
-        st.caption("Institutional-style skew across the expiry curve")
-        exp_rows, chart_pc = _build_expiry_table(vol, prev_vol, pc_ratio)
-        if exp_rows:
-            exp_df = pd.DataFrame(exp_rows)
-
-            def _bias_style(val: str) -> str:
-                if "BULL" in str(val):
-                    return "color:#00c853;font-weight:bold"
-                if "BEAR" in str(val):
-                    return "color:#d50000;font-weight:bold"
-                return "color:#9e9e9e"
-
-            def _delta_style(val: str) -> str:
-                s = str(val)
-                if s.startswith("▲"):
-                    return "color:#00c853"
-                if s.startswith("▼"):
-                    return "color:#d50000"
-                return "color:#666"
-
-            styled_exp = (
-                exp_df.style
-                .map(_bias_style, subset=["BIAS"])
-                .map(_delta_style, subset=["CALL Δ", "PUT Δ"])
-            )
-            st.dataframe(styled_exp, use_container_width=True, hide_index=True)
-            _render_pc_term_chart(chart_pc)
-        else:
-            st.caption("No expiry data available")
+        expiry_breakdown.render(_ctx)
 
     with tab_cost:
-        _render_cost_distribution_panel(ticker, spot, cost_info)
+        cost_distribution.render(_ctx, cost_info)
 
     # ══ Collapsible detail sections ═══════════════════════════════════════════
     if prev:
@@ -5881,6 +5582,13 @@ def main():
         _render_pre_trade(cfg, cand)
     elif page == "settings":
         _render_settings(cfg)
+    elif page in COMPONENTS:
+        ctx = load_scan_context(cfg["ticker"], top_n=cfg["top_n"])
+        if ctx is None:
+            st.info(f"No archive data found for {cfg['ticker']}. "
+                    "Run the scanner first or pick a different ticker.")
+        else:
+            COMPONENTS[page].render(ctx)
 
 
 if __name__ == "__main__" or True:

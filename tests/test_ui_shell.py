@@ -197,6 +197,12 @@ def test_main_routes_every_menu_entry():
         c.value for n in ast.walk(main) if isinstance(n, ast.Compare)
         for c in n.comparators if isinstance(c, ast.Constant) and isinstance(c.value, str)
     }
+    # Component pages are routed through the registry rather than one branch each.
+    from ui.components import REGISTRY
+
+    src = ast.get_source_segment((ROOT / "app.py").read_text(), main)
+    assert "page in COMPONENTS" in src and "COMPONENTS[page].render(" in src
+    routed |= set(REGISTRY)
     assert set(shell.page_ids()) <= routed, set(shell.page_ids()) - routed
 
 
