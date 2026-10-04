@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import os
 import urllib.request
 
@@ -76,6 +76,7 @@ def _format_scan_message(
     top_n: int,
     include: dict,
     expiry_drill: list[str] | None = None,
+    gamma: dict | None = None,
 ) -> str:
     """
     Build a Telegram HTML message from an archive payload.
@@ -308,6 +309,11 @@ def _format_scan_message(
                 )
             L.append("")
 
+    # ── Gamma exposure ────────────────────────────────────────────────────────
+    if include.get("gamma"):
+        L.extend(format_gamma_lines(gamma))
+        L.append("")
+
     # ── Expiry drill-down ─────────────────────────────────────────────────────
     if expiry_drill:
         for exp in expiry_drill:
@@ -333,3 +339,53 @@ def _format_scan_message(
             L.extend(rows)
 
     return "\n".join(L)
+
+
+def format_gamma_lines(summary: dict | None) -> list[str]:
+    """Telegram (HTML) lines for the gamma read. ``summary`` comes from ``gex.summary``."""
+    import gex
+
+    if not summary:
+        return ["🧱 <b>GAMMA</b> — no chain snapshot with usable open interest yet"]
+    d = date.fromisoformat(summary["expiry"])
+    net = float(summary["net"])
+    regime = ("positive: dealer hedging tends to dampen moves" if net >= 0
+              else "negative: dealer hedging tends to amplify moves")
+    lines = [
+        f"🧱 <b>GAMMA · {d:%b} {d.day}</b>",
+        f"Net <b>{'+' if net >= 0 else ''}{gex.fmt_money(net)}</b> — {regime}",
+    ]
+    walls = []
+    if summary.get("call_wall") is not None:
+        walls.append(f"Call wall <b>${summary['call_wall']:g}</b> "
+                     f"({gex.fmt_money(summary['call_wall_gex'])})")
+    if summary.get("put_wall") is not None:
+        walls.append(f"Put wall <b>${summary['put_wall']:g}</b> "
+                     f"({gex.fmt_money(summary['put_wall_gex'])})")
+    if walls:
+        lines.append(" · ".join(walls))
+    if summary.get("top"):
+        lines.append("Largest: " + " · ".join(
+            f"${k:g} {gex.fmt_money(v)}" for k, v in summary["top"]))
+    if summary.get("first_negative_below_spot") is not None:
+        lines.append(f"First negative strike below spot: "
+                     f"<b>${summary['first_negative_below_spot']:g}</b>")
+    as_of = summary["as_of"].astimezone(ET)
+    lines.append(f"<i>dollars of hedging per $1 move · snapshot {as_of:%a %b %d %H:%M ET}</i>")
+    return lines
+
+
+def gamma_summary_for(ticker: str, spot) -> dict | None:
+    """Gamma read from the latest full-chain snapshot of ``ticker``; None if unavailable."""
+    import gex
+    import volume_history as vh
+
+    try:
+        spot_f = float(spot)
+    except (TypeError, ValueError):
+        return None
+    latest = vh.latest_scan(str(ticker or "").upper())
+    if latest.empty or spot_f <= 0:
+        return None
+    as_of = datetime.fromisoformat(str(latest["ts_et"].iloc[0]))
+    return gex.summary(latest, spot=spot_f, as_of=as_of, today=datetime.now(ET).date())

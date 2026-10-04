@@ -225,6 +225,40 @@ def walls(matrix: pd.DataFrame) -> dict[str, dict[str, float | None]]:
     return out
 
 
+def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
+            today: date | None = None, n_strikes: int = 16, top: int = 3) -> dict | None:
+    """Headline gamma read for the nearest live expiry, in dollars per $1 move.
+
+    Net, the call and put walls, the largest positive strikes, and the highest
+    negative strike below spot. None when nothing usable is in the snapshot.
+    """
+    table = gex_table(latest, spot=spot, as_of=as_of, today=today)
+    expiries = available_expiries(table)
+    if not expiries:
+        return None
+    exp = expiries[0]
+    matrix = gex_matrix(table, spot=float(spot), expiries=[exp], n_strikes=n_strikes)
+    if matrix.empty:
+        return None
+    col = matrix[exp].dropna()
+    w = walls(matrix)[exp]
+    below = col[(col.index < float(spot)) & (col < 0)]
+    return {
+        "expiry": exp,
+        "spot": float(spot),
+        "net": w["net"],
+        "call_wall": w["call_wall"],
+        "call_wall_gex": None if w["call_wall"] is None else float(col[w["call_wall"]]),
+        "put_wall": w["put_wall"],
+        "put_wall_gex": None if w["put_wall"] is None else float(col[w["put_wall"]]),
+        "top": [(float(k), float(v))
+                for k, v in col[col > 0].sort_values(ascending=False).head(top).items()],
+        "first_negative_below_spot": None if below.empty else float(below.index.max()),
+        "as_of": as_of,
+        "coverage": coverage(table),
+    }
+
+
 def nearest_strike(matrix: pd.DataFrame, spot: float) -> float | None:
     if matrix is None or matrix.empty:
         return None

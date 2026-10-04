@@ -271,6 +271,30 @@ def test_walls_and_net_per_expiry():
     assert w[LATER]["put_wall"] is None                              # no puts there
 
 
+def test_summary_reads_the_nearest_expiry():
+    s = gex.summary(_latest(_chain()), spot=SPOT, as_of=AS_OF)
+    m = gex.gex_matrix(gex.gex_table(_latest(_chain()), spot=SPOT, as_of=AS_OF),
+                       spot=SPOT, expiries=[MONDAY])
+    assert s["expiry"] == MONDAY and s["spot"] == SPOT
+    assert s["net"] == pytest.approx(m[MONDAY].sum())
+    assert (s["call_wall"], s["put_wall"]) == (335.0, 327.5)
+    assert s["call_wall_gex"] == pytest.approx(m.loc[335.0, MONDAY])
+    assert s["put_wall_gex"] == pytest.approx(m.loc[327.5, MONDAY]) and s["put_wall_gex"] < 0
+    assert [k for k, _ in s["top"]] == [335.0, 332.5]          # largest positive first
+    assert s["first_negative_below_spot"] == 327.5
+    assert s["coverage"]["used"] > 0
+
+
+def test_summary_is_none_without_usable_data_and_skips_dead_expiries():
+    assert gex.summary(pd.DataFrame(), spot=SPOT, as_of=AS_OF) is None
+    assert gex.summary(_latest([_c("CALL", 336.0, MONDAY, None)]), spot=SPOT, as_of=AS_OF) is None
+    rows = [_c("CALL", 335.0, TODAY, 9000), _c("CALL", 335.0, MONDAY, 2000)]
+    assert gex.summary(_latest(rows), spot=SPOT, as_of=AS_OF)["expiry"] == TODAY
+    later = gex.summary(_latest(rows), spot=SPOT, as_of=AS_OF, today=date(2026, 10, 3))
+    assert later["expiry"] == MONDAY
+    assert later["put_wall"] is None and later["first_negative_below_spot"] is None
+
+
 def test_nearest_strike_and_money_format():
     m = gex.gex_matrix(_table(_chain()), spot=SPOT)
     assert gex.nearest_strike(m, SPOT) == 332.5

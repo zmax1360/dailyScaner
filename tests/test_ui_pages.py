@@ -197,6 +197,7 @@ def test_settings_page_shows_scan_filters_and_telegram(tmp_path, monkeypatch):
     assert any("Run Scan for AAPL" in b.label for b in at.button)
     assert {n.key for n in at.number_input} == {"w_min_dte", "w_top_n"}
     assert any("Not configured" in w.value for w in at.warning)
+    assert any("Gamma exposure" in c.label for c in at.checkbox)
     send = next(b for b in at.button if "Send to Telegram" in b.label)
     assert send.disabled                            # nothing to send, nowhere to send it
 
@@ -225,6 +226,87 @@ def test_scan_message_is_built_from_an_archive_payload():
     bare = tg._format_scan_message(payload=payload, prev_payload=None, ticker="AAPL",
                                    top_n=5, include={k: False for k in include})
     assert len(bare) < len(msg)
+
+
+_GAMMA = {"expiry": "2026-10-05", "spot": 333.69, "net": 34_210_000.0,
+          "call_wall": 330.0, "call_wall_gex": 15_250_000.0,
+          "put_wall": 320.0, "put_wall_gex": -384_388.0,
+          "top": [(330.0, 15_250_000.0), (335.0, 6_910_000.0), (332.5, 5_460_000.0)],
+          "first_negative_below_spot": 325.0}
+
+
+def _gamma_summary():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return {**_GAMMA, "as_of": datetime(2026, 10, 4, 16, 18, tzinfo=ZoneInfo("America/New_York"))}
+
+
+def test_gamma_lines_for_telegram():
+    import ui.telegram_push as tg
+
+    assert tg.format_gamma_lines(_gamma_summary()) == [
+        "🧱 <b>GAMMA · Oct 5</b>",
+        "Net <b>+34.21M</b> — positive: dealer hedging tends to dampen moves",
+        "Call wall <b>$330</b> (15.25M) · Put wall <b>$320</b> (-384,388)",
+        "Largest: $330 15.25M · $335 6.91M · $332.5 5.46M",
+        "First negative strike below spot: <b>$325</b>",
+        "<i>dollars of hedging per $1 move · snapshot Sun Oct 04 16:18 ET</i>",
+    ]
+
+
+def test_gamma_lines_say_so_when_gamma_is_negative_or_missing():
+    import ui.telegram_push as tg
+
+    neg = {**_gamma_summary(), "net": -2_500_000.0, "call_wall": None, "call_wall_gex": None,
+           "first_negative_below_spot": None}
+    lines = tg.format_gamma_lines(neg)
+    assert lines[1] == "Net <b>-2.50M</b> — negative: dealer hedging tends to amplify moves"
+    assert lines[2] == "Put wall <b>$320</b> (-384,388)"
+    assert not any("First negative" in line for line in lines)
+    assert tg.format_gamma_lines(None) == [
+        "🧱 <b>GAMMA</b> — no chain snapshot with usable open interest yet"]
+
+
+def test_scan_message_includes_gamma_only_when_asked():
+    import ui.telegram_push as tg
+
+    payload = json.loads((GOLDEN / CURR).read_text())
+    off = {k: False for k in ("session", "mtf", "magnets", "volume_expiry", "orb", "deltas",
+                              "best_value")}
+    base = tg._format_scan_message(payload=payload, prev_payload=None, ticker="AAPL",
+                                   top_n=5, include=off, gamma=_gamma_summary())
+    assert "GAMMA" not in base
+    with_gamma = tg._format_scan_message(payload=payload, prev_payload=None, ticker="AAPL",
+                                         top_n=5, include={**off, "gamma": True},
+                                         gamma=_gamma_summary())
+    assert "🧱 <b>GAMMA · Oct 5</b>" in with_gamma and "Call wall <b>$330</b>" in with_gamma
+    assert len(with_gamma) < 4096                       # Telegram's message limit
+
+
+def test_gamma_summary_for_reads_the_latest_snapshot(tmp_path, monkeypatch):
+    import pandas as pd
+
+    import ui.telegram_push as tg
+    import volume_history as vh
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    db = str(tmp_path / "vh.db")
+    monkeypatch.setattr(vh, "DB_PATH", db)
+    assert tg.gamma_summary_for("AAPL", 333.0) is None          # no snapshot yet
+    cols = ["strike", "lastPrice", "volume", "openInterest", "impliedVolatility", "bid", "ask",
+            "expiry"]
+    far = "2099-01-16"                                          # never expires under the test
+    calls = pd.DataFrame([dict(zip(cols, (335.0, 9.0, 5000, 9000, 0.30, 8.9, 9.1, far)))])
+    puts = pd.DataFrame([dict(zip(cols, (325.0, 7.0, 3000, 6000, 0.33, 6.9, 7.1, far)))])
+    vh.record_scan(calls, puts, ticker="AAPL", scan_id="AAPL_20261002_100000",
+                   ts=datetime(2026, 10, 2, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+                   db_path=db)
+    s = tg.gamma_summary_for("aapl", "333.0")
+    assert s["expiry"] == far and s["call_wall"] == 335.0 and s["put_wall"] == 325.0
+    assert tg.gamma_summary_for("AAPL", None) is None
+    assert tg.gamma_summary_for("AAPL", 0) is None
 
 
 def test_archive_lookups(tmp_path, monkeypatch):

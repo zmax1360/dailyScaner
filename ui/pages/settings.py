@@ -14,6 +14,7 @@ from ui.services import _scan_archive_metadata
 from ui.telegram_push import _format_scan_message
 from ui.telegram_push import _load_telegram_config
 from ui.telegram_push import _send_telegram
+from ui.telegram_push import gamma_summary_for
 from ui.widgets import _choice_control
 import streamlit as st
 from ui.common import ET
@@ -109,6 +110,7 @@ def render(cfg: dict) -> None:
         inc_orb        = st.checkbox("Opening Range Breakout",               value=True,  key="tg_orb")
         inc_deltas     = st.checkbox("CALL Δ / PUT Δ vs previous run",       value=True,  key="tg_deltas")
         inc_best_value = st.checkbox("⭐ Best Value Option",                  value=True,  key="tg_bestval")
+        inc_gamma      = st.checkbox("🧱 Gamma exposure (net, walls)",        value=True,  key="tg_gamma")
 
         # ── Expiry drill-down selector ────────────────────────────────
         tg_expiries: list[str] = []
@@ -152,8 +154,11 @@ def render(cfg: dict) -> None:
                     "orb":           inc_orb,
                     "deltas":        inc_deltas,
                     "best_value":    inc_best_value,
+                    "gamma":         inc_gamma,
                 },
                 expiry_drill=selected_expiries or None,
+                gamma=(gamma_summary_for(tg_ticker, tg_payload.get("spot"))
+                       if inc_gamma else None),
             )
             ok, err = _send_telegram(tg_token, tg_chat, msg)
             if ok:
