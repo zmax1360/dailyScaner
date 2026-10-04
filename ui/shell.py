@@ -32,6 +32,7 @@ class Entry:
 MENU: list[tuple[str, list[Entry]]] = [
     ("Trade", [
         Entry("flow", "Options Flow", "candlestick_chart", "📈"),
+        Entry("best_value", "Best Value", "star", "⭐"),
         Entry("spread_gate", "Spread Gate", "science", "🔬"),
         Entry("pretrade", "Pre-Trade Check", "fact_check", "✅"),
     ]),

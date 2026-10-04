@@ -2014,8 +2014,26 @@ def _usd(v) -> str:
     return f"\\${float(v):.2f}"
 
 
-def render(cfg: dict):
-    """Options Flow — Magnets heatmap + Volume-by-Expiry term structure."""
+SECTIONS = ("header", "chart", "context", "positions", "news", "best_value", "details")
+# Options Flow shows the market picture. The chart and Best Value have their own pages.
+OVERVIEW = frozenset({"header", "context", "positions", "news", "details"})
+
+
+def render_best_value(cfg: dict) -> None:
+    """Best Value page: the ranked picks only."""
+    render(cfg, sections=frozenset({"best_value"}))
+
+
+def render(cfg: dict, sections: frozenset[str] | None = None):
+    """Options Flow — market picture for the selected ticker.
+
+    ``sections`` picks which parts are drawn (see SECTIONS); the default is OVERVIEW.
+    Every section reads the same scan context, loaded once at the top.
+    """
+    sections = OVERVIEW if sections is None else frozenset(sections)
+    unknown = sections - set(SECTIONS)
+    if unknown:
+        raise ValueError(f"unknown sections: {sorted(unknown)}")
 
     ticker = cfg.get("ticker", "AAPL")
     files  = sorted(glob.glob(f"archive/{ticker}_*.json"), reverse=True)
@@ -2098,277 +2116,285 @@ def render(cfg: dict):
         ts_et = datetime.fromisoformat(ts_str).astimezone(ET)
         st.caption(f"Last run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ZONE 1 — System Header & Macro KPIs
-    # ══════════════════════════════════════════════════════════════════════════
-    dir_color   = "#00c853" if "BULL" in direction else "#d50000" if "BEAR" in direction else "#9e9e9e"
-    dir_icon    = "▲" if "BULL" in direction else "▼" if "BEAR" in direction else "─"
-    hist_suffix = " (historical)" if _market_is_closed() else ""
-    ms_label    = (market_state_info or {}).get("market_state") or "—"
+    if "header" in sections:
+        # ══════════════════════════════════════════════════════════════════════════
+        # ZONE 1 — System Header & Macro KPIs
+        # ══════════════════════════════════════════════════════════════════════════
+        dir_color   = "#00c853" if "BULL" in direction else "#d50000" if "BEAR" in direction else "#9e9e9e"
+        dir_icon    = "▲" if "BULL" in direction else "▼" if "BEAR" in direction else "─"
+        hist_suffix = " (historical)" if _market_is_closed() else ""
+        ms_label    = (market_state_info or {}).get("market_state") or "—"
 
-    banner_meta = [
-        f'<span style="color:#aaa">{ticker} · {spot_label} '
-        f'<b style="color:#eee">${spot:.2f}</b></span>',
-        f'<span style="color:#00c853">Calls {call_vol:,}</span>',
-        f'<span style="color:#d50000">Puts {put_vol:,}</span>',
-        f'<span style="color:#aaa">P/C {pc_ratio:.2f} ({pc_bias})</span>',
-        f'<span style="color:#90caf9">Macro {ms_label}</span>',
-    ]
-    if open_today is not None:
-        banner_meta.insert(1, f'<span style="color:#aaa">Open ${open_today:.2f}</span>')
-    if day_high is not None and day_low is not None:
+        banner_meta = [
+            f'<span style="color:#aaa">{ticker} · {spot_label} '
+            f'<b style="color:#eee">${spot:.2f}</b></span>',
+            f'<span style="color:#00c853">Calls {call_vol:,}</span>',
+            f'<span style="color:#d50000">Puts {put_vol:,}</span>',
+            f'<span style="color:#aaa">P/C {pc_ratio:.2f} ({pc_bias})</span>',
+            f'<span style="color:#90caf9">Macro {ms_label}</span>',
+        ]
+        if open_today is not None:
+            banner_meta.insert(1, f'<span style="color:#aaa">Open ${open_today:.2f}</span>')
+        if day_high is not None and day_low is not None:
+            banner_meta.append(
+                f'<span style="color:#888">H ${day_high:.2f} · L ${day_low:.2f}</span>'
+            )
+        if em_range.get("Lower_1SD") is not None and em_range.get("Upper_1SD") is not None:
+            banner_meta.append(
+                f'<span style="color:#ce93d8;font-weight:600">'
+                f'1SD Expected Range: '
+                f'${float(em_range["Lower_1SD"]):.2f} – '
+                f'${float(em_range["Upper_1SD"]):.2f}</span>'
+            )
         banner_meta.append(
-            f'<span style="color:#888">H ${day_high:.2f} · L ${day_low:.2f}</span>'
-        )
-    if em_range.get("Lower_1SD") is not None and em_range.get("Upper_1SD") is not None:
-        banner_meta.append(
-            f'<span style="color:#ce93d8;font-weight:600">'
-            f'1SD Expected Range: '
-            f'${float(em_range["Lower_1SD"]):.2f} – '
-            f'${float(em_range["Upper_1SD"]):.2f}</span>'
-        )
-    banner_meta.append(
-        f'<span style="color:#80cbc4">{optimal_strat}</span>'
-    )
-
-    st.markdown(
-        f'<div style="background:#1a1a2e;padding:0.85rem 1.4rem;border-radius:8px;'
-        f'margin-bottom:0.75rem;border-left:4px solid {dir_color}">'
-        f'<div style="font-size:0.7rem;letter-spacing:0.08em;color:#888;text-transform:uppercase">'
-        f'Scanner direction · multi-timeframe score (the trend rule above decides calls or puts)</div>'
-        f'<div style="font-size:1.45rem;font-weight:900;color:{dir_color};margin-bottom:0.35rem">'
-        f'{dir_icon} {direction}{hist_suffix}</div>'
-        f'<div style="display:flex;flex-wrap:wrap;gap:0.15rem 0;align-items:center">'
-        + "&ensp;·&ensp;".join(banner_meta)
-        + "</div></div>",
-        unsafe_allow_html=True,
-    )
-
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    if spot_chg is not None and spot_chg_pct is not None:
-        k1.metric(
-            f"{spot_label} Price",
-            f"${spot:.2f}",
-            delta=f"{spot_chg:+.2f} ({spot_chg_pct:+.2f}%)",
-        )
-    else:
-        k1.metric(f"{spot_label} Price", f"${spot:.2f}")
-
-    if market_state_info:
-        spy = market_state_info["spy_close"]
-        qqq = market_state_info["qqq_close"]
-        vix = market_state_info["vix_close"]
-        spy_chg = market_state_info.get("spy_chg_pct")
-        qqq_chg = market_state_info.get("qqq_chg_pct")
-        vchg = market_state_info.get("vix_chg_pct")
-        k2.metric("SPY", f"${spy:.2f}", delta=f"{spy_chg:+.2f}%" if spy_chg is not None else None)
-        k3.metric("QQQ", f"${qqq:.2f}", delta=f"{qqq_chg:+.2f}%" if qqq_chg is not None else None)
-        k4.metric("VIX", f"{vix:.2f}", delta=f"{vchg:+.2f}%" if vchg is not None else None)
-    else:
-        k2.metric("SPY", "—")
-        k3.metric("QQQ", "—")
-        k4.metric("VIX", "—")
-
-    if daily_bias_info:
-        k5.metric(
-            "Daily Bias",
-            daily_bias_info["daily_bias"],
-            delta=f"body {daily_bias_info['body_ratio']:+.2f}",
-        )
-    else:
-        k5.metric("Daily Bias", "—")
-
-    if vwap_px is not None:
-        k6.metric("Live VWAP", f"${float(vwap_px):.2f}", delta=vwap_state)
-    else:
-        k6.metric("Live VWAP", "—")
-
-    # ── 0DTE Gamma Flow KPI ───────────────────────────────────────────────────
-    _render_0dte_gamma_kpi(odte_info)
-
-    # 1SD expected range strip (68% probability band)
-    if em_range.get("Lower_1SD") is not None and em_range.get("Upper_1SD") is not None:
-        dte_s = em_range.get("DTE")
-        iv_s = em_range.get("IV")
-        em_s = em_range.get("Expected_Move")
-        detail = []
-        if em_s is not None:
-            detail.append(f"EM ±{_usd(em_s)}")
-        if iv_s is not None:
-            detail.append(f"IV {float(iv_s):.1%}")
-        if dte_s is not None:
-            detail.append(f"DTE {float(dte_s):.0f}d")
-        st.caption(
-            f"**1SD Expected Range:** "
-            f"{_usd(em_range['Lower_1SD'])} – {_usd(em_range['Upper_1SD'])}"
-            + (f"  ·  {' · '.join(detail)}" if detail else "")
-            + f"  ·  **Strategy:** {optimal_strat}"
+            f'<span style="color:#80cbc4">{optimal_strat}</span>'
         )
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ZONE 2 — Main Workspace Grid
-    # ══════════════════════════════════════════════════════════════════════════
-    with st.container():
-        # One chart: candles + EMA 9/21/50 + VWAP, volume with participation, stochastic.
-        price_chart.render(ScanContext(ticker=ticker, curr=curr, prev=prev, top_n=int(top_n)))
-
-        # Institutional POV leakage read-out (5-minute participation math)
-        if pov_df is not None and not pov_df.empty:
-            if pov_info.get("urgency"):
-                st.caption(
-                    f"**{URGENCY_TAG}** · last bar POV "
-                    f"**{pov_info.get('ratio')}×** · price above VWAP"
-                )
-            elif pov_info.get("ratio") is not None:
-                st.caption(
-                    f"POV last 5-minute bar: **{pov_info.get('ratio')}×** "
-                    f"(leakage threshold {3.0:.1f}×) · "
-                    f"{'above' if pov_info.get('above_vwap') else 'below/at'} VWAP"
-                )
-
-    # Row 1: Volume Analysis | Multi-Timeframe
-    sub_c1, sub_c2 = st.columns([1, 1.4])
-    with sub_c1:
-        _render_volume_analysis(ticker, compact=True, vol_curr=vol)
-    with sub_c2:
-        _render_mtf_matrix(tfs, prev_tfs)
-
-    # Row 2: My Open Positions, full width
-    _render_portfolio_manager(
-        ticker, vol, spot, prev_vol,
-        daily_bias=(daily_bias_info or {}).get("daily_bias"),
-        market_state=(market_state_info or {}).get("market_state"),
-        news_bias=news_bias,
-        compact=True,
-    )
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # ZONE 3 — Catalyst (collapsed by default)
-    # ══════════════════════════════════════════════════════════════════════════
-    _bias_colors = {
-        "BULLISH": "#00c853",
-        "BEARISH": "#d50000",
-        "NEUTRAL": "#9e9e9e",
-    }
-    bias_color = _bias_colors.get(news_bias, "#9e9e9e")
-
-    with st.expander("📰 Live Catalyst Sentiment & News", expanded=False):
         st.markdown(
-            f'<span style="font-size:1.15rem;font-weight:700;color:{bias_color}">'
-            f'{news_bias}</span>'
-            f'  ·  catalyst score '
-            f'<span style="font-weight:700;color:{bias_color}">{catalyst:+.2f}</span>',
+            f'<div style="background:#1a1a2e;padding:0.85rem 1.4rem;border-radius:8px;'
+            f'margin-bottom:0.75rem;border-left:4px solid {dir_color}">'
+            f'<div style="font-size:0.7rem;letter-spacing:0.08em;color:#888;text-transform:uppercase">'
+            f'Scanner direction · multi-timeframe score (the trend rule above decides calls or puts)</div>'
+            f'<div style="font-size:1.45rem;font-weight:900;color:{dir_color};margin-bottom:0.35rem">'
+            f'{dir_icon} {direction}{hist_suffix}</div>'
+            f'<div style="display:flex;flex-wrap:wrap;gap:0.15rem 0;align-items:center">'
+            + "&ensp;·&ensp;".join(banner_meta)
+            + "</div></div>",
             unsafe_allow_html=True,
         )
-        if headlines:
-            bullets = []
-            for h in headlines:
-                src  = h.get("source") or "Unknown"
-                text = h.get("headline") or ""
-                url  = h.get("url") or ""
-                if url and text:
-                    bullets.append(f"- **{src}**: [{text}]({url})")
-                elif text:
-                    bullets.append(f"- **{src}**: {text}")
-            if bullets:
-                st.markdown("\n".join(bullets))
-        else:
-            st.caption("No recent headlines from Finnhub or Yahoo Finance.")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ZONE 4 — Execution Engine (Best Value)
-    # ══════════════════════════════════════════════════════════════════════════
-    st.subheader("⭐ Best Value Option Scanner")
-    _render_best_value_panel(
-        vol, spot, prev_vol, ticker=ticker,
-        daily_bias_info=daily_bias_info,
-        market_state_info=market_state_info,
-        news_bias=news_bias,
-        session_low=session.get("day_low"),
-        vwap_info=vwap_info,
-        run_timestamp=ts_str,
-        cost_info=cost_info,
-        has_catalyst=has_catalyst,
-        spot_below_support=spot_below_sup,
-        optimal_strategy=optimal_strat,
-        upper_1sd=em_range.get("Upper_1SD"),
-        lower_1sd=em_range.get("Lower_1SD"),
-        odte_info=odte_info,
-        pov_info=pov_info,
-        top_n=top_n,
-    )
-
-    # 0DTE reflexivity — top strikes MM exposure
-    _render_0dte_top_strikes_expander(odte_info)
-
-    # Flow Magnets, Expiration Breakdown and Cost Distribution are their own menu
-    # pages now (ui/components); they are no longer repeated here.
-
-    # ══ Collapsible detail sections ═══════════════════════════════════════════
-    if prev:
-        prev_spot = float(prev.get("spot") or 0)
-        prev_pc   = float((prev.get("volume") or {}).get("pc_ratio") or 0)
-        try:
-            prev_ts_str = datetime.fromisoformat(prev.get("timestamp", "")).astimezone(ET).strftime("%Y-%m-%d %H:%M ET")
-        except Exception:
-            prev_ts_str = "previous run"
-        vs_spot = spot - prev_spot
-        pc_chg  = pc_ratio - prev_pc
-        pct_chg = (vs_spot / prev_spot * 100) if prev_spot else 0
-
-        with st.expander(f"📈 Changes vs last run  (since {prev_ts_str})", expanded=False):
-            ca, cb = st.columns(2)
-            with ca:
-                st.metric("Spot", f"${spot:.2f}", delta=f"{vs_spot:+.2f} ({pct_chg:+.1f}%)")
-                st.metric("P/C Ratio", f"{pc_ratio:.3f}", delta=f"{pc_chg:+.3f}")
-            with cb:
-                rsi_lines = []
-                for tf in ["5M", "10M", "15M", "45M", "1H", "4H", "1D"]:
-                    cr = (tfs.get(tf) or {}).get("rsi")
-                    pr = ((prev.get("timeframes") or {}).get(tf) or {}).get("rsi")
-                    if cr is not None and pr is not None:
-                        rsi_lines.append(f"**{tf}:** {pr:.1f}→{cr:.1f} ({cr-pr:+.1f})")
-                if rsi_lines:
-                    st.markdown("**RSI shifts**  \n" + "  \n".join(rsi_lines))
-            prev_mags = prev.get("signal_magnets") or {}
-            for side in ("call", "put"):
-                cm = mags.get(side) or {}
-                pm = prev_mags.get(side) or {}
-                if cm and pm and cm.get("strike") != pm.get("strike"):
-                    icon = "▲ CALL" if side == "call" else "▼ PUT"
-                    st.info(
-                        f"**{icon} MAGNET shifted:** "
-                        f"${pm.get('strike')} ({pm.get('expiry')}) → "
-                        f"${cm.get('strike')} ({cm.get('expiry')})  ← STRIKE CHANGE"
-                    )
-
-    with st.expander("⏰ Opening Range Breakout", expanded=False):
-        or_rows = []
-        for tf_key in ["5M", "15M"]:
-            or_tf = or_data.get(tf_key) or {}
-            if or_tf:
-                or_rows.append({
-                    "TF":        tf_key,
-                    "Open time": or_tf.get("open_time", "—"),
-                    "Open":      f"${or_tf.get('open', 0):.2f}",
-                    "High":      f"${or_tf.get('high', 0):.2f}",
-                    "Low":       f"${or_tf.get('low', 0):.2f}",
-                    "Range":     f"${or_tf.get('range', 0):.2f} ({or_tf.get('range_pct', 0):.2f}%)",
-                    "Current":   f"${float(or_tf.get('current') or spot):.2f}",
-                    "Bias":      or_tf.get("bias", "—"),
-                })
-        if or_rows:
-            def _or_bias_style(val: str) -> str:
-                if "BULL" in str(val):
-                    return "color:#00c853;font-weight:bold"
-                if "BEAR" in str(val):
-                    return "color:#d50000;font-weight:bold"
-                return "color:#9e9e9e"
-            or_df = pd.DataFrame(or_rows)
-            st.dataframe(
-                or_df.style.map(_or_bias_style, subset=["Bias"]),
-                use_container_width=True,
-                hide_index=True,
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        if spot_chg is not None and spot_chg_pct is not None:
+            k1.metric(
+                f"{spot_label} Price",
+                f"${spot:.2f}",
+                delta=f"{spot_chg:+.2f} ({spot_chg_pct:+.2f}%)",
             )
         else:
-            st.caption("No Opening Range data in this archive.")
+            k1.metric(f"{spot_label} Price", f"${spot:.2f}")
+
+        if market_state_info:
+            spy = market_state_info["spy_close"]
+            qqq = market_state_info["qqq_close"]
+            vix = market_state_info["vix_close"]
+            spy_chg = market_state_info.get("spy_chg_pct")
+            qqq_chg = market_state_info.get("qqq_chg_pct")
+            vchg = market_state_info.get("vix_chg_pct")
+            k2.metric("SPY", f"${spy:.2f}", delta=f"{spy_chg:+.2f}%" if spy_chg is not None else None)
+            k3.metric("QQQ", f"${qqq:.2f}", delta=f"{qqq_chg:+.2f}%" if qqq_chg is not None else None)
+            k4.metric("VIX", f"{vix:.2f}", delta=f"{vchg:+.2f}%" if vchg is not None else None)
+        else:
+            k2.metric("SPY", "—")
+            k3.metric("QQQ", "—")
+            k4.metric("VIX", "—")
+
+        if daily_bias_info:
+            k5.metric(
+                "Daily Bias",
+                daily_bias_info["daily_bias"],
+                delta=f"body {daily_bias_info['body_ratio']:+.2f}",
+            )
+        else:
+            k5.metric("Daily Bias", "—")
+
+        if vwap_px is not None:
+            k6.metric("Live VWAP", f"${float(vwap_px):.2f}", delta=vwap_state)
+        else:
+            k6.metric("Live VWAP", "—")
+
+        # ── 0DTE Gamma Flow KPI ───────────────────────────────────────────────────
+        _render_0dte_gamma_kpi(odte_info)
+
+        # 1SD expected range strip (68% probability band)
+        if em_range.get("Lower_1SD") is not None and em_range.get("Upper_1SD") is not None:
+            dte_s = em_range.get("DTE")
+            iv_s = em_range.get("IV")
+            em_s = em_range.get("Expected_Move")
+            detail = []
+            if em_s is not None:
+                detail.append(f"EM ±{_usd(em_s)}")
+            if iv_s is not None:
+                detail.append(f"IV {float(iv_s):.1%}")
+            if dte_s is not None:
+                detail.append(f"DTE {float(dte_s):.0f}d")
+            st.caption(
+                f"**1SD Expected Range:** "
+                f"{_usd(em_range['Lower_1SD'])} – {_usd(em_range['Upper_1SD'])}"
+                + (f"  ·  {' · '.join(detail)}" if detail else "")
+                + f"  ·  **Strategy:** {optimal_strat}"
+            )
+
+    if "chart" in sections:
+        # ══════════════════════════════════════════════════════════════════════════
+        # ZONE 2 — Main Workspace Grid
+        # ══════════════════════════════════════════════════════════════════════════
+        with st.container():
+            # One chart: candles + EMA 9/21/50 + VWAP, volume with participation, stochastic.
+            price_chart.render(ScanContext(ticker=ticker, curr=curr, prev=prev, top_n=int(top_n)))
+
+            # Institutional POV leakage read-out (5-minute participation math)
+            if pov_df is not None and not pov_df.empty:
+                if pov_info.get("urgency"):
+                    st.caption(
+                        f"**{URGENCY_TAG}** · last bar POV "
+                        f"**{pov_info.get('ratio')}×** · price above VWAP"
+                    )
+                elif pov_info.get("ratio") is not None:
+                    st.caption(
+                        f"POV last 5-minute bar: **{pov_info.get('ratio')}×** "
+                        f"(leakage threshold {3.0:.1f}×) · "
+                        f"{'above' if pov_info.get('above_vwap') else 'below/at'} VWAP"
+                    )
+
+    if "context" in sections:
+        # Row 1: Volume Analysis | Multi-Timeframe
+        sub_c1, sub_c2 = st.columns([1, 1.4])
+        with sub_c1:
+            _render_volume_analysis(ticker, compact=True, vol_curr=vol)
+        with sub_c2:
+            _render_mtf_matrix(tfs, prev_tfs)
+
+    if "positions" in sections:
+        # Row 2: My Open Positions, full width
+        _render_portfolio_manager(
+            ticker, vol, spot, prev_vol,
+            daily_bias=(daily_bias_info or {}).get("daily_bias"),
+            market_state=(market_state_info or {}).get("market_state"),
+            news_bias=news_bias,
+            compact=True,
+        )
+
+    if "news" in sections:
+        # ══════════════════════════════════════════════════════════════════════════
+        # ZONE 3 — Catalyst (collapsed by default)
+        # ══════════════════════════════════════════════════════════════════════════
+        _bias_colors = {
+            "BULLISH": "#00c853",
+            "BEARISH": "#d50000",
+            "NEUTRAL": "#9e9e9e",
+        }
+        bias_color = _bias_colors.get(news_bias, "#9e9e9e")
+
+        with st.expander("📰 Live Catalyst Sentiment & News", expanded=False):
+            st.markdown(
+                f'<span style="font-size:1.15rem;font-weight:700;color:{bias_color}">'
+                f'{news_bias}</span>'
+                f'  ·  catalyst score '
+                f'<span style="font-weight:700;color:{bias_color}">{catalyst:+.2f}</span>',
+                unsafe_allow_html=True,
+            )
+            if headlines:
+                bullets = []
+                for h in headlines:
+                    src  = h.get("source") or "Unknown"
+                    text = h.get("headline") or ""
+                    url  = h.get("url") or ""
+                    if url and text:
+                        bullets.append(f"- **{src}**: [{text}]({url})")
+                    elif text:
+                        bullets.append(f"- **{src}**: {text}")
+                if bullets:
+                    st.markdown("\n".join(bullets))
+            else:
+                st.caption("No recent headlines from Finnhub or Yahoo Finance.")
+
+    if "best_value" in sections:
+        # ══════════════════════════════════════════════════════════════════════════
+        # ZONE 4 — Execution Engine (Best Value)
+        # ══════════════════════════════════════════════════════════════════════════
+        st.subheader("⭐ Best Value Option Scanner")
+        _render_best_value_panel(
+            vol, spot, prev_vol, ticker=ticker,
+            daily_bias_info=daily_bias_info,
+            market_state_info=market_state_info,
+            news_bias=news_bias,
+            session_low=session.get("day_low"),
+            vwap_info=vwap_info,
+            run_timestamp=ts_str,
+            cost_info=cost_info,
+            has_catalyst=has_catalyst,
+            spot_below_support=spot_below_sup,
+            optimal_strategy=optimal_strat,
+            upper_1sd=em_range.get("Upper_1SD"),
+            lower_1sd=em_range.get("Lower_1SD"),
+            odte_info=odte_info,
+            pov_info=pov_info,
+            top_n=top_n,
+        )
+
+        # 0DTE reflexivity — top strikes MM exposure
+        _render_0dte_top_strikes_expander(odte_info)
+
+        # Flow Magnets, Expiration Breakdown and Cost Distribution are their own menu
+        # pages now (ui/components); they are no longer repeated here.
+
+    if "details" in sections:
+        # ══ Collapsible detail sections ═══════════════════════════════════════════
+        if prev:
+            prev_spot = float(prev.get("spot") or 0)
+            prev_pc   = float((prev.get("volume") or {}).get("pc_ratio") or 0)
+            try:
+                prev_ts_str = datetime.fromisoformat(prev.get("timestamp", "")).astimezone(ET).strftime("%Y-%m-%d %H:%M ET")
+            except Exception:
+                prev_ts_str = "previous run"
+            vs_spot = spot - prev_spot
+            pc_chg  = pc_ratio - prev_pc
+            pct_chg = (vs_spot / prev_spot * 100) if prev_spot else 0
+
+            with st.expander(f"📈 Changes vs last run  (since {prev_ts_str})", expanded=False):
+                ca, cb = st.columns(2)
+                with ca:
+                    st.metric("Spot", f"${spot:.2f}", delta=f"{vs_spot:+.2f} ({pct_chg:+.1f}%)")
+                    st.metric("P/C Ratio", f"{pc_ratio:.3f}", delta=f"{pc_chg:+.3f}")
+                with cb:
+                    rsi_lines = []
+                    for tf in ["5M", "10M", "15M", "45M", "1H", "4H", "1D"]:
+                        cr = (tfs.get(tf) or {}).get("rsi")
+                        pr = ((prev.get("timeframes") or {}).get(tf) or {}).get("rsi")
+                        if cr is not None and pr is not None:
+                            rsi_lines.append(f"**{tf}:** {pr:.1f}→{cr:.1f} ({cr-pr:+.1f})")
+                    if rsi_lines:
+                        st.markdown("**RSI shifts**  \n" + "  \n".join(rsi_lines))
+                prev_mags = prev.get("signal_magnets") or {}
+                for side in ("call", "put"):
+                    cm = mags.get(side) or {}
+                    pm = prev_mags.get(side) or {}
+                    if cm and pm and cm.get("strike") != pm.get("strike"):
+                        icon = "▲ CALL" if side == "call" else "▼ PUT"
+                        st.info(
+                            f"**{icon} MAGNET shifted:** "
+                            f"${pm.get('strike')} ({pm.get('expiry')}) → "
+                            f"${cm.get('strike')} ({cm.get('expiry')})  ← STRIKE CHANGE"
+                        )
+
+        with st.expander("⏰ Opening Range Breakout", expanded=False):
+            or_rows = []
+            for tf_key in ["5M", "15M"]:
+                or_tf = or_data.get(tf_key) or {}
+                if or_tf:
+                    or_rows.append({
+                        "TF":        tf_key,
+                        "Open time": or_tf.get("open_time", "—"),
+                        "Open":      f"${or_tf.get('open', 0):.2f}",
+                        "High":      f"${or_tf.get('high', 0):.2f}",
+                        "Low":       f"${or_tf.get('low', 0):.2f}",
+                        "Range":     f"${or_tf.get('range', 0):.2f} ({or_tf.get('range_pct', 0):.2f}%)",
+                        "Current":   f"${float(or_tf.get('current') or spot):.2f}",
+                        "Bias":      or_tf.get("bias", "—"),
+                    })
+            if or_rows:
+                def _or_bias_style(val: str) -> str:
+                    if "BULL" in str(val):
+                        return "color:#00c853;font-weight:bold"
+                    if "BEAR" in str(val):
+                        return "color:#d50000;font-weight:bold"
+                    return "color:#9e9e9e"
+                or_df = pd.DataFrame(or_rows)
+                st.dataframe(
+                    or_df.style.map(_or_bias_style, subset=["Bias"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption("No Opening Range data in this archive.")
+

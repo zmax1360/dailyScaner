@@ -349,6 +349,9 @@ def main():
     if page == "flow":
         render_market_banner()
         flow_page.render(cfg)
+    elif page == "best_value":
+        render_market_banner()
+        flow_page.render_best_value(cfg)
     elif page == "archive":
         render_market_banner()
         archive_page.render(cfg)

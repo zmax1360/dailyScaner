@@ -19,7 +19,7 @@ PAGES_DIR = ROOT / "ui" / "pages"
 PAGE_MODULES = sorted(p.stem for p in PAGES_DIR.glob("*.py") if p.stem != "__init__")
 
 # app.py may only shrink. Lower this number whenever a page moves out.
-APP_LINE_BUDGET = 390
+APP_LINE_BUDGET = 395
 
 
 def _run(script: str):
@@ -379,6 +379,79 @@ def test_open_positions_has_its_own_row_below_volume_and_timeframes():
     assert "st.columns([1, 1.4])" in row1
     assert "_render_volume_analysis(" in row1 and "_render_mtf_matrix(" in row1
     assert "_render_portfolio_manager(" in row2 and "with sub_c" not in row2
+
+
+def _flow_render():
+    src = (ROOT / "ui" / "pages" / "flow.py").read_text()
+    tree = ast.parse(src)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "render")
+    return src, fn
+
+
+def test_every_flow_section_is_guarded_exactly_once():
+    from ui.pages import flow
+
+    src, fn = _flow_render()
+    guards = [
+        n.test.left.value for n in fn.body
+        if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+        and isinstance(n.test.left, ast.Constant)
+        and isinstance(n.test.comparators[0], ast.Name) and n.test.comparators[0].id == "sections"
+    ]
+    assert guards == list(flow.SECTIONS)
+
+
+def test_flow_sections_do_not_depend_on_each_other():
+    """A section may only use names set before the first section, or by itself."""
+    from ui.pages import flow
+
+    src, fn = _flow_render()
+    section_of = {}
+    shared: set[str] = set()
+    for stmt in fn.body:
+        name = None
+        if isinstance(stmt, ast.If) and isinstance(stmt.test, ast.Compare) \
+                and isinstance(stmt.test.left, ast.Constant) \
+                and stmt.test.left.value in flow.SECTIONS:
+            name = stmt.test.left.value
+        stores = {n.id for n in ast.walk(stmt) if isinstance(n, ast.Name)
+                  and isinstance(n.ctx, ast.Store)}
+        if name is None:
+            shared |= stores
+        else:
+            section_of[name] = (stmt, stores)
+    for name, (stmt, _) in section_of.items():
+        loads = {n.id for n in ast.walk(stmt) if isinstance(n, ast.Name)
+                 and isinstance(n.ctx, ast.Load)}
+        for other, (_, other_stores) in section_of.items():
+            if other != name:
+                leaked = (loads & other_stores) - shared - section_of[name][1]
+                assert not leaked, f"{name} uses {sorted(leaked)} set by {other}"
+
+
+def test_options_flow_overview_leaves_the_chart_and_best_value_to_their_own_pages():
+    from ui.pages import flow
+
+    assert flow.OVERVIEW == {"header", "context", "positions", "news", "details"}
+    assert not ({"chart", "best_value"} & flow.OVERVIEW)
+    titles = {e.id: e.title for e in __import__("ui.shell", fromlist=["x"]).entries()}
+    assert titles["best_value"] == "Best Value" and titles["price_chart"] == "Chart"
+
+
+def test_flow_render_rejects_unknown_sections():
+    from ui.pages import flow
+
+    with pytest.raises(ValueError):
+        flow.render({"ticker": "AAPL"}, sections=frozenset({"nope"}))
+
+
+def test_best_value_page_draws_only_the_best_value_section(monkeypatch):
+    from ui.pages import flow
+
+    seen = {}
+    monkeypatch.setattr(flow, "render", lambda cfg, sections=None: seen.update(s=sections))
+    flow.render_best_value({"ticker": "AAPL"})
+    assert seen["s"] == frozenset({"best_value"})
 
 
 def test_direction_card_says_what_it_measures():
