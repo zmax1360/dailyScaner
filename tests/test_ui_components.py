@@ -217,9 +217,9 @@ def test_scan_context_is_immutable():
 
 def test_options_flow_does_not_repeat_the_component_pages():
     """They are menu pages; Options Flow no longer embeds them in tabs."""
-    src = (ROOT / "app.py").read_text()
+    src = (ROOT / "ui" / "pages" / "flow.py").read_text()
     tree = ast.parse(src)
-    tab1 = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_render_tab1")
-    body = ast.get_source_segment(src, tab1)
+    page = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "render")
+    body = ast.get_source_segment(src, page)
     for name in ("flow_magnets", "expiry_breakdown", "cost_distribution.render", "st.tabs("):
         assert name not in body, name

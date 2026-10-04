@@ -19,7 +19,7 @@ PAGES_DIR = ROOT / "ui" / "pages"
 PAGE_MODULES = sorted(p.stem for p in PAGES_DIR.glob("*.py") if p.stem != "__init__")
 
 # app.py may only shrink. Lower this number whenever a page moves out.
-APP_LINE_BUDGET = 3880
+APP_LINE_BUDGET = 1460
 
 
 def _run(script: str):
@@ -179,10 +179,60 @@ def test_display_greeks_are_sane_and_obey_put_call_parity():
     assert call[2] < 0                                        # long options decay
 
 
+# ── shared widgets and market helpers ───────────────────────────────────────
+
+_CHOICE = """
+import streamlit as st
+from ui.widgets import _choice_control
+{pre}
+val = _choice_control("Sort by", ["Volume", "Premium $", "Strike"], default={default!r},
+                      key="k")
+st.json({{"val": val}})
+"""
+
+
+def test_choice_control_returns_the_default_then_the_selection():
+    at = _run(_CHOICE.format(pre="", default="Premium $"))
+    assert json.loads(at.json[0].value)["val"] == "Premium $"
+    if at.radio:                      # Streamlit < 1.40 falls back to a horizontal radio
+        at.radio[0].set_value("Strike").run()
+    else:                             # pills / segmented control on newer versions
+        at.session_state["k"] = "Strike"
+        at.run()
+    assert not at.exception
+    assert json.loads(at.json[0].value)["val"] == "Strike"
+
+
+def test_choice_control_accepts_a_value_preset_in_session_state():
+    """A jump sets the key before the widget is drawn; passing a default too would raise."""
+    at = _run(_CHOICE.format(pre='st.session_state["k"] = "Strike"', default="Volume"))
+    assert json.loads(at.json[0].value)["val"] == "Strike"
+
+
+def test_choice_control_falls_back_to_the_first_option_for_an_unknown_default():
+    at = _run(_CHOICE.format(pre="", default="Nope"))
+    assert json.loads(at.json[0].value)["val"] == "Volume"
+
+
+def test_streamlit_version_check():
+    from ui.widgets import _streamlit_ge
+
+    assert _streamlit_ge(1, 0) is True
+    assert _streamlit_ge(99, 0) is False
+
+
+def test_market_clock_is_timezone_aware_eastern():
+    from ui.market import _market_is_closed, _now_et
+
+    now = _now_et()
+    assert now.tzinfo is not None and str(now.tzinfo) == "America/New_York"
+    assert isinstance(_market_is_closed(), bool)
+
+
 # ── the page contract ───────────────────────────────────────────────────────
 
 def test_expected_pages_exist():
-    assert {"news", "spread_gate", "journal", "tickers", "archive"} <= set(PAGE_MODULES)
+    assert {"news", "spread_gate", "journal", "tickers", "archive", "flow"} <= set(PAGE_MODULES)
 
 
 @pytest.mark.parametrize("name", PAGE_MODULES)
@@ -222,7 +272,10 @@ def test_app_no_longer_defines_the_moved_pages():
              "_render_tab_journal", "_cached_market_news", "_fmt_news_ts",
              "_fmt_journal_money", "_fmt_journal_pct", "_fmt_journal_ts",
              "_render_greeks_panel", "_ticker_summary", "_bs_greeks", "_discover_tickers",
-             "_run_daily_scanner", "_scan_archive_metadata"}
+             "_run_daily_scanner", "_scan_archive_metadata", "_render_tab1",
+             "_render_best_value_panel", "_render_portfolio_manager", "evaluate_portfolio",
+             "_choice_control", "_streamlit_ge", "_now_et", "_market_is_closed",
+             "_cached_vwap_state", "_build_best_value_df", "_rsi_plain"}
     assert not (defined & moved)
 
 

@@ -16,11 +16,7 @@ _SCRIPT = """
 import streamlit as st
 from ui import shell
 
-def choice(label, options, *, default=None, key=None, help=None):
-    kw = {"key": key, "horizontal": True}
-    if key not in st.session_state:
-        kw["index"] = options.index(default)
-    return st.radio(label, options, **kw)
+from ui.widgets import _choice_control as choice
 
 page = shell.render_menu(st)
 ticker = shell.render_ticker_bar(st, TICKERS, status="Last scan 2026-10-02 16:05 ET")
@@ -137,6 +133,17 @@ def test_changed_settings_survive_leaving_and_returning():
     assert at.number_input(key="w_top_n").value == 9
     assert at.number_input(key="w_min_dte").value == 3
     assert at.radio(key="flow_sort_by").value == "Strike"
+
+
+def test_sort_can_be_changed_again_after_returning_to_settings():
+    """Regression: with a non-default sort stored, the next change snapped back to Volume."""
+    at = _click(_app(), "settings")
+    at.radio(key="flow_sort_by").set_value("Strike").run()
+    at = _click(_click(at, "gamma"), "settings")
+    at.radio(key="flow_sort_by").set_value("Premium $").run()
+    assert not at.exception
+    assert _state(at)["sort_by"] == "Premium $"
+    assert at.radio(key="flow_sort_by").value == "Premium $"
 
 
 def test_setting_rejects_unknown_names():
