@@ -93,14 +93,26 @@ def test_add_indicators_attaches_all_columns_and_rejects_missing_ohlc():
     assert ci.add_indicators(_bars().drop(columns=["High"])).empty
 
 
-def test_last_session_keeps_only_the_latest_day_and_needs_a_timezone():
+def test_last_session_keeps_only_the_latest_day():
     df = _bars()
     last = ci.last_session(df)
     assert set(last.index.date) == {pd.Timestamp("2026-10-02").date()}
     assert len(last) == 78
-    with pytest.raises(ValueError):
-        ci.last_session(df.tz_localize(None))
     assert ci.last_session(pd.DataFrame()).empty
+
+
+def test_last_session_accepts_a_naive_index_as_exchange_wall_clock():
+    """Regression: the Yahoo source strips the timezone, and the chart crashed on it."""
+    naive = _bars().tz_localize(None)
+    last = ci.last_session(naive)
+    assert len(last) == 78
+    assert set(last.index.date) == {pd.Timestamp("2026-10-02").date()}
+    assert last.index[0] == pd.Timestamp("2026-10-02 09:30")
+
+
+def test_last_session_converts_an_aware_index_before_taking_the_date():
+    utc = _bars().tz_convert("UTC")                      # same instants, UTC wall clock
+    assert len(ci.last_session(utc)) == 78
 
 
 # ── preparing and drawing the chart ─────────────────────────────────────────
@@ -200,6 +212,22 @@ def test_component_renders_with_a_last_bar_read_out():
     assert {c.key for c in at.checkbox} == {"chart_stoch", "chart_atr", "chart_participation"}
 
 
+def test_component_renders_with_timezone_naive_bars():
+    """Regression: real bars from the Yahoo source have no timezone."""
+    at = _run(bars="_bars().tz_localize(None)")
+    assert any(c.value.startswith("Last bar:") for c in at.caption)
+
+
+def test_prepare_handles_timezone_naive_bars_on_every_timeframe():
+    from volume_analysis import CHART_TIMEFRAMES
+
+    naive = _bars().tz_localize(None)
+    for tf in CHART_TIMEFRAMES:
+        shown = pc.prepare(naive, tf)
+        assert not shown.empty, tf
+        assert len(pc.build_figure(shown, timeframe=tf).data) > 0, tf
+
+
 def test_component_reports_unavailable_data():
     at = _run(bars="pd.DataFrame()")
     assert any("chart unavailable" in c.value for c in at.caption)
@@ -219,3 +247,51 @@ def test_options_flow_uses_the_combined_chart_instead_of_two():
     src = (Path(__file__).resolve().parents[1] / "ui" / "pages" / "flow.py").read_text()
     assert "price_chart.render(" in src
     assert "render_vwap_chart(" not in src and "render_pov_leakage_chart(" not in src
+
+
+# ── end to end through the real fetch function, with a fake data source ─────
+
+class _NaiveSource:
+    """Stands in for the Yahoo source: OHLCV bars with the timezone stripped."""
+    name = "fake"
+
+    def fetch_history(self, ticker, *, interval, period):
+        if interval == "5m":
+            sessions = ("2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02")
+            return _bars(sessions=sessions).drop(columns=["VWAP"]).tz_localize(None)
+        if interval == "1h":
+            days = pd.bdate_range("2026-09-01", "2026-10-02")
+            idx = pd.DatetimeIndex([d + pd.Timedelta(hours=h, minutes=30)
+                                    for d in days for h in range(9, 16)])
+        else:
+            idx = pd.bdate_range("2026-04-01", "2026-10-02")
+        rng = np.random.default_rng(3)
+        close = 330 + np.cumsum(rng.normal(0, 0.6, len(idx)))
+        return pd.DataFrame({"Open": close - 0.2, "High": close + 0.8, "Low": close - 0.9,
+                             "Close": close, "Volume": rng.integers(1e5, 9e5, len(idx))},
+                            index=idx)
+
+
+@pytest.mark.parametrize("timeframe", ["5M", "10M", "15M", "45M", "1H", "4H", "1D"])
+def test_every_timeframe_draws_from_source_shaped_bars(timeframe):
+    from volume_analysis import fetch_intraday_vwap_df
+
+    bars = fetch_intraday_vwap_df("AAPL", last_session_only=False, timeframe=timeframe,
+                                  source=_NaiveSource())
+    assert not bars.empty and bars.index.tz is None
+    shown = pc.prepare(bars, timeframe)
+    assert not shown.empty
+    names = _names(pc.build_figure(shown, ticker="AAPL", timeframe=timeframe, show_atr=True))
+    assert {"Price", "EMA 9", "VWAP", "Volume", "Stoch %K", "ATR 14"} <= set(names)
+    if timeframe in pc.SESSION_TIMEFRAMES:
+        assert len(set(shown.index.date)) == 1
+
+
+def test_fifteen_minute_view_has_a_full_session_with_all_three_emas():
+    from volume_analysis import fetch_intraday_vwap_df
+
+    bars = fetch_intraday_vwap_df("AAPL", last_session_only=False, timeframe="15M",
+                                  source=_NaiveSource())
+    shown = pc.prepare(bars, "15M")
+    assert len(shown) == 26                                   # 09:30 .. 15:45
+    assert shown[["EMA9", "EMA21", "EMA50"]].notna().all().all()

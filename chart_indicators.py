@@ -74,11 +74,13 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def last_session(df: pd.DataFrame, tz: str = "America/New_York") -> pd.DataFrame:
-    """Rows of the most recent trading day in ``tz``. Requires a timezone-aware index."""
+    """Rows of the most recent trading day.
+
+    A timezone-aware index is converted to ``tz`` first. A naive index is taken as
+    exchange wall-clock time already (the Yahoo source strips the timezone that way).
+    """
     if df is None or getattr(df, "empty", True):
         return pd.DataFrame()
     idx = pd.DatetimeIndex(df.index)
-    if idx.tz is None:
-        raise ValueError("last_session needs a timezone-aware index")
-    days = idx.tz_convert(tz).date
+    days = (idx.tz_convert(tz) if idx.tz is not None else idx).date
     return df[days == days[-1]]
