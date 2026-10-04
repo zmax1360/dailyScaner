@@ -19,7 +19,7 @@ PAGES_DIR = ROOT / "ui" / "pages"
 PAGE_MODULES = sorted(p.stem for p in PAGES_DIR.glob("*.py") if p.stem != "__init__")
 
 # app.py may only shrink. Lower this number whenever a page moves out.
-APP_LINE_BUDGET = 400
+APP_LINE_BUDGET = 390
 
 
 def _run(script: str):
@@ -310,6 +310,43 @@ def test_market_clock_is_timezone_aware_eastern():
     now = _now_et()
     assert now.tzinfo is not None and str(now.tzinfo) == "America/New_York"
     assert isinstance(_market_is_closed(), bool)
+
+
+# ── display fixes on Options Flow ───────────────────────────────────────────
+
+_BANNER = """
+import ui.market as market
+market._market_is_closed = lambda: {closed!r}
+market.render_market_banner()
+"""
+
+
+def test_market_closed_banner_shows_a_single_red_circle():
+    """Regression: the icon and the text each carried a red circle."""
+    at = _run(_BANNER.format(closed=True))
+    assert len(at.error) == 1
+    assert at.error[0].icon == "🔴"
+    assert "🔴" not in at.error[0].value and "MARKET CLOSED" in at.error[0].value
+
+
+def test_market_banner_is_absent_while_the_market_is_open():
+    assert len(_run(_BANNER.format(closed=False)).error) == 0
+
+
+def test_dollar_amounts_in_captions_are_escaped():
+    """Regression: '1SD Expected Range: $a – $b · EM ±$c' rendered as LaTeX math."""
+    from ui.pages import flow
+
+    assert flow._usd(324.63) == r"\$324.63"
+    assert flow._usd("9.064") == r"\$9.06"
+    src = (ROOT / "ui" / "pages" / "flow.py").read_text()
+    strip = src[src.index("# 1SD expected range strip"):src.index("# ZONE 2 — Main Workspace Grid")]
+    assert "${" not in strip and strip.count("_usd(") == 3
+
+
+def test_direction_card_says_what_it_measures():
+    src = (ROOT / "ui" / "pages" / "flow.py").read_text()
+    assert "Scanner direction · multi-timeframe score" in src
 
 
 # ── the page contract ───────────────────────────────────────────────────────

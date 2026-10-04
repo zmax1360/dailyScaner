@@ -74,3 +74,13 @@ def _build_best_value_df(
         odte_info=odte_info,
         pov_info=pov_info,
     )
+
+
+def render_market_banner() -> None:
+    """MARKET CLOSED banner, shown on scan-driven pages when the session is not open."""
+    if _market_is_closed():
+        now = _now_et()
+        st.error(
+            f"MARKET CLOSED — DATA IS END-OF-DAY  ({now.strftime('%A %H:%M ET')})",
+            icon="🔴",
+        )

@@ -2003,6 +2003,12 @@ def _render_0dte_top_strikes_expander(odte_info: dict | None) -> None:
         )
 
 
+def _usd(v) -> str:
+    """Dollar amount for st.caption / st.markdown text: the ``$`` is escaped so two
+    amounts on one line are not rendered as LaTeX math."""
+    return f"\\${float(v):.2f}"
+
+
 def render(cfg: dict):
     """Options Flow — Magnets heatmap + Volume-by-Expiry term structure."""
 
@@ -2123,6 +2129,8 @@ def render(cfg: dict):
     st.markdown(
         f'<div style="background:#1a1a2e;padding:0.85rem 1.4rem;border-radius:8px;'
         f'margin-bottom:0.75rem;border-left:4px solid {dir_color}">'
+        f'<div style="font-size:0.7rem;letter-spacing:0.08em;color:#888;text-transform:uppercase">'
+        f'Scanner direction · multi-timeframe score (the trend rule above decides calls or puts)</div>'
         f'<div style="font-size:1.45rem;font-weight:900;color:{dir_color};margin-bottom:0.35rem">'
         f'{dir_icon} {direction}{hist_suffix}</div>'
         f'<div style="display:flex;flex-wrap:wrap;gap:0.15rem 0;align-items:center">'
@@ -2180,14 +2188,14 @@ def render(cfg: dict):
         em_s = em_range.get("Expected_Move")
         detail = []
         if em_s is not None:
-            detail.append(f"EM ±${float(em_s):.2f}")
+            detail.append(f"EM ±{_usd(em_s)}")
         if iv_s is not None:
             detail.append(f"IV {float(iv_s):.1%}")
         if dte_s is not None:
             detail.append(f"DTE {float(dte_s):.0f}d")
         st.caption(
             f"**1SD Expected Range:** "
-            f"${float(em_range['Lower_1SD']):.2f} – ${float(em_range['Upper_1SD']):.2f}"
+            f"{_usd(em_range['Lower_1SD'])} – {_usd(em_range['Upper_1SD'])}"
             + (f"  ·  {' · '.join(detail)}" if detail else "")
             + f"  ·  **Strategy:** {optimal_strat}"
         )

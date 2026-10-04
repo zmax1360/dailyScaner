@@ -24,7 +24,7 @@ from ui.archives import (
     _latest_archive_stamp,
     _latest_weekly_archive,
 )
-from ui.market import _cached_vwap_state, _market_is_closed, _now_et
+from ui.market import _cached_vwap_state, render_market_banner
 from ui.widgets import _streamlit_ge
 from ui.option_math import _bs_greeks
 from ui.services import _SCANNER_DIR, _discover_tickers, _scan_archive_metadata
@@ -132,18 +132,6 @@ def _watch_archive_auto_refresh(ticker: str) -> None:
         st.caption("Auto-refresh on · watching for new scans")
 
     _watcher()
-
-
-def _market_banner():
-    """Persistent MARKET CLOSED banner — shown on every tab when session is not open."""
-    if _market_is_closed():
-        now = _now_et()
-        st.error(
-            f"🔴  MARKET CLOSED — DATA IS END-OF-DAY  "
-            f"({now.strftime('%A %H:%M ET')})",
-            icon="🔴",
-        )
-
 
 
 def _service_pid(pidfile: str, script_hint: str | None = None) -> int | None:
@@ -359,13 +347,13 @@ def main():
     page = cfg["page"]
     latest = cfg.get("latest_archive") or {}
     if page == "flow":
-        _market_banner()
+        render_market_banner()
         flow_page.render(cfg)
     elif page == "archive":
-        _market_banner()
+        render_market_banner()
         archive_page.render(cfg)
     elif page == "spread_gate":
-        _market_banner()
+        render_market_banner()
         spread_gate_page.render(cfg)
     elif page == "tickers":
         tickers_page.render()
