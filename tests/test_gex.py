@@ -271,6 +271,31 @@ def test_walls_and_net_per_expiry():
     assert w[LATER]["put_wall"] is None                              # no puts there
 
 
+def _col(values: dict) -> pd.DataFrame:
+    return pd.DataFrame({MONDAY: pd.Series(values)}).sort_index(ascending=False)
+
+
+def test_support_is_the_largest_positive_below_spot_and_resistance_above():
+    """The reported map: $330 is the call wall but sits below spot, so it is support."""
+    m = _col({340.0: 2.73e6, 337.5: 2.82e6, 335.0: 6.91e6, 332.5: 5.46e6, 330.0: 15.25e6,
+              327.5: 2.5e5, 325.0: -2.5e5, 320.0: -3.8e5})
+    sr = gex.support_resistance(m, 333.69)[MONDAY]
+    assert sr == {"support": 330.0, "resistance": 335.0}
+    assert gex.walls(m)[MONDAY]["call_wall"] == 330.0            # unchanged definition
+
+
+def test_support_and_resistance_swap_as_spot_moves_through_the_wall():
+    m = _col({335.0: 6.91e6, 332.5: 5.46e6, 330.0: 15.25e6, 325.0: -2.5e5})
+    assert gex.support_resistance(m, 329.0)[MONDAY] == {"support": None, "resistance": 330.0}
+    assert gex.support_resistance(m, 336.0)[MONDAY] == {"support": 330.0, "resistance": None}
+    assert gex.support_resistance(m, 330.0)[MONDAY]["support"] == 330.0   # at spot: support
+
+
+def test_negative_strikes_are_never_support_or_resistance():
+    m = _col({340.0: -1e6, 320.0: -2e6})
+    assert gex.support_resistance(m, 330.0)[MONDAY] == {"support": None, "resistance": None}
+
+
 def test_summary_reads_the_nearest_expiry():
     s = gex.summary(_latest(_chain()), spot=SPOT, as_of=AS_OF)
     m = gex.gex_matrix(gex.gex_table(_latest(_chain()), spot=SPOT, as_of=AS_OF),
@@ -282,6 +307,9 @@ def test_summary_reads_the_nearest_expiry():
     assert s["put_wall_gex"] == pytest.approx(m.loc[327.5, MONDAY]) and s["put_wall_gex"] < 0
     assert [k for k, _ in s["top"]] == [335.0, 332.5]          # largest positive first
     assert s["first_negative_below_spot"] == 327.5
+    assert (s["support"], s["resistance"]) == (332.5, 335.0)
+    assert s["support_gex"] == pytest.approx(m.loc[332.5, MONDAY])
+    assert s["resistance_gex"] == pytest.approx(m.loc[335.0, MONDAY])
     assert s["coverage"]["used"] > 0
 
 
@@ -462,8 +490,9 @@ def test_page_default_view_is_current_week_without_the_dead_expiry(seeded):
     assert sum("◀ spot" in label for label in labels) == 1
     metrics = {m.label: m.value for m in at.metric}
     assert metrics["Spot"] == "$333.00"
-    assert metrics["Call wall · Oct 5"] == "$335"
-    assert metrics["Put wall · Oct 5"] == "$327.5"
+    assert metrics["Gamma support"] == "$332.5"            # largest positive at/below spot
+    assert metrics["Call resistance"] == "$335"            # largest positive above spot
+    assert metrics["Put wall"] == "$327.5"
     assert "-0" not in {c for cells in shown.rows.values() for c in cells}
 
 

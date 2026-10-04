@@ -248,6 +248,8 @@ _GAMMA = {"expiry": "2026-10-05", "spot": 333.69, "net": 34_210_000.0,
           "call_wall": 330.0, "call_wall_gex": 15_250_000.0,
           "put_wall": 320.0, "put_wall_gex": -384_388.0,
           "top": [(330.0, 15_250_000.0), (335.0, 6_910_000.0), (332.5, 5_460_000.0)],
+          "support": 330.0, "support_gex": 15_250_000.0,
+          "resistance": 335.0, "resistance_gex": 6_910_000.0,
           "first_negative_below_spot": 325.0}
 
 
@@ -265,6 +267,7 @@ def test_gamma_lines_for_telegram():
         "🧱 <b>GAMMA · Oct 5</b>",
         "Net <b>+34.21M</b> — positive: dealer hedging tends to dampen moves",
         "Call wall <b>$330</b> (15.25M) · Put wall <b>$320</b> (-384,388)",
+        "Support <b>$330</b> (15.25M) · Resistance <b>$335</b> (6.91M)",
         "Largest: $330 15.25M · $335 6.91M · $332.5 5.46M",
         "First negative strike below spot: <b>$325</b>",
         "<i>dollars of hedging per $1 move · snapshot Sun Oct 04 16:18 ET</i>",
@@ -275,10 +278,11 @@ def test_gamma_lines_say_so_when_gamma_is_negative_or_missing():
     import ui.telegram_push as tg
 
     neg = {**_gamma_summary(), "net": -2_500_000.0, "call_wall": None, "call_wall_gex": None,
-           "first_negative_below_spot": None}
+           "support": None, "support_gex": None, "first_negative_below_spot": None}
     lines = tg.format_gamma_lines(neg)
     assert lines[1] == "Net <b>-2.50M</b> — negative: dealer hedging tends to amplify moves"
     assert lines[2] == "Put wall <b>$320</b> (-384,388)"
+    assert lines[3] == "Resistance <b>$335</b> (6.91M)"            # no support line part
     assert not any("First negative" in line for line in lines)
     assert tg.format_gamma_lines(None) == [
         "🧱 <b>GAMMA</b> — no chain snapshot with usable open interest yet"]

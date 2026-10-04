@@ -225,6 +225,22 @@ def walls(matrix: pd.DataFrame) -> dict[str, dict[str, float | None]]:
     return out
 
 
+def support_resistance(matrix: pd.DataFrame, spot: float) -> dict[str, dict[str, float | None]]:
+    """Per expiry: the largest positive strike at or below spot (support) and the largest
+    positive strike above spot (resistance). The call wall is whichever of the two is
+    bigger; splitting it by side of spot says how it is likely to act right now."""
+    out: dict[str, dict[str, float | None]] = {}
+    for exp in matrix.columns:
+        pos = matrix[exp].dropna()
+        pos = pos[pos > 0]
+        below, above = pos[pos.index <= spot], pos[pos.index > spot]
+        out[str(exp)] = {
+            "support": None if below.empty else float(below.idxmax()),
+            "resistance": None if above.empty else float(above.idxmax()),
+        }
+    return out
+
+
 def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
             today: date | None = None, n_strikes: int = 16, top: int = 3) -> dict | None:
     """Headline gamma read for the nearest live expiry, in dollars per $1 move.
@@ -243,6 +259,7 @@ def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
     col = matrix[exp].dropna()
     w = walls(matrix)[exp]
     below = col[(col.index < float(spot)) & (col < 0)]
+    sr = support_resistance(matrix, float(spot))[exp]
     return {
         "expiry": exp,
         "spot": float(spot),
@@ -251,6 +268,10 @@ def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
         "call_wall_gex": None if w["call_wall"] is None else float(col[w["call_wall"]]),
         "put_wall": w["put_wall"],
         "put_wall_gex": None if w["put_wall"] is None else float(col[w["put_wall"]]),
+        "support": sr["support"],
+        "support_gex": None if sr["support"] is None else float(col[sr["support"]]),
+        "resistance": sr["resistance"],
+        "resistance_gex": None if sr["resistance"] is None else float(col[sr["resistance"]]),
         "top": [(float(k), float(v))
                 for k, v in col[col > 0].sort_values(ascending=False).head(top).items()],
         "first_negative_below_spot": None if below.empty else float(below.index.max()),

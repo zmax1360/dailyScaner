@@ -175,13 +175,20 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
     first = str(matrix.columns[0])
     w = wall_map.get(first, {})
     net = w.get("net")
-    m1, m2, m3, m4 = st.columns(4)
+    sr = gex.support_resistance(matrix, spot).get(first, {})
+
+    def _px(v):
+        return "—" if v is None else f"${v:g}"
+
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Spot", f"${spot:,.2f}")
     m2.metric(f"Net GEX · {_fmt_exp(first)}", gex.fmt_money(net) or "—")
-    m3.metric(f"Call wall · {_fmt_exp(first)}",
-              "—" if w.get("call_wall") is None else f"${w['call_wall']:g}")
-    m4.metric(f"Put wall · {_fmt_exp(first)}",
-              "—" if w.get("put_wall") is None else f"${w['put_wall']:g}")
+    m3.metric("Gamma support", _px(sr.get("support")),
+              help="Largest positive strike at or below spot. Dips toward it tend to be bought.")
+    m4.metric("Call resistance", _px(sr.get("resistance")),
+              help="Largest positive strike above spot. Rallies toward it tend to stall.")
+    m5.metric("Put wall", _px(w.get("put_wall")),
+              help="Most negative strike. Moves can speed up around and below it.")
     if net is not None:
         st.caption("Net positive: dealer hedging tends to dampen moves." if net >= 0
                    else "Net negative: dealer hedging tends to amplify moves.")
@@ -204,7 +211,11 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
     with st.expander("How to read this, and its limits"):
         st.markdown(
             "- **Purple** strikes are call-heavy, **teal** are put-heavy. **Yellow** is the "
-            "largest positive strike in each expiry, **bright teal** the most negative.\n"
+            "largest positive strike in each expiry (the call wall), **bright teal** the "
+            "most negative (the put wall).\n"
+            "- **Gamma support** is the largest positive strike at or below spot and "
+            "**Call resistance** the largest above it. The call wall is one of the two; "
+            "which side of spot it sits on says how it is likely to act.\n"
             "- Large positive strikes tend to act as walls and magnets. "
             "Negative strikes are where moves can speed up.\n"
             "- The sign assumes dealers are long calls and short puts. That is a "

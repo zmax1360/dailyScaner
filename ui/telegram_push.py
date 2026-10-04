@@ -364,6 +364,15 @@ def format_gamma_lines(summary: dict | None) -> list[str]:
                      f"({gex.fmt_money(summary['put_wall_gex'])})")
     if walls:
         lines.append(" · ".join(walls))
+    levels = []
+    if summary.get("support") is not None:
+        levels.append(f"Support <b>${summary['support']:g}</b> "
+                      f"({gex.fmt_money(summary['support_gex'])})")
+    if summary.get("resistance") is not None:
+        levels.append(f"Resistance <b>${summary['resistance']:g}</b> "
+                      f"({gex.fmt_money(summary['resistance_gex'])})")
+    if levels:
+        lines.append(" · ".join(levels))
     if summary.get("top"):
         lines.append("Largest: " + " · ".join(
             f"${k:g} {gex.fmt_money(v)}" for k, v in summary["top"]))
