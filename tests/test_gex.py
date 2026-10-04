@@ -363,54 +363,147 @@ def test_page_empty_state_without_a_snapshot(tmp_path):
     assert any("No chain snapshot" in i.value for i in at.info)
 
 
+class _Table(__import__("html.parser", fromlist=["HTMLParser"]).HTMLParser):
+    """Reads the gamma map's HTML table: column headings and {row label: [cells]}."""
+
+    def __init__(self):
+        super().__init__()
+        self.columns, self.rows, self.styles = [], {}, ""
+        self._cell = self._row = None
+        self._in_style = False
+
+    def handle_starttag(self, tag, attrs):
+        cls = dict(attrs).get("class", "")
+        if tag == "style":
+            self._in_style = True
+        elif tag == "tr":
+            self._row = {"label": None, "cells": []}
+        elif tag in ("th", "td"):
+            kind = ("col" if "col_heading" in cls else "label" if "row_heading" in cls
+                    else "cell" if tag == "td" else "skip")
+            self._cell = [kind, ""]
+
+    def handle_data(self, data):
+        if self._in_style:
+            self.styles += data
+        elif self._cell is not None:
+            self._cell[1] += data
+
+    def handle_endtag(self, tag):
+        if tag == "style":
+            self._in_style = False
+        elif tag in ("th", "td") and self._cell is not None:
+            kind, text = self._cell
+            if kind == "col":
+                self.columns.append(text)
+            elif kind == "label":
+                self._row["label"] = text
+            elif kind == "cell":
+                self._row["cells"].append(text)
+            self._cell = None
+        elif tag == "tr" and self._row and self._row["label"] is not None:
+            self.rows[self._row["label"]] = self._row["cells"]
+
+
+def _map(at) -> _Table:
+    """The gamma map drawn on the page (exactly one)."""
+    tables = [m.value for m in at.markdown if "<table" in m.value]
+    assert len(tables) == 1, len(tables)
+    parsed = _Table()
+    parsed.feed(tables[0])
+    return parsed
+
+
+def _view(db, **kw):
+    """The page's numbers, without Streamlit, for the seeded snapshot viewed on Saturday."""
+    latest = vh.latest_scan("AAPL", db_path=db)
+    as_of = datetime.fromisoformat(str(latest["ts_et"].iloc[0]))
+    return gex_page.build_view(latest, spot=SPOT, as_of=as_of, today=date(2026, 10, 3), **kw)
+
+
 def test_page_refuses_without_spot(seeded):
     at = _run(seeded, spot=None)
     assert any("No spot price" in i.value for i in at.info)
-    assert len(at.dataframe) == 0
+    assert not any("<table" in m.value for m in at.markdown)
 
 
 def test_page_default_view_is_current_week_without_the_dead_expiry(seeded):
     at = _run(seeded)
-    assert len(at.dataframe) == 1
-    shown = at.dataframe[0].value
-    assert list(shown.columns) == [MONDAY, NEXT_FRI]          # no 2026-10-02, no later week
-    assert shown.index[-1] == gex_page.NET_LABEL
-    assert sum("◀ spot" in str(i) for i in shown.index) == 1
+    shown = _map(at)
+    assert shown.columns == ["Oct 5", "Oct 9"]                # no Oct 2, no later week
+    labels = list(shown.rows)
+    assert labels[-1] == gex_page.NET_LABEL
+    assert sum("◀ spot" in label for label in labels) == 1
     metrics = {m.label: m.value for m in at.metric}
     assert metrics["Spot"] == "$333.00"
     assert metrics["Call wall · Oct 5"] == "$335"
     assert metrics["Put wall · Oct 5"] == "$327.5"
-    assert "-0" not in set(shown.map(gex.fmt_money).values.ravel())
+    assert "-0" not in {c for cells in shown.rows.values() for c in cells}
+
+
+def test_map_values_are_centred_in_their_cells(seeded):
+    """The request: numbers in the middle of the cell, not pushed left or right."""
+    shown = _map(_run(seeded))
+    css = shown.styles.replace(" ", "")
+    assert "#T_gextd{text-align:center;" in css
+    assert "#T_gexth{text-align:center;" in css
+    assert len(_run(seeded).dataframe) == 0                   # no right-aligning grid widget
+
+
+def test_map_html_is_safe_for_markdown_and_keeps_wall_colours(seeded):
+    view = _view(seeded)
+    styled = gex_page.style_matrix(view["matrix"], view["walls"], spot_strike=335.0)
+    html = gex_page.matrix_html(styled, ["Oct 5", "Oct 9"])
+    assert "\n" not in html                                   # no line can become a code block
+    assert html.startswith("<div") and html.endswith("</table></div>")
+    assert "rgb(250, 204, 21)" in html and "rgb(45, 212, 191)" in html     # call / put wall
 
 
 def test_page_expiration_filter(seeded):
     at = _run(seeded)
     at.radio(key="gex_exp_mode").set_value(gex_page.EXP_CURRENT).run()
-    assert list(at.dataframe[0].value.columns) == [MONDAY]
+    assert _map(at).columns == ["Oct 5"]
     at.radio(key="gex_exp_mode").set_value(gex_page.EXP_ALL).run()
-    assert list(at.dataframe[0].value.columns) == [MONDAY, NEXT_FRI, LATER]
+    assert _map(at).columns == ["Oct 5", "Oct 9", "Oct 16"]
     at.radio(key="gex_exp_mode").set_value(gex_page.EXP_PICK).run()
     at.multiselect(key="gex_exp_pick").set_value([LATER]).run()
     assert not at.exception
-    assert list(at.dataframe[0].value.columns) == [LATER]
+    assert _map(at).columns == ["Oct 16"]
 
 
 def test_page_strike_count_filter(seeded):
     at = _run(seeded)
     at.radio(key="gex_exp_mode").set_value(gex_page.EXP_ALL).run()
-    full = len(at.dataframe[0].value) - 1                       # minus the NET row
-    assert full == 5
+    assert len(_map(at).rows) - 1 == 5                          # minus the NET row
     at.radio(key="gex_strikes").set_value("All").run()
-    assert len(at.dataframe[0].value) - 1 == 5
+    assert len(_map(at).rows) - 1 == 5
+    assert len(_view(seeded, mode=gex_page.EXP_ALL, strikes="8")["matrix"]) == 5
 
 
-def test_page_unit_toggle_rescales_by_spot_over_100(seeded):
+def test_view_expiry_modes_and_dead_expiry(seeded):
+    assert _view(seeded)["available"] == [MONDAY, NEXT_FRI, LATER]         # no 2026-10-02
+    assert list(_view(seeded)["matrix"].columns) == [MONDAY, NEXT_FRI]
+    assert list(_view(seeded, mode=gex_page.EXP_CURRENT)["matrix"].columns) == [MONDAY]
+    assert list(_view(seeded, mode=gex_page.EXP_PICK, picked=[LATER])["matrix"].columns) == [LATER]
+
+
+def test_view_units_rescale_the_same_map(seeded):
+    usd = _view(seeded)["walls"][MONDAY]["net"]
+    pct = _view(seeded, unit=gex.UNIT_PCT)["walls"][MONDAY]["net"]
+    shares = _view(seeded, unit=gex.UNIT_SHARES)["walls"][MONDAY]["net"]
+    assert pct / usd == pytest.approx(SPOT / 100)
+    assert usd / shares == pytest.approx(SPOT)
+    for unit in gex.UNITS:                                    # walls do not depend on the unit
+        w = _view(seeded, unit=unit)["walls"][MONDAY]
+        assert (w["call_wall"], w["put_wall"]) == (335.0, 327.5)
+
+
+def test_page_unit_toggle_redraws_the_map(seeded):
     at = _run(seeded)
-    usd = at.dataframe[0].value.loc[gex_page.NET_LABEL, MONDAY]
+    before = _map(at).rows[gex_page.NET_LABEL]
     at.radio(key="gex_unit").set_value("Dollars per 1%").run()
     assert not at.exception
-    pct = at.dataframe[0].value.loc[gex_page.NET_LABEL, MONDAY]
-    assert pct / usd == pytest.approx(SPOT / 100)
+    assert _map(at).rows[gex_page.NET_LABEL] != before
 
 
 def test_page_iv_source_toggle(seeded):
@@ -431,11 +524,8 @@ def test_page_caption_escapes_dollar_signs(seeded):
 
 def test_page_shares_unit_relabels_the_net_row_and_caption(seeded):
     at = _run(seeded)
-    usd = at.dataframe[0].value.loc[gex_page.NET_LABEL, MONDAY]
     at.radio(key="gex_unit").set_value("Shares per $1").run()
     assert not at.exception
-    shown = at.dataframe[0].value
-    assert shown.index[-1] == "NET sh"
-    assert usd / shown.loc["NET sh", MONDAY] == pytest.approx(SPOT)
+    assert list(_map(at).rows)[-1] == "NET sh"
     cap = next(c.value for c in at.caption if "Snapshot" in c.value)
     assert "shares of dealer hedging per \\$1 move" in cap

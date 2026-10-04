@@ -83,6 +83,48 @@ def _fmt_exp(e: str) -> str:
     return f"{d:%b} {d.day}"
 
 
+TABLE_STYLES = [
+    {"selector": "", "props": "width:100%; border-collapse:collapse; font-size:0.88rem; "
+                              "font-variant-numeric:tabular-nums;"},
+    {"selector": "th, td", "props": "text-align:center; padding:7px 10px; border:0; "
+                                    "border-bottom:1px solid rgba(255,255,255,0.07);"},
+    {"selector": "th.col_heading", "props": "font-weight:600; color:#b0bec5;"},
+    {"selector": "th.row_heading, th.blank",
+     "props": "text-align:left; width:9rem; font-weight:500; color:#b0bec5; white-space:nowrap;"},
+]
+
+
+def matrix_html(styled, col_labels: list[str]) -> str:
+    """The styled matrix as an HTML table with every value centred in its cell.
+
+    st.dataframe always right-aligns numbers, so the map is drawn as HTML instead.
+    Leading whitespace is stripped so Markdown never reads a line as a code block.
+    """
+    html = (styled.set_uuid("gex").relabel_index(col_labels, axis=1)
+            .set_table_styles(TABLE_STYLES).to_html())
+    flat = "".join(line.strip() for line in html.splitlines() if line.strip())
+    return f'<div style="max-height:75vh; overflow:auto;">{flat}</div>'
+
+
+def build_view(latest: pd.DataFrame, *, spot: float, as_of: datetime, today: date,
+               unit: str = gex.UNIT_DOLLAR, iv_source: str = gex.IV_QUOTE,
+               mode: str = EXP_WEEK, picked: list[str] | None = None,
+               strikes: str = "16") -> dict:
+    """Everything the page draws, computed without Streamlit: the per-contract table,
+    the expiries on offer, the matrix for the chosen window, its walls and coverage."""
+    table = gex.gex_table(latest, spot=spot, as_of=as_of, unit=unit, today=today,
+                          iv_source=iv_source)
+    available = gex.available_expiries(table)
+    matrix = pd.DataFrame()
+    if available:
+        matrix = gex.gex_matrix(table, spot=spot,
+                                expiries=pick_expiries(mode, available, picked),
+                                n_strikes=None if strikes == "All" else int(strikes))
+    return {"table": table, "available": available, "matrix": matrix,
+            "walls": gex.walls(matrix) if not matrix.empty else {},
+            "coverage": gex.coverage(table)}
+
+
 def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None = None) -> None:
     ticker = str(ticker or "").upper()
     head, settings = st.columns([4, 1])
@@ -107,29 +149,27 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
                             help="'From quotes' solves IV from each contract's bid/ask mid; "
                                  "'Vendor' uses the IV the data source reports.")
         unit = UNIT_LABELS[unit_label]
-        table = gex.gex_table(latest, spot=spot, as_of=as_of, unit=unit,
-                              today=today, iv_source=IV_LABELS[iv_label])
-        available = gex.available_expiries(table)
         mode = st.radio("Expirations", [EXP_CURRENT, EXP_WEEK, EXP_ALL, EXP_PICK], index=1,
                         horizontal=True, key="gex_exp_mode")
         picked = None
         if mode == EXP_PICK:
-            picked = st.multiselect("Dates", available, default=available[:1],
+            options = build_view(latest, spot=spot, as_of=as_of, today=today, unit=unit,
+                                 iv_source=IV_LABELS[iv_label])["available"]
+            picked = st.multiselect("Dates", options, default=options[:1],
                                     format_func=_fmt_exp, key="gex_exp_pick")
         strikes = st.radio("Strikes", STRIKE_CHOICES, index=1, horizontal=True,
                            key="gex_strikes")
 
+    view = build_view(latest, spot=spot, as_of=as_of, today=today, unit=unit,
+                      iv_source=IV_LABELS[iv_label], mode=mode, picked=picked, strikes=strikes)
+    available, matrix, wall_map, cov = (view["available"], view["matrix"], view["walls"],
+                                        view["coverage"])
     if not available:
         st.caption("No live expiry has usable open interest and IV in this snapshot.")
         return
-    expiries = pick_expiries(mode, available, picked)
-    matrix = gex.gex_matrix(table, spot=spot, expiries=expiries,
-                            n_strikes=None if strikes == "All" else int(strikes))
     if matrix.empty:
         st.caption("No contract near spot has usable open interest and IV in this snapshot.")
         return
-    wall_map = gex.walls(matrix)
-    cov = gex.coverage(table)
 
     # ── panel 1: the regime, for the nearest shown expiry ───────────────────
     first = str(matrix.columns[0])
@@ -149,11 +189,8 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
     # ── panel 2: the map ─────────────────────────────────────────────────────
     styled = style_matrix(matrix, wall_map, spot_strike=gex.nearest_strike(matrix, spot),
                           net_label=NET_LABELS[unit])
-    st.dataframe(
-        styled, use_container_width=True, key=f"gex_matrix_{ticker}",
-        height=min(36 * (len(matrix) + 2) + 4, 1200),
-        column_config={e: st.column_config.Column(_fmt_exp(e)) for e in matrix.columns},
-    )
+    st.markdown(matrix_html(styled, [_fmt_exp(e) for e in matrix.columns]),
+                unsafe_allow_html=True)
     st.caption(
         f"Snapshot {as_of.astimezone(tz):%a %b %d %H:%M ET} · "
         f"{len(matrix.columns)} of {len(available)} expiries · {len(matrix)} strikes · "
