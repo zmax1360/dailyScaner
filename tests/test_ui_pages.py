@@ -1,19 +1,25 @@
-"""UI pages moved out of app.py: Market News, Spread Gate, Journal."""
+"""UI pages moved out of app.py, and the shared services they use."""
 
 from __future__ import annotations
 
 import ast
 import importlib
+import json
+import shutil
 from pathlib import Path
 
 import pytest
 
+import ui.services as svc
+
 ROOT = Path(__file__).resolve().parents[1]
+GOLDEN = ROOT / "tests" / "golden"
+CURR, PREV = "AAPL_20260728_095049.json", "AAPL_20260728_093102.json"
 PAGES_DIR = ROOT / "ui" / "pages"
 PAGE_MODULES = sorted(p.stem for p in PAGES_DIR.glob("*.py") if p.stem != "__init__")
 
 # app.py may only shrink. Lower this number whenever a page moves out.
-APP_LINE_BUDGET = 5110
+APP_LINE_BUDGET = 3880
 
 
 def _run(script: str):
@@ -93,10 +99,90 @@ def test_journal_renders_the_golden_journal():
     assert len(at.error) == 0, [e.value for e in at.error]
 
 
+# ── Tickers ─────────────────────────────────────────────────────────────────
+
+_TICKERS = """
+import ui.services as svc
+from ui.pages import tickers
+svc._EXCLUDED_FILE = tickers._EXCLUDED_FILE = {excluded!r}
+tickers._SCHED_CFG_FILE = {sched!r}
+tickers.render()
+"""
+
+
+def test_tickers_page_renders_with_and_without_archives(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    script = _TICKERS.format(excluded=str(tmp_path / "excluded.json"),
+                             sched=str(tmp_path / "sched.json"))
+    _run(script)                                             # nothing scanned yet
+    (tmp_path / "archive").mkdir()
+    shutil.copy(GOLDEN / CURR, tmp_path / "archive" / CURR)
+    _run(script)
+    assert not (tmp_path / "excluded.json").exists()         # rendering writes nothing
+    assert not (tmp_path / "sched.json").exists()
+
+
+# ── Scanner Archive ─────────────────────────────────────────────────────────
+
+_ARCHIVE = """
+from ui.pages import archive
+archive.render({cfg!r})
+"""
+
+
+def test_archive_page_renders_with_and_without_archives(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cfg = {"ticker": "AAPL", "top_n": 5, "min_dte": 1, "sort_by": "Volume",
+           "latest_archive": None}
+    _run(_ARCHIVE.format(cfg=cfg))
+    (tmp_path / "archive").mkdir()
+    for name in (CURR, PREV):
+        shutil.copy(GOLDEN / name, tmp_path / "archive" / name)
+    svc._scan_archive_metadata.clear()
+    _run(_ARCHIVE.format(cfg=cfg))
+
+
+# ── shared services and option math ─────────────────────────────────────────
+
+def test_scanner_dir_is_the_repo_root():
+    assert Path(svc._SCANNER_DIR) == ROOT
+    assert (Path(svc._SCANNER_DIR) / "dailyScaner.py").exists()
+
+
+def test_discover_tickers_falls_back_to_aapl_and_honours_exclusions(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(svc, "_EXCLUDED_FILE", str(tmp_path / "excluded.json"))
+    assert svc._discover_tickers() == ["AAPL"]
+    (tmp_path / "archive").mkdir()
+    for t in ("AAPL", "NVDA"):
+        (tmp_path / "archive" / f"{t}_20261002_100000.json").write_text("{}")
+    assert svc._discover_tickers() == ["AAPL", "NVDA"]
+    (tmp_path / "excluded.json").write_text(json.dumps(["NVDA"]))
+    assert svc._discover_tickers() == ["AAPL"]
+
+
+def test_background_scan_state_starts_idle():
+    state = svc._bg_state("ZZZZ_TEST")
+    assert state == {"running": False, "last_ok": None, "last_ts": None, "t0": 0.0}
+    assert svc._bg_state("ZZZZ_TEST") is state               # same object on re-read
+    svc._BG.pop("ZZZZ_TEST", None)
+
+
+def test_display_greeks_are_sane_and_obey_put_call_parity():
+    from ui.option_math import _bs_greeks
+
+    call = _bs_greeks(333.0, 335.0, 0.30, 7, r=0.045, is_call=True)
+    put = _bs_greeks(333.0, 335.0, 0.30, 7, r=0.045, is_call=False)
+    assert 0 < call[0] < 1 and -1 < put[0] < 0
+    assert call[0] - put[0] == pytest.approx(1.0, abs=1e-9)
+    assert call[1] == pytest.approx(put[1]) and call[1] > 0   # same gamma
+    assert call[2] < 0                                        # long options decay
+
+
 # ── the page contract ───────────────────────────────────────────────────────
 
 def test_expected_pages_exist():
-    assert {"news", "spread_gate", "journal"} <= set(PAGE_MODULES)
+    assert {"news", "spread_gate", "journal", "tickers", "archive"} <= set(PAGE_MODULES)
 
 
 @pytest.mark.parametrize("name", PAGE_MODULES)
@@ -132,8 +218,11 @@ def test_components_never_import_pages():
 def test_app_no_longer_defines_the_moved_pages():
     tree = ast.parse((ROOT / "app.py").read_text())
     defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
-    moved = {"_render_tab3", "_render_tab5", "_render_tab_journal", "_cached_market_news",
-             "_fmt_news_ts", "_fmt_journal_money", "_fmt_journal_pct", "_fmt_journal_ts"}
+    moved = {"_render_tab2", "_render_tab3", "_render_tab4", "_render_tab5",
+             "_render_tab_journal", "_cached_market_news", "_fmt_news_ts",
+             "_fmt_journal_money", "_fmt_journal_pct", "_fmt_journal_ts",
+             "_render_greeks_panel", "_ticker_summary", "_bs_greeks", "_discover_tickers",
+             "_run_daily_scanner", "_scan_archive_metadata"}
     assert not (defined & moved)
 
 
