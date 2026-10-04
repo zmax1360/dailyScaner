@@ -27,6 +27,7 @@ import data_adapter
 import ema_stack
 import gex_page
 import volume_page
+from ui import shell
 import snapshot_store as ss
 from spread_gate import evaluate_spread_gate
 from dailyScaner import market_is_open, proximity_filter, MIN_OI_FOR_MAGNET
@@ -212,40 +213,6 @@ def _choice_control(
     if use_default:
         radio_kw["index"] = options.index(default) if default in options else 0
     return st.radio(label, options, **radio_kw)
-
-
-def _main_tab_labels() -> list[str]:
-    """Material icons when supported; emoji fallback otherwise."""
-    if _streamlit_ge(1, 40):
-        return [
-            ":material/candlestick_chart: Options Flow",
-            ":material/database: Scanner Archive",
-            ":material/science: Spread Gate",
-            ":material/list_alt: Tickers",
-            ":material/newspaper: Market News",
-            ":material/bar_chart: Volume",
-            ":material/grid_on: Gamma",
-            ":material/menu_book: Journal",
-        ]
-    return [
-        "📈 Options Flow",
-        "📋 Scanner Archive",
-        "🔬 Spread Gate",
-        "📁 Tickers",
-        "📰 Market News",
-        "📊 Volume",
-        "🧱 Gamma",
-        "📓 Journal",
-    ]
-
-
-def _journal_page_labels() -> list[str]:
-    if _streamlit_ge(1, 40):
-        return [
-            ":material/menu_book: Trade log",
-            ":material/fact_check: Pre-Trade Check",
-        ]
-    return ["📓 Trade log", "✅ Pre-Trade Check"]
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -930,196 +897,180 @@ def _ema_stack_banner(cfg: dict) -> None:
     show[0](text, icon=show[1])
 
 
-def _sidebar() -> dict:
+def _shell() -> dict:
+    """Left-hand menu and ticker bar. Returns the cfg every page receives."""
+    page = shell.render_menu(st, material_icons=_streamlit_ge(1, 40))
+
+    known_tickers = _discover_tickers()
+    picked = shell.stored_ticker(st, known_tickers)
+    latest = _latest_archive(picked)
+    status = None
+    if latest:
+        ts = datetime.fromisoformat(latest["timestamp"]).astimezone(ET)
+        status = (f"Last scan {ts.strftime('%Y-%m-%d %H:%M ET')} · "
+                  f"spot at run {latest.get('spot', '—')}")
+    focus_ticker = shell.render_ticker_bar(st, known_tickers, status=status)
+    if focus_ticker != picked:
+        latest = _latest_archive(focus_ticker)
+
     with st.sidebar:
-        st.title("📊 Options Scanner")
-        st.caption("Display layer — results from archive JSONs")
         st.divider()
-
-        # ── Ticker selector ───────────────────────────────────────────────
-        known_tickers = _discover_tickers()
-        default_idx   = known_tickers.index("AAPL") if "AAPL" in known_tickers else 0
-        focus_ticker  = st.selectbox(
-            "Focus ticker",
-            known_tickers,
-            index=default_idx,
-            help="All tabs show data for this ticker. Add new tickers in the Tickers tab.",
-        )
-
-        st.divider()
-
-        # ── Manual scan for focus ticker ──────────────────────────────────
-        st.markdown(f"**Daily scan — {focus_ticker}**")
-        run_scan = st.button(
-            f"🚀 Run Scan for {focus_ticker}",
-            use_container_width=True,
-            type="primary",
-            help=f"Runs dailyScaner.py {focus_ticker} and saves a new archive JSON",
-        )
-
-        if run_scan:
-            with st.spinner(f"Scanning {focus_ticker}… (may take a few minutes)"):
-                ok, output = _run_daily_scanner(focus_ticker)
-            if ok:
-                st.success(f"{focus_ticker} scan complete — archive updated.")
-                _scan_archive_metadata.clear()
-                stamp = _latest_archive_stamp(focus_ticker)
-                if stamp:
-                    st.session_state[f"_last_seen_archive_{focus_ticker}"] = stamp
-                st.rerun()
-            else:
-                st.error(f"{focus_ticker} scanner returned an error.")
-            with st.expander("Scanner output", expanded=not ok):
-                st.code(output[-4000:], language="text")
-
         # Auto-refresh when scheduler (or another process) writes a new archive
         _watch_archive_auto_refresh(focus_ticker)
 
-        # Auto-launch scheduler / telegram bot once per session (status alert is at page top)
-        _ensure_services()
-
-        st.divider()
-        st.subheader("Flow filters")
-        min_dte  = st.number_input("Min DTE", min_value=0, value=1, step=1)
-        top_n    = st.number_input(
-            "Top N results",
-            min_value=1,
-            max_value=30,
-            value=5,
-            step=1,
-            help="How many rows to show in Best Value and how many calls/puts in The Magnets",
-        )
-        sort_by  = _choice_control(
-            "Sort by",
-            ["Volume", "Premium $", "Strike"],
-            default="Volume",
-            key="flow_sort_by",
-        )
-
-        st.divider()
-        latest = _latest_archive(focus_ticker)
-        if latest:
-            ts = datetime.fromisoformat(latest["timestamp"]).astimezone(ET)
-            st.caption(f"Last archive: {ts.strftime('%Y-%m-%d %H:%M ET')}")
-            st.caption(f"Spot at run: ${latest.get('spot', '—')}")
-
-        # ── Telegram push ─────────────────────────────────────────────────
-        st.divider()
-        with st.expander("📨 Telegram", expanded=False):
-            tg_token, tg_chat = _load_telegram_config()
-            configured = bool(tg_token and tg_chat)
-            if configured:
-                st.success("@zeuseaibot connected ✓", icon="✅")
-            else:
-                st.warning("Not configured — add keys to `.env`")
-                st.code(
-                    "TELEGRAM_BOT_TOKEN=...\nTELEGRAM_CHAT_ID=...",
-                    language="text",
-                )
-
-            # ── Ticker selector ───────────────────────────────────────────
-            tg_tickers = _discover_tickers()
-            tg_default = tg_tickers.index(focus_ticker) if focus_ticker in tg_tickers else 0
-            tg_ticker  = st.selectbox(
-                "Ticker to send",
-                tg_tickers,
-                index=tg_default,
-                key="tg_ticker_sel",
-            )
-
-            # Load latest archive for selected ticker
-            tg_files = sorted(glob.glob(f"archive/{tg_ticker}_*.json"), reverse=True)
-            tg_payload: dict | None = None
-            tg_prev:    dict | None = None
-            if tg_files:
-                try:
-                    with open(tg_files[0]) as _f:
-                        tg_payload = json.load(_f)
-                except Exception:
-                    pass
-            if len(tg_files) >= 2:
-                try:
-                    with open(tg_files[1]) as _f:
-                        tg_prev = json.load(_f)
-                except Exception:
-                    pass
-
-            if tg_payload:
-                try:
-                    ts_str = datetime.fromisoformat(tg_payload["timestamp"]).astimezone(ET).strftime("%Y-%m-%d %H:%M ET")
-                except Exception:
-                    ts_str = "—"
-                st.caption(f"Latest: {ts_str} · Spot ${tg_payload.get('spot','—')}")
-
-            # ── Section toggles ───────────────────────────────────────────
-            st.caption("Sections to include:")
-            inc_session    = st.checkbox("Session (spot, Δ, open, prev close)", value=True,  key="tg_session")
-            inc_mtf        = st.checkbox("Multi-Timeframe Detail",               value=True,  key="tg_mtf")
-            inc_magnets    = st.checkbox(f"The Magnets — top {int(top_n)} calls/puts",  value=True,  key="tg_magnets")
-            inc_vol_exp    = st.checkbox("Volume by Expiry",                     value=True,  key="tg_volexp")
-            inc_orb        = st.checkbox("Opening Range Breakout",               value=True,  key="tg_orb")
-            inc_deltas     = st.checkbox("CALL Δ / PUT Δ vs previous run",       value=True,  key="tg_deltas")
-            inc_best_value = st.checkbox("⭐ Best Value Option",                  value=True,  key="tg_bestval")
-
-            # ── Expiry drill-down selector ────────────────────────────────
-            tg_expiries: list[str] = []
-            if tg_payload:
-                vol_block = tg_payload.get("volume") or {}
-                exp_set: set[str] = set()
-                for c in (vol_block.get("top_calls") or []) + (vol_block.get("top_puts") or []):
-                    if c.get("expiry"):
-                        exp_set.add(c["expiry"])
-                tg_expiries = sorted(exp_set)
-
-            selected_expiries: list[str] = []
-            if tg_expiries:
-                selected_expiries = st.multiselect(
-                    "Expiry drill-down (optional)",
-                    options=tg_expiries,
-                    default=[],
-                    help="Select one or more expiries to include top contracts in the message",
-                    key="tg_expiry_sel",
-                )
-
-            # ── Send button ───────────────────────────────────────────────
-            send_tg = st.button(
-                "📤 Send to Telegram",
-                use_container_width=True,
-                disabled=not configured or not tg_payload,
-                type="primary",
-                key="tg_send_btn",
-            )
-            if send_tg and configured and tg_payload:
-                msg = _format_scan_message(
-                    payload=tg_payload,
-                    prev_payload=tg_prev,
-                    ticker=tg_ticker,
-                    top_n=int(top_n),
-                    include={
-                        "session":       inc_session,
-                        "mtf":           inc_mtf,
-                        "magnets":       inc_magnets,
-                        "volume_expiry": inc_vol_exp,
-                        "orb":           inc_orb,
-                        "deltas":        inc_deltas,
-                        "best_value":    inc_best_value,
-                    },
-                    expiry_drill=selected_expiries or None,
-                )
-                ok, err = _send_telegram(tg_token, tg_chat, msg)
-                if ok:
-                    st.success("Sent ✈️")
-                else:
-                    st.error(f"Failed: {err}")
+    # Auto-launch scheduler / telegram bot once per session (status alert is at page top)
+    _ensure_services()
 
     return {
-        "run":            run_scan,
+        "page":           page,
+        "run":            False,
         "ticker":         focus_ticker,
-        "min_dte":        min_dte,
-        "top_n":          int(top_n),
-        "sort_by":        sort_by,
+        **shell.flow_settings(st),
         "latest_archive": latest,
     }
+
+
+def _render_settings(cfg: dict) -> None:
+    """Settings page: manual scan, flow filters, Telegram push (formerly the sidebar)."""
+    focus_ticker = cfg["ticker"]
+    st.subheader("Settings")
+
+    # ── Manual scan for focus ticker ──────────────────────────────────
+    st.markdown(f"**Daily scan — {focus_ticker}**")
+    run_scan = st.button(
+        f"🚀 Run Scan for {focus_ticker}",
+        use_container_width=True,
+        type="primary",
+        help=f"Runs dailyScaner.py {focus_ticker} and saves a new archive JSON",
+    )
+
+    if run_scan:
+        with st.spinner(f"Scanning {focus_ticker}… (may take a few minutes)"):
+            ok, output = _run_daily_scanner(focus_ticker)
+        if ok:
+            st.success(f"{focus_ticker} scan complete — archive updated.")
+            _scan_archive_metadata.clear()
+            stamp = _latest_archive_stamp(focus_ticker)
+            if stamp:
+                st.session_state[f"_last_seen_archive_{focus_ticker}"] = stamp
+            st.rerun()
+        else:
+            st.error(f"{focus_ticker} scanner returned an error.")
+        with st.expander("Scanner output", expanded=not ok):
+            st.code(output[-4000:], language="text")
+
+    st.divider()
+    st.markdown("**Flow filters**")
+    top_n = shell.render_flow_filters(st, _choice_control)["top_n"]
+
+    st.divider()
+    # ── Telegram push ─────────────────────────────────────────────────
+    with st.expander("📨 Telegram", expanded=False):
+        tg_token, tg_chat = _load_telegram_config()
+        configured = bool(tg_token and tg_chat)
+        if configured:
+            st.success("@zeuseaibot connected ✓", icon="✅")
+        else:
+            st.warning("Not configured — add keys to `.env`")
+            st.code(
+                "TELEGRAM_BOT_TOKEN=...\nTELEGRAM_CHAT_ID=...",
+                language="text",
+            )
+
+        # ── Ticker selector ───────────────────────────────────────────
+        tg_tickers = _discover_tickers()
+        tg_default = tg_tickers.index(focus_ticker) if focus_ticker in tg_tickers else 0
+        tg_ticker  = st.selectbox(
+            "Ticker to send",
+            tg_tickers,
+            index=tg_default,
+            key="tg_ticker_sel",
+        )
+
+        # Load latest archive for selected ticker
+        tg_files = sorted(glob.glob(f"archive/{tg_ticker}_*.json"), reverse=True)
+        tg_payload: dict | None = None
+        tg_prev:    dict | None = None
+        if tg_files:
+            try:
+                with open(tg_files[0]) as _f:
+                    tg_payload = json.load(_f)
+            except Exception:
+                pass
+        if len(tg_files) >= 2:
+            try:
+                with open(tg_files[1]) as _f:
+                    tg_prev = json.load(_f)
+            except Exception:
+                pass
+
+        if tg_payload:
+            try:
+                ts_str = datetime.fromisoformat(tg_payload["timestamp"]).astimezone(ET).strftime("%Y-%m-%d %H:%M ET")
+            except Exception:
+                ts_str = "—"
+            st.caption(f"Latest: {ts_str} · Spot ${tg_payload.get('spot','—')}")
+
+        # ── Section toggles ───────────────────────────────────────────
+        st.caption("Sections to include:")
+        inc_session    = st.checkbox("Session (spot, Δ, open, prev close)", value=True,  key="tg_session")
+        inc_mtf        = st.checkbox("Multi-Timeframe Detail",               value=True,  key="tg_mtf")
+        inc_magnets    = st.checkbox(f"The Magnets — top {int(top_n)} calls/puts",  value=True,  key="tg_magnets")
+        inc_vol_exp    = st.checkbox("Volume by Expiry",                     value=True,  key="tg_volexp")
+        inc_orb        = st.checkbox("Opening Range Breakout",               value=True,  key="tg_orb")
+        inc_deltas     = st.checkbox("CALL Δ / PUT Δ vs previous run",       value=True,  key="tg_deltas")
+        inc_best_value = st.checkbox("⭐ Best Value Option",                  value=True,  key="tg_bestval")
+
+        # ── Expiry drill-down selector ────────────────────────────────
+        tg_expiries: list[str] = []
+        if tg_payload:
+            vol_block = tg_payload.get("volume") or {}
+            exp_set: set[str] = set()
+            for c in (vol_block.get("top_calls") or []) + (vol_block.get("top_puts") or []):
+                if c.get("expiry"):
+                    exp_set.add(c["expiry"])
+            tg_expiries = sorted(exp_set)
+
+        selected_expiries: list[str] = []
+        if tg_expiries:
+            selected_expiries = st.multiselect(
+                "Expiry drill-down (optional)",
+                options=tg_expiries,
+                default=[],
+                help="Select one or more expiries to include top contracts in the message",
+                key="tg_expiry_sel",
+            )
+
+        # ── Send button ───────────────────────────────────────────────
+        send_tg = st.button(
+            "📤 Send to Telegram",
+            use_container_width=True,
+            disabled=not configured or not tg_payload,
+            type="primary",
+            key="tg_send_btn",
+        )
+        if send_tg and configured and tg_payload:
+            msg = _format_scan_message(
+                payload=tg_payload,
+                prev_payload=tg_prev,
+                ticker=tg_ticker,
+                top_n=int(top_n),
+                include={
+                    "session":       inc_session,
+                    "mtf":           inc_mtf,
+                    "magnets":       inc_magnets,
+                    "volume_expiry": inc_vol_exp,
+                    "orb":           inc_orb,
+                    "deltas":        inc_deltas,
+                    "best_value":    inc_best_value,
+                },
+                expiry_drill=selected_expiries or None,
+            )
+            ok, err = _send_telegram(tg_token, tg_chat, msg)
+            if ok:
+                st.success("Sent ✈️")
+            else:
+                st.error(f"Failed: {err}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3159,7 +3110,7 @@ def _render_best_value_table_with_plus(
             if cid and scan_id:
                 ref = pre_trade_check.candidate_ref(scan_id, cid)
                 pre_trade_check.set_candidate_query(st, ref)
-                # nav_main is a widget key — jump on the next run, before pills render
+                # jump on the next run: main() opens Pre-Trade Check for a new candidate
                 st.session_state.pop("ptc_nav_done_for", None)
                 st.rerun()
 
@@ -5854,85 +5805,82 @@ def _render_tab_journal() -> None:
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    cfg = _sidebar()
-
-    # Service-down alerts sit above tabs so they're visible on every page
-    _services_alert()
-    _ema_stack_banner(cfg)
-
-    labels = _main_tab_labels()
-    journal_label = labels[-1]
-    journal_pages = _journal_page_labels()
-    pretrade_label = journal_pages[1]
-
+def _open_pre_trade_if_requested() -> str | None:
+    """A candidate link or an archive prefill jumps to the Pre-Trade Check page."""
     cand = pre_trade_check.read_candidate_query(st)
     if cand and st.session_state.get("ptc_nav_done_for") != cand:
-        st.session_state["nav_main"] = journal_label
-        st.session_state["journal_subpage"] = pretrade_label
+        shell.go(st, "pretrade")
         st.session_state["ptc_nav_done_for"] = cand
 
     arch = st.session_state.get(pre_trade_check.ARCHIVE_PREFILL_KEY)
     arch_id = arch.get("id") if isinstance(arch, dict) else None
     if arch_id and st.session_state.get("ptc_nav_done_for") != arch_id:
-        st.session_state["nav_main"] = journal_label
-        st.session_state["journal_subpage"] = pretrade_label
+        shell.go(st, "pretrade")
         st.session_state["ptc_nav_done_for"] = arch_id
+    return cand
 
-    page = _choice_control("Page", labels, default=labels[0], key="nav_main")
 
-    if page == labels[0]:
+def _render_pre_trade(cfg: dict, cand: str | None) -> None:
+    latest = cfg.get("latest_archive") or {}
+    spot = latest.get("spot")
+    try:
+        spot_f = float(spot) if spot is not None else None
+    except (TypeError, ValueError):
+        spot_f = None
+    # Spot is a chart field — do not pass it when a candidate
+    # or archive prefill is loaded; archive sets underlying itself.
+    arch_pending = st.session_state.get(pre_trade_check.ARCHIVE_PREFILL_KEY)
+    ticker = str(cfg.get("ticker") or "")
+    vwap_info = _cached_vwap_state(ticker) if ticker else {}
+    weekly_payload = _latest_weekly_archive(ticker) if ticker else {}
+    pre_trade_check.render_pre_trade_page(
+        default_ticker=ticker,
+        default_spot=None if (cand or arch_pending) else spot_f,
+        or_data=(latest.get("or_data") or {}) if latest else {},
+        vwap=(vwap_info or {}).get("VWAP"),
+        emas={
+            "daily": (weekly_payload.get("daily") or {}),
+            "weekly": (weekly_payload.get("weekly") or {}),
+        },
+    )
+
+
+def main():
+    cand = _open_pre_trade_if_requested()      # before the menu, so it highlights correctly
+    cfg = _shell()
+
+    # Service-down alerts sit above the page so they're visible everywhere
+    _services_alert()
+    _ema_stack_banner(cfg)
+
+    page = cfg["page"]
+    latest = cfg.get("latest_archive") or {}
+    if page == "flow":
         _market_banner()
         _render_tab1(cfg)
-    elif page == labels[1]:
+    elif page == "archive":
         _market_banner()
         _render_tab2(cfg)
-    elif page == labels[2]:
+    elif page == "spread_gate":
         _market_banner()
         _render_tab3(cfg)
-    elif page == labels[3]:
+    elif page == "tickers":
         _render_tab4()
-    elif page == labels[4]:
+    elif page == "news":
         _render_tab5(cfg)
-    elif page == labels[5]:
-        _latest = cfg.get("latest_archive") or {}
+    elif page == "volume":
         volume_page.render_volume_page(
-            cfg["ticker"], tz=ET, spot=_latest.get("spot"),
-            scan_ts=_latest.get("timestamp"), greeks_fn=_bs_greeks,
+            cfg["ticker"], tz=ET, spot=latest.get("spot"),
+            scan_ts=latest.get("timestamp"), greeks_fn=_bs_greeks,
         )
-    elif page == labels[6]:
-        _latest = cfg.get("latest_archive") or {}
-        gex_page.render_gex_page(cfg["ticker"], tz=ET, spot=_latest.get("spot"))
-    else:
-        jpage = _choice_control(
-            "Journal page", journal_pages, default=journal_pages[0],
-            key="journal_subpage",
-        )
-        if jpage == journal_pages[0]:
-            _render_tab_journal()
-        else:
-            latest = cfg.get("latest_archive") or {}
-            spot = latest.get("spot")
-            try:
-                spot_f = float(spot) if spot is not None else None
-            except (TypeError, ValueError):
-                spot_f = None
-            # Sidebar spot is a chart field — do not pass it when a candidate
-            # or archive prefill is loaded; archive sets underlying itself.
-            arch_pending = st.session_state.get(pre_trade_check.ARCHIVE_PREFILL_KEY)
-            ticker = str(cfg.get("ticker") or "")
-            vwap_info = _cached_vwap_state(ticker) if ticker else {}
-            weekly_payload = _latest_weekly_archive(ticker) if ticker else {}
-            pre_trade_check.render_pre_trade_page(
-                default_ticker=ticker,
-                default_spot=None if (cand or arch_pending) else spot_f,
-                or_data=(latest.get("or_data") or {}) if latest else {},
-                vwap=(vwap_info or {}).get("VWAP"),
-                emas={
-                    "daily": (weekly_payload.get("daily") or {}),
-                    "weekly": (weekly_payload.get("weekly") or {}),
-                },
-            )
+    elif page == "gamma":
+        gex_page.render_gex_page(cfg["ticker"], tz=ET, spot=latest.get("spot"))
+    elif page == "journal":
+        _render_tab_journal()
+    elif page == "pretrade":
+        _render_pre_trade(cfg, cand)
+    elif page == "settings":
+        _render_settings(cfg)
 
 
 if __name__ == "__main__" or True:
