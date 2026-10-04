@@ -160,6 +160,18 @@ def test_indicator_toggles_add_and_remove_panels():
     assert full.layout.height > base.layout.height
 
 
+def test_legend_lists_only_the_price_overlays():
+    fig = pc.build_figure(pc.prepare(_bars(), "5M"), show_atr=True)
+    listed = [t.name for t in fig.data if t.showlegend is not False]
+    assert listed == ["EMA 9", "EMA 21", "EMA 50", "VWAP"]
+
+
+def test_participation_axis_has_no_tick_labels_to_collide_with_volume():
+    fig = pc.build_figure(pc.prepare(_bars(), "5M"))
+    hidden = [ax for ax in fig.select_yaxes() if ax.showticklabels is False]
+    assert len(hidden) == 1
+
+
 def test_an_ema_without_enough_bars_is_left_off_the_chart():
     one_day = _bars(sessions=("2026-10-02",), freq="15min")           # 26 bars
     fig = pc.build_figure(pc.prepare(one_day, "15M"), timeframe="15M")

@@ -96,27 +96,28 @@ def build_figure(df: pd.DataFrame, *, ticker: str = "", timeframe: str = DEFAULT
                 and df["Participation"].notna().any():
             ratio = df["Participation"]
             fig.add_trace(go.Scatter(
-                x=x, y=ratio, mode="lines", name="Participation ×",
+                x=x, y=ratio, mode="lines", name="Participation ×", showlegend=False,
                 line=dict(color="#B0BEC5", width=1.3),
                 hovertemplate="Participation %{y:.2f}×<extra></extra>",
             ), row=row["volume"], col=1, secondary_y=True)
             hot = ratio.where(ratio >= OVER_PARTICIPATION_THRESH)
             if hot.notna().any():
                 fig.add_trace(go.Scatter(
-                    x=x, y=hot, mode="markers", name=f"≥ {OVER_PARTICIPATION_THRESH:g}×",
+                    x=x, y=hot, mode="markers", name=f"≥ {OVER_PARTICIPATION_THRESH:g}×", showlegend=False,
                     marker=dict(color="#FF00FF", size=7),
                     hovertemplate="Over-participation %{y:.2f}×<extra></extra>",
                 ), row=row["volume"], col=1, secondary_y=True)
-            fig.update_yaxes(showgrid=False, rangemode="tozero", side="left",
-                             tickfont=dict(size=9, color="#78909C"),
+            # The ratio's own scale is not labelled (it collided with the volume ticks);
+            # hover shows the value and magenta dots mark the bars at or above the threshold.
+            fig.update_yaxes(showgrid=False, rangemode="tozero", showticklabels=False,
                              row=row["volume"], col=1, secondary_y=True)
 
     if show_stoch and {"StochK", "StochD"} <= set(df.columns):
-        fig.add_trace(go.Scatter(x=x, y=df["StochK"], mode="lines", name="Stoch %K",
+        fig.add_trace(go.Scatter(x=x, y=df["StochK"], mode="lines", name="Stoch %K", showlegend=False,
                                  line=dict(color="#42A5F5", width=1.3),
                                  hovertemplate="%K %{y:.1f}<extra></extra>"),
                       row=row["stoch"], col=1)
-        fig.add_trace(go.Scatter(x=x, y=df["StochD"], mode="lines", name="Stoch %D",
+        fig.add_trace(go.Scatter(x=x, y=df["StochD"], mode="lines", name="Stoch %D", showlegend=False,
                                  line=dict(color="#EC407A", width=1.3),
                                  hovertemplate="%D %{y:.1f}<extra></extra>"),
                       row=row["stoch"], col=1)
@@ -126,7 +127,7 @@ def build_figure(df: pd.DataFrame, *, ticker: str = "", timeframe: str = DEFAULT
         fig.update_yaxes(range=[0, 100], tickvals=[20, 50, 80], row=row["stoch"], col=1)
 
     if show_atr and "ATR" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df["ATR"], mode="lines", name="ATR 14",
+        fig.add_trace(go.Scatter(x=x, y=df["ATR"], mode="lines", name="ATR 14", showlegend=False,
                                  line=dict(color="#FFA726", width=1.3),
                                  hovertemplate="ATR %{y:.2f}<extra></extra>"),
                       row=row["atr"], col=1)
