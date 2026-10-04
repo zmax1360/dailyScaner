@@ -1120,8 +1120,8 @@ def _render_best_value_panel(
             "Ranks every contract by a composite score: "
             "**40% leverage efficiency** (delta × spot ÷ premium)  ·  "
             "**60% flow intensity** (VOL/OI × |ΔVol|).  "
-            f"Filters: Volume ≥ {min_vol_input:,} · Price > $0.01  ·  "
-            f"Showing top **{show_n}** (sidebar Flow filters)  ·  "
+            f"Filters: Volume ≥ {min_vol_input:,} · Price > \\$0.01  ·  "
+            f"Showing top **{show_n}** (Settings → Flow filters)  ·  "
             f"Velocity threshold ±{_SURGE_THRESH:.2f}"
             f"{note_s}"
         )
@@ -1490,26 +1490,7 @@ def _render_best_value_panel(
     # ── Summary callout (one star per DTE pool) ───────────────────────────────
     best = df[df["Status"].astype(str).str.contains("BEST VALUE", na=False)]
     if not best.empty:
-        from scoring_pool import POOL_0DTE, POOL_1DTE
-        lines = []
-        for pool_name in (POOL_1DTE, POOL_0DTE):
-            sub = best[best["pool"] == pool_name] if "pool" in best.columns else best
-            if sub.empty:
-                lines.append(f"⭐ **{pool_name}** — not ranked")
-                continue
-            b = sub.iloc[0]
-            voi = b["volume"] / max(int(b["openInterest"]), 1)
-            dte_s = (
-                f"{int(b['dte'])}d"
-                if "dte" in b.index and pd.notna(b.get("dte"))
-                else "?"
-            )
-            lines.append(
-                f"⭐ **{pool_name}** {b['side']} ${b['strike']:.1f} "
-                f"{b['expiry']} ({dte_s}) · score {b['Value_Score']:.2f} · "
-                f"${b['last']:.2f} · vol/OI {voi:.1f}x"
-            )
-        st.success("  \n".join(lines), icon="⭐")
+        st.success("  \n".join(_best_value_callout_lines(best)))
 
     # Charts sit below the scanner table/callout so the table layout stays untouched.
     _render_expiry_distribution_charts(vis_top5, spot)
@@ -2001,6 +1982,32 @@ def _render_0dte_top_strikes_expander(odte_info: dict | None) -> None:
         )
 
 
+def _best_value_callout_lines(best: pd.DataFrame) -> list[str]:
+    """One line per DTE pool for the Best Value callout. Dollar signs are escaped so
+    the strike and the premium on one line are not rendered as LaTeX math."""
+    from scoring_pool import POOL_0DTE, POOL_1DTE
+
+    lines = []
+    for pool_name in (POOL_1DTE, POOL_0DTE):
+        sub = best[best["pool"] == pool_name] if "pool" in best.columns else best
+        if sub.empty:
+            lines.append(f"⭐ **{pool_name}** — not ranked")
+            continue
+        b = sub.iloc[0]
+        voi = b["volume"] / max(int(b["openInterest"]), 1)
+        dte_s = (
+            f"{int(b['dte'])}d"
+            if "dte" in b.index and pd.notna(b.get("dte"))
+            else "?"
+        )
+        lines.append(
+            f"⭐ **{pool_name}** {b['side']} \\${b['strike']:.1f} "
+            f"{b['expiry']} ({dte_s}) · score {b['Value_Score']:.2f} · "
+            f"\\${b['last']:.2f} · vol/OI {voi:.1f}x"
+        )
+    return lines
+
+
 def _usd(v) -> str:
     """Dollar amount for st.caption / st.markdown text: the ``$`` is escaped so two
     amounts on one line are not rendered as LaTeX math."""
@@ -2219,20 +2226,21 @@ def render(cfg: dict):
                     f"{'above' if pov_info.get('above_vwap') else 'below/at'} VWAP"
                 )
 
-    # Same row: Volume Analysis | Multi-Timeframe | My Open Positions
-    sub_c1, sub_c2, sub_c3 = st.columns(3)
+    # Row 1: Volume Analysis | Multi-Timeframe
+    sub_c1, sub_c2 = st.columns([1, 1.4])
     with sub_c1:
         _render_volume_analysis(ticker, compact=True, vol_curr=vol)
     with sub_c2:
         _render_mtf_matrix(tfs, prev_tfs)
-    with sub_c3:
-        _render_portfolio_manager(
-            ticker, vol, spot, prev_vol,
-            daily_bias=(daily_bias_info or {}).get("daily_bias"),
-            market_state=(market_state_info or {}).get("market_state"),
-            news_bias=news_bias,
-            compact=True,
-        )
+
+    # Row 2: My Open Positions, full width
+    _render_portfolio_manager(
+        ticker, vol, spot, prev_vol,
+        daily_bias=(daily_bias_info or {}).get("daily_bias"),
+        market_state=(market_state_info or {}).get("market_state"),
+        news_bias=news_bias,
+        compact=True,
+    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # ZONE 3 — Catalyst (collapsed by default)

@@ -344,6 +344,43 @@ def test_dollar_amounts_in_captions_are_escaped():
     assert "${" not in strip and strip.count("_usd(") == 3
 
 
+def test_best_value_callout_escapes_dollars_and_has_one_star_per_line():
+    """Regression: '$335.0 ... $1.25' rendered as math, and the first line had two stars."""
+    import pandas as pd
+
+    from ui.pages import flow
+
+    best = pd.DataFrame([{"pool": "1DTE+", "side": "CALL", "strike": 335.0,
+                          "expiry": "2026-10-05", "dte": 1, "Value_Score": 0.21,
+                          "last": 1.25, "volume": 35463, "openInterest": 2851}])
+    lines = flow._best_value_callout_lines(best)
+    assert lines == [
+        r"⭐ **1DTE+** CALL \$335.0 2026-10-05 (1d) · score 0.21 · \$1.25 · vol/OI 12.4x",
+        "⭐ **0DTE** — not ranked",
+    ]
+    assert all(line.count("⭐") == 1 for line in lines)
+    src = (ROOT / "ui" / "pages" / "flow.py").read_text()
+    assert 'icon="⭐"' not in src                      # the icon doubled the first star
+
+
+def test_best_value_caption_has_no_bare_dollar_and_points_at_settings():
+    src = (ROOT / "ui" / "pages" / "flow.py").read_text()
+    cap = src[src.index('"Ranks every contract by a composite score: "'):
+              src.index('f"Velocity threshold')]
+    assert "Price > \\\\$0.01" in cap
+    assert "sidebar" not in cap and "Settings → Flow filters" in cap
+
+
+def test_open_positions_has_its_own_row_below_volume_and_timeframes():
+    src = (ROOT / "ui" / "pages" / "flow.py").read_text()
+    block = src[src.index("# Row 1: Volume Analysis | Multi-Timeframe"):
+                src.index("# ZONE 3 — Catalyst")]
+    row1, row2 = block.split("# Row 2: My Open Positions, full width")
+    assert "st.columns([1, 1.4])" in row1
+    assert "_render_volume_analysis(" in row1 and "_render_mtf_matrix(" in row1
+    assert "_render_portfolio_manager(" in row2 and "with sub_c" not in row2
+
+
 def test_direction_card_says_what_it_measures():
     src = (ROOT / "ui" / "pages" / "flow.py").read_text()
     assert "Scanner direction · multi-timeframe score" in src
