@@ -32,6 +32,7 @@ def _latest(rows):
 
 
 def _table(rows, **kw):
+    kw.setdefault("iv_source", gex.IV_VENDOR)      # formula tests pin the vendor IV
     return gex.gex_table(_latest(rows), spot=SPOT, as_of=kw.pop("as_of", AS_OF), **kw)
 
 
@@ -148,7 +149,13 @@ def _quoted(side, strike, expiry, oi, *, vendor_iv, true_iv):
     return row
 
 
-def test_vendor_iv_is_the_default_and_ignores_quotes():
+def test_quote_iv_is_the_default():
+    row = _quoted("CALL", 335.0, MONDAY, 2000, vendor_iv=0.15, true_iv=0.30)
+    t = gex.gex_table(_latest([row]), spot=SPOT, as_of=AS_OF)
+    assert bool(t.loc[0, "iv_from_quote"])
+
+
+def test_vendor_mode_ignores_quotes():
     t = _table([_quoted("CALL", 335.0, MONDAY, 2000, vendor_iv=0.15, true_iv=0.30)])
     assert t.loc[0, "iv"] == 0.15 and not t.loc[0, "iv_from_quote"]
 
@@ -164,9 +171,24 @@ def test_quote_iv_recovers_the_market_iv_and_changes_gamma():
     assert gex.coverage(quote)["iv_from_quote"] == 1
 
 
+def test_unquoted_strike_keeps_vendor_iv_and_never_borrows_from_neighbours():
+    """Regression: neighbour IV overstated far-wing gamma several-fold (352.5 / 350)."""
+    unquoted = _c("CALL", 350.0, MONDAY, 1000, iv=0.22)
+    unquoted.update(bid=0.0, ask=0.05)                       # no bid: not a usable quote
+    rows = [
+        _quoted("CALL", 347.5, MONDAY, 1000, vendor_iv=0.10, true_iv=0.34),
+        unquoted,
+        _quoted("CALL", 355.0, MONDAY, 1000, vendor_iv=0.10, true_iv=0.90),   # penny wing
+    ]
+    t = _table(rows, iv_source=gex.IV_QUOTE).set_index("strike")
+    assert t.loc[350.0, "iv"] == 0.22 and not t.loc[350.0, "iv_from_quote"]
+    assert t.loc[350.0, "gex"] == pytest.approx(
+        _gamma(350.0, MONDAY, iv=0.22) * 1000 * 100 * SPOT)
+
+
 @pytest.mark.parametrize("bid, ask", [(None, None), (0.0, 1.0), (1.2, 1.0),
                                       (SPOT + 1.0, SPOT + 2.0)])     # last: no IV fits
-def test_quote_iv_falls_back_to_vendor_without_a_usable_quote(bid, ask):
+def test_quote_mode_falls_back_to_vendor_without_a_usable_quote(bid, ask):
     row = _c("CALL", 335.0, MONDAY, 2000, iv=0.25)
     row.update(bid=bid, ask=ask)
     t = _table([row], iv_source=gex.IV_QUOTE)
@@ -386,7 +408,15 @@ def test_page_unit_toggle_rescales_by_spot_over_100(seeded):
 
 def test_page_iv_source_toggle(seeded):
     at = _run(seeded)
-    assert not any("IV from quotes" in c.value for c in at.caption)
-    at.radio(key="gex_iv_source").set_value("From quotes").run()
+    assert any("IV from quotes on" in c.value for c in at.caption)        # the default
+    at.radio(key="gex_iv_source").set_value("Vendor").run()
     assert not at.exception
-    assert any("IV from quotes on" in c.value for c in at.caption)
+    assert not any("IV from quotes" in c.value for c in at.caption)
+
+
+def test_page_caption_escapes_dollar_signs(seeded):
+    """Regression: two bare $ in the caption rendered as LaTeX math."""
+    at = _run(seeded)
+    cap = next(c.value for c in at.caption if "Snapshot" in c.value)
+    assert "dollars of dealer hedging per \\$1 move" in cap
+    assert cap.count("$") == cap.count("\\$")

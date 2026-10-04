@@ -79,7 +79,7 @@ def gex_table(
     as_of: datetime,
     unit: str = UNIT_DOLLAR,
     today: date | None = None,
-    iv_source: str = IV_VENDOR,
+    iv_source: str = IV_QUOTE,
 ) -> pd.DataFrame:
     """One row per contract with its gamma and signed dollar GEX.
 
@@ -87,9 +87,11 @@ def gex_table(
     expired at ``as_of`` are dropped, and so are expiries before ``today`` (so a
     snapshot viewed on a later day does not show dead expiries).
 
-    ``iv_source`` "quote" solves IV from the bid/ask mid with the exact time to
-    expiry, and falls back to the vendor IV when there is no usable two-sided
-    quote or no IV reproduces the mid.
+    ``iv_source`` "quote" solves IV from each contract's bid/ask mid with the exact
+    time to expiry, and keeps the vendor IV when there is no usable two-sided quote
+    or no IV reproduces the mid. (Borrowing IV from neighbouring strikes was tried
+    and removed: penny quotes in the far wings solve to inflated IVs, and spreading
+    those to unquoted strikes overstated wing gamma several-fold.)
     """
     if unit not in (UNIT_DOLLAR, UNIT_PCT):
         raise ValueError(f"unknown unit {unit!r}")
@@ -103,7 +105,8 @@ def gex_table(
     snap_day = as_of.astimezone(ET).date()
     scale = s if unit == UNIT_DOLLAR else s * s * MOVE_PCT
 
-    rows = []
+    # pass 1: parse, and (quote mode) solve IV from each contract's own mid
+    parsed = []
     for rec in latest.to_dict(orient="records"):
         side = str(rec.get("side") or "").upper()
         strike = _f(rec.get("strike"))
@@ -113,15 +116,23 @@ def gex_table(
             continue
         if today is not None and date.fromisoformat(expiry) < today:
             continue
-        oi = _f(rec.get("open_interest"))
-        iv = _f(rec.get("iv"))
-        from_quote = False
+        solved = None
         if iv_source == IV_QUOTE:
             bid, ask = _f(rec.get("bid")), _f(rec.get("ask"))
             if bid is not None and ask is not None and bid > 0 and ask >= bid:
-                solved = implied_vol(side, s, strike, t * 365.0, 0.5 * (bid + ask), r=r)
-                if solved is not None and solved >= min_iv:
-                    iv, from_quote = solved, True
+                v = implied_vol(side, s, strike, t * 365.0, 0.5 * (bid + ask), r=r)
+                if v is not None and v >= min_iv:
+                    solved = v
+        parsed.append({"side": side, "strike": strike, "expiry": expiry, "t": t,
+                       "oi": _f(rec.get("open_interest")), "vendor_iv": _f(rec.get("iv")),
+                       "solved": solved})
+
+    rows = []
+    for p in parsed:
+        side, strike, expiry, t, oi = p["side"], p["strike"], p["expiry"], p["t"], p["oi"]
+        iv, from_quote = p["vendor_iv"], False
+        if p["solved"] is not None:
+            iv, from_quote = p["solved"], True
         gamma = None
         if iv is not None and iv >= min_iv:
             gamma = bs_gamma(s, strike, iv, t_years=t, r=r)
