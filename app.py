@@ -29,9 +29,8 @@ import gex_page
 import volume_page
 from ui import shell
 from ui.components import REGISTRY as COMPONENTS
-from ui.components import cost_distribution, expiry_breakdown, flow_magnets
 from ui.components.cost_distribution import cached_cost_distribution as _cached_cost_distribution
-from ui.context import ScanContext, load_scan_context
+from ui.context import load_scan_context
 import snapshot_store as ss
 from spread_gate import evaluate_spread_gate
 from dailyScaner import market_is_open, proximity_filter, MIN_OI_FOR_MAGNET
@@ -3423,24 +3422,8 @@ def _render_tab1(cfg: dict):
     # 0DTE reflexivity — top strikes MM exposure
     _render_0dte_top_strikes_expander(odte_info)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ZONE 5 — Analytics (Magnets + Expiration + Cost Distribution)
-    # ══════════════════════════════════════════════════════════════════════════
-    tab_magnets, tab_expiry, tab_cost = st.tabs([
-        "🧲 Flow Magnets",
-        "📅 Expiration Breakdown",
-        "📊 Cost Distribution",
-    ])
-
-    _ctx = ScanContext(ticker=ticker, curr=curr, prev=prev, top_n=int(top_n))
-    with tab_magnets:
-        flow_magnets.render(_ctx)
-
-    with tab_expiry:
-        expiry_breakdown.render(_ctx)
-
-    with tab_cost:
-        cost_distribution.render(_ctx, cost_info)
+    # Flow Magnets, Expiration Breakdown and Cost Distribution are their own menu
+    # pages now (ui/components); they are no longer repeated here.
 
     # ══ Collapsible detail sections ═══════════════════════════════════════════
     if prev:

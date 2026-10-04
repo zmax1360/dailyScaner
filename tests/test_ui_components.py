@@ -213,3 +213,13 @@ def test_scan_context_is_immutable():
     ctx = ScanContext(ticker="AAPL", curr={"spot": 333.0})
     with pytest.raises(Exception):
         ctx.ticker = "NVDA"
+
+
+def test_options_flow_does_not_repeat_the_component_pages():
+    """They are menu pages; Options Flow no longer embeds them in tabs."""
+    src = (ROOT / "app.py").read_text()
+    tree = ast.parse(src)
+    tab1 = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_render_tab1")
+    body = ast.get_source_segment(src, tab1)
+    for name in ("flow_magnets", "expiry_breakdown", "cost_distribution.render", "st.tabs("):
+        assert name not in body, name
