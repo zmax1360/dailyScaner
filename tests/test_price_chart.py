@@ -203,30 +203,30 @@ import pandas as pd
 from tests.test_price_chart import _bars
 from ui.components import price_chart as pc
 from ui.context import ScanContext
-pc._cached_bars = lambda ticker, timeframe: {bars}
-pc.render(ScanContext(ticker="AAPL", curr={{"spot": 333.0}}))
+pc.render(ScanContext(ticker="AAPL", curr={"spot": 333.0}))
 """
 
 
-def _run(bars="_bars()"):
+def _run(monkeypatch, bars):
     from streamlit.testing.v1 import AppTest
 
-    at = AppTest.from_string(_SCRIPT.format(bars=bars), default_timeout=30).run()
+    monkeypatch.setattr(pc, "_cached_bars", lambda ticker, timeframe: bars)
+    at = AppTest.from_string(_SCRIPT, default_timeout=30).run()
     assert not at.exception, at.exception
     return at
 
 
-def test_component_renders_with_a_last_bar_read_out():
-    at = _run()
+def test_component_renders_with_a_last_bar_read_out(monkeypatch):
+    at = _run(monkeypatch, _bars())
     cap = next(c.value for c in at.caption if c.value.startswith("Last bar:"))
     for want in ("EMA 9", "EMA 21", "EMA 50", "VWAP", "Stoch", "ATR"):
         assert want in cap
     assert {c.key for c in at.checkbox} == {"chart_stoch", "chart_atr", "chart_participation"}
 
 
-def test_component_renders_with_timezone_naive_bars():
+def test_component_renders_with_timezone_naive_bars(monkeypatch):
     """Regression: real bars from the Yahoo source have no timezone."""
-    at = _run(bars="_bars().tz_localize(None)")
+    at = _run(monkeypatch, _bars().tz_localize(None))
     assert any(c.value.startswith("Last bar:") for c in at.caption)
 
 
@@ -240,8 +240,8 @@ def test_prepare_handles_timezone_naive_bars_on_every_timeframe():
         assert len(pc.build_figure(shown, timeframe=tf).data) > 0, tf
 
 
-def test_component_reports_unavailable_data():
-    at = _run(bars="pd.DataFrame()")
+def test_component_reports_unavailable_data(monkeypatch):
+    at = _run(monkeypatch, pd.DataFrame())
     assert any("chart unavailable" in c.value for c in at.caption)
 
 

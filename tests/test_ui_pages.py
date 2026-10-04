@@ -34,9 +34,15 @@ def _run(script: str):
 
 _NEWS = """
 from ui.pages import news
-news._cached_market_news = lambda tickers, limit=15: {articles!r}
 news.render({cfg!r})
 """
+
+
+def _news(monkeypatch, articles, cfg):
+    from ui.pages import news
+
+    monkeypatch.setattr(news, "_cached_market_news", lambda tickers, limit=15: articles)
+    return _run(_NEWS.format(cfg=cfg))
 
 _ARTICLES = [
     {"headline": "Apple <b>beats</b> estimates", "url": "https://example.com/a",
@@ -46,34 +52,35 @@ _ARTICLES = [
 ]
 
 
-def test_news_renders_headlines_for_the_selected_ticker():
-    at = _run(_NEWS.format(articles=_ARTICLES, cfg={"ticker": "aapl"}))
+def test_news_renders_headlines_for_the_selected_ticker(monkeypatch):
+    at = _news(monkeypatch, _ARTICLES, {"ticker": "aapl"})
     text = " ".join(m.value for m in at.markdown)
     assert "Latest 2 headlines — AAPL" in text
     assert "Apple &lt;b&gt;beats&lt;/b&gt; estimates" in text      # HTML is escaped
     assert "BULLISH" in text and "BEARISH" in text
 
 
-def test_news_empty_states():
-    at = _run(_NEWS.format(articles=[], cfg={"ticker": "AAPL"}))
+def test_news_empty_states(monkeypatch):
+    at = _news(monkeypatch, [], {"ticker": "AAPL"})
     assert any("No headlines found for AAPL" in i.value for i in at.info)
-    at = _run(_NEWS.format(articles=_ARTICLES, cfg={"ticker": ""}))
+    at = _news(monkeypatch, _ARTICLES, {"ticker": ""})
     assert any("Pick a ticker" in i.value for i in at.info)
 
 
 # ── Spread Gate ─────────────────────────────────────────────────────────────
 
 _GATE = """
-import snapshot_store
-snapshot_store.load_gate_history = lambda: []
-snapshot_store.save_gate_history = lambda history: None
 from ui.pages import spread_gate
 spread_gate.render({cfg!r})
 """
 
 
 @pytest.mark.parametrize("latest, spot", [({"spot": 333.69}, 333.69), (None, 200.0)])
-def test_spread_gate_form_prefills_spot_from_the_latest_archive(latest, spot):
+def test_spread_gate_form_prefills_spot_from_the_latest_archive(latest, spot, monkeypatch):
+    import snapshot_store
+
+    monkeypatch.setattr(snapshot_store, "load_gate_history", lambda: [])
+    monkeypatch.setattr(snapshot_store, "save_gate_history", lambda history: None)
     at = _run(_GATE.format(cfg={"ticker": "AAPL", "latest_archive": latest}))
     assert any("Spread Gate Evaluator" in h.value for h in at.header)
     spot_input = next(n for n in at.number_input if n.label == "Spot ($)")
@@ -83,41 +90,46 @@ def test_spread_gate_form_prefills_spot_from_the_latest_archive(latest, spot):
 # ── Journal ─────────────────────────────────────────────────────────────────
 
 _JOURNAL = """
-import scanner.journal_io as jio
-jio.JOURNAL_DIR = {journal_dir!r}
 from ui.pages import journal
 journal.render()
 """
 
 
-def test_journal_renders_without_any_journal_files(tmp_path):
-    _run(_JOURNAL.format(journal_dir=str(tmp_path / "empty")))
+def _journal(monkeypatch, journal_dir):
+    import scanner.journal_io as jio
+
+    monkeypatch.setattr(jio, "JOURNAL_DIR", str(journal_dir))
+    return _run(_JOURNAL)
 
 
-def test_journal_renders_the_golden_journal():
-    at = _run(_JOURNAL.format(journal_dir=str(ROOT / "tests" / "golden" / "journal")))
+def test_journal_renders_without_any_journal_files(tmp_path, monkeypatch):
+    _journal(monkeypatch, tmp_path / "empty")
+
+
+def test_journal_renders_the_golden_journal(monkeypatch):
+    at = _journal(monkeypatch, ROOT / "tests" / "golden" / "journal")
     assert len(at.error) == 0, [e.value for e in at.error]
 
 
 # ── Tickers ─────────────────────────────────────────────────────────────────
 
 _TICKERS = """
-import ui.services as svc
 from ui.pages import tickers
-svc._EXCLUDED_FILE = tickers._EXCLUDED_FILE = {excluded!r}
-tickers._SCHED_CFG_FILE = {sched!r}
 tickers.render()
 """
 
 
 def test_tickers_page_renders_with_and_without_archives(tmp_path, monkeypatch):
+    from ui.pages import tickers
+
     monkeypatch.chdir(tmp_path)
-    script = _TICKERS.format(excluded=str(tmp_path / "excluded.json"),
-                             sched=str(tmp_path / "sched.json"))
-    _run(script)                                             # nothing scanned yet
+    for mod in (svc, tickers):                    # never the real exclusion / schedule files
+        monkeypatch.setattr(mod, "_EXCLUDED_FILE", str(tmp_path / "excluded.json"))
+    monkeypatch.setattr(tickers, "_SCHED_CFG_FILE", str(tmp_path / "sched.json"))
+    _run(_TICKERS)                                           # nothing scanned yet
     (tmp_path / "archive").mkdir()
     shutil.copy(GOLDEN / CURR, tmp_path / "archive" / CURR)
-    _run(script)
+    _run(_TICKERS)
     assert not (tmp_path / "excluded.json").exists()         # rendering writes nothing
     assert not (tmp_path / "sched.json").exists()
 
@@ -182,8 +194,6 @@ def test_display_greeks_are_sane_and_obey_put_call_parity():
 # ── Settings and Telegram push ──────────────────────────────────────────────
 
 _SETTINGS = """
-import ui.telegram_push as tg
-tg._ENV_FILE = {env!r}
 from ui.pages import settings
 settings.render({cfg!r})
 """
@@ -193,11 +203,17 @@ def test_settings_page_shows_scan_filters_and_telegram(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)                     # no archives, no real .env
     cfg = {"ticker": "AAPL", "top_n": 5, "min_dte": 1, "sort_by": "Volume",
            "latest_archive": None}
-    at = _run(_SETTINGS.format(env=str(tmp_path / "absent.env"), cfg=cfg))
+    import ui.settings_store as settings_store
+    import ui.telegram_push as tg
+
+    monkeypatch.setattr(tg, "_ENV_FILE", str(tmp_path / "absent.env"))
+    monkeypatch.setattr(settings_store, "PATH", str(tmp_path / "ui_settings.json"))
+    at = _run(_SETTINGS.format(cfg=cfg))
     assert any("Run Scan for AAPL" in b.label for b in at.button)
     assert {n.key for n in at.number_input} == {"w_min_dte", "w_top_n"}
     assert any("Not configured" in w.value for w in at.warning)
     assert any("Gamma exposure" in c.label for c in at.checkbox)
+    assert [t.label for t in at.toggle] == ["Show all ranked contracts"]
     send = next(b for b in at.button if "Send to Telegram" in b.label)
     assert send.disabled                            # nothing to send, nowhere to send it
 
@@ -398,21 +414,27 @@ def test_market_clock_is_timezone_aware_eastern():
 
 _BANNER = """
 import ui.market as market
-market._market_is_closed = lambda: {closed!r}
 market.render_market_banner()
 """
 
 
-def test_market_closed_banner_shows_a_single_red_circle():
+def _banner(monkeypatch, closed):
+    import ui.market as market
+
+    monkeypatch.setattr(market, "_market_is_closed", lambda: closed)
+    return _run(_BANNER)
+
+
+def test_market_closed_banner_shows_a_single_red_circle(monkeypatch):
     """Regression: the icon and the text each carried a red circle."""
-    at = _run(_BANNER.format(closed=True))
+    at = _banner(monkeypatch, True)
     assert len(at.error) == 1
     assert at.error[0].icon == "🔴"
     assert "🔴" not in at.error[0].value and "MARKET CLOSED" in at.error[0].value
 
 
-def test_market_banner_is_absent_while_the_market_is_open():
-    assert len(_run(_BANNER.format(closed=False)).error) == 0
+def test_market_banner_is_absent_while_the_market_is_open(monkeypatch):
+    assert len(_banner(monkeypatch, False).error) == 0
 
 
 def test_dollar_amounts_in_captions_are_escaped():
@@ -534,6 +556,13 @@ def test_best_value_page_draws_only_the_best_value_section(monkeypatch):
     monkeypatch.setattr(flow, "render", lambda cfg, sections=None: seen.update(s=sections))
     flow.render_best_value({"ticker": "AAPL"})
     assert seen["s"] == frozenset({"best_value"})
+
+
+def test_best_value_reads_show_all_from_settings_not_a_page_toggle():
+    src = (ROOT / "ui" / "pages" / "flow.py").read_text()
+    assert "st.toggle(" not in src
+    assert 'shell.setting(st, "show_all_ranked")' in src
+    assert "show them all in Settings" in src
 
 
 def test_direction_card_says_what_it_measures():

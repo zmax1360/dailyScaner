@@ -6,7 +6,7 @@ from datetime import datetime
 import glob
 import json
 
-from ui import shell
+from ui import settings_store, shell
 from ui.archives import _latest_archive_stamp
 from ui.services import _discover_tickers
 from ui.services import _run_daily_scanner
@@ -52,6 +52,13 @@ def render(cfg: dict) -> None:
     st.divider()
     st.markdown("**Flow filters**")
     top_n = shell.render_flow_filters(st, _choice_control)["top_n"]
+
+    st.divider()
+    st.markdown("**Best Value**")
+    shell.render_best_value_settings(st)
+
+    shell.save_if_changed(st, settings_store.save)
+    st.caption("Settings are saved automatically and restored the next time the app starts.")
 
     st.divider()
     # ── Telegram push ─────────────────────────────────────────────────

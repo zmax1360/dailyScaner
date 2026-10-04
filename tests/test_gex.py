@@ -346,7 +346,6 @@ _SCRIPT = """
 import streamlit as st, volume_history as vh, gex_page
 from datetime import date
 from zoneinfo import ZoneInfo
-vh.DB_PATH = {db!r}
 gex_page.render_gex_page('AAPL', tz=ZoneInfo('America/New_York'), spot={spot!r},
                          today=date(2026, 10, 3))
 """
@@ -359,9 +358,11 @@ def _leg(rows):
 
 
 @pytest.fixture
-def seeded(tmp_path):
-    """Friday's end-of-day snapshot, viewed on Saturday (the reported case)."""
+def seeded(tmp_path, monkeypatch):
+    """Friday's end-of-day snapshot, viewed on Saturday (the reported case). The page
+    reads it through volume_history.DB_PATH, patched for this test only."""
     db = str(tmp_path / "vh.db")
+    monkeypatch.setattr(vh, "DB_PATH", db)
     calls = _leg([(335.0, 0.01, 5000, 9000, 0.30, 0.01, 0.02, TODAY),      # expired
                   (335.0, 1.2, 5000, 9000, 0.30, 1.15, 1.25, MONDAY),
                   (332.5, 2.4, 4000, 3000, 0.30, 2.35, 2.45, MONDAY),
@@ -374,16 +375,17 @@ def seeded(tmp_path):
     return db
 
 
-def _run(db, spot=SPOT):
+def _run(spot=SPOT):
     from streamlit.testing.v1 import AppTest
 
-    at = AppTest.from_string(_SCRIPT.format(db=db, spot=spot)).run()
+    at = AppTest.from_string(_SCRIPT.format(spot=spot)).run()
     assert not at.exception, at.exception
     return at
 
 
-def test_page_empty_state_without_a_snapshot(tmp_path):
-    at = _run(str(tmp_path / "none.db"))
+def test_page_empty_state_without_a_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(vh, "DB_PATH", str(tmp_path / "none.db"))
+    at = _run()
     assert any("No chain snapshot" in i.value for i in at.info)
 
 
@@ -446,13 +448,13 @@ def _view(db, **kw):
 
 
 def test_page_refuses_without_spot(seeded):
-    at = _run(seeded, spot=None)
+    at = _run(spot=None)
     assert any("No spot price" in i.value for i in at.info)
     assert not any("<table" in m.value for m in at.markdown)
 
 
 def test_page_default_view_is_current_week_without_the_dead_expiry(seeded):
-    at = _run(seeded)
+    at = _run()
     shown = _map(at)
     assert shown.columns == ["Oct 5", "Oct 9"]                # no Oct 2, no later week
     labels = list(shown.rows)
@@ -467,11 +469,11 @@ def test_page_default_view_is_current_week_without_the_dead_expiry(seeded):
 
 def test_map_values_are_centred_in_their_cells(seeded):
     """The request: numbers in the middle of the cell, not pushed left or right."""
-    shown = _map(_run(seeded))
+    shown = _map(_run())
     css = shown.styles.replace(" ", "")
     assert "#T_gextd{text-align:center;" in css
     assert "#T_gexth{text-align:center;" in css
-    assert len(_run(seeded).dataframe) == 0                   # no right-aligning grid widget
+    assert len(_run().dataframe) == 0                   # no right-aligning grid widget
 
 
 def test_map_html_is_safe_for_markdown_and_keeps_wall_colours(seeded):
@@ -484,7 +486,7 @@ def test_map_html_is_safe_for_markdown_and_keeps_wall_colours(seeded):
 
 
 def test_page_expiration_filter(seeded):
-    at = _run(seeded)
+    at = _run()
     at.radio(key="gex_exp_mode").set_value(gex_page.EXP_CURRENT).run()
     assert _map(at).columns == ["Oct 5"]
     at.radio(key="gex_exp_mode").set_value(gex_page.EXP_ALL).run()
@@ -496,7 +498,7 @@ def test_page_expiration_filter(seeded):
 
 
 def test_page_strike_count_filter(seeded):
-    at = _run(seeded)
+    at = _run()
     at.radio(key="gex_exp_mode").set_value(gex_page.EXP_ALL).run()
     assert len(_map(at).rows) - 1 == 5                          # minus the NET row
     at.radio(key="gex_strikes").set_value("All").run()
@@ -523,7 +525,7 @@ def test_view_units_rescale_the_same_map(seeded):
 
 
 def test_page_unit_toggle_redraws_the_map(seeded):
-    at = _run(seeded)
+    at = _run()
     before = _map(at).rows[gex_page.NET_LABEL]
     at.radio(key="gex_unit").set_value("Dollars per 1%").run()
     assert not at.exception
@@ -531,7 +533,7 @@ def test_page_unit_toggle_redraws_the_map(seeded):
 
 
 def test_page_iv_source_toggle(seeded):
-    at = _run(seeded)
+    at = _run()
     assert any("IV from quotes on" in c.value for c in at.caption)        # the default
     at.radio(key="gex_iv_source").set_value("Vendor").run()
     assert not at.exception
@@ -540,14 +542,14 @@ def test_page_iv_source_toggle(seeded):
 
 def test_page_caption_escapes_dollar_signs(seeded):
     """Regression: two bare $ in the caption rendered as LaTeX math."""
-    at = _run(seeded)
+    at = _run()
     cap = next(c.value for c in at.caption if "Snapshot" in c.value)
     assert "dollars of dealer hedging per \\$1 move" in cap
     assert cap.count("$") == cap.count("\\$")
 
 
 def test_page_shares_unit_relabels_the_net_row_and_caption(seeded):
-    at = _run(seeded)
+    at = _run()
     at.radio(key="gex_unit").set_value("Shares per $1").run()
     assert not at.exception
     assert list(_map(at).rows)[-1] == "NET sh"

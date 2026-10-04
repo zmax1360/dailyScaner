@@ -222,3 +222,96 @@ def test_sidebar_holds_only_the_menu_and_the_scan_watcher():
     assert "shell.render_menu(" in src and "shell.render_ticker_bar(" in src
     for widget in ("number_input", "st.button(", "checkbox", "multiselect"):
         assert widget not in src, f"{widget} must live on a page, not in the shell"
+
+
+# ── settings saved to disk ──────────────────────────────────────────────────
+
+class _FakeSt:
+    def __init__(self, **state):
+        self.session_state = dict(state)
+
+
+def test_clean_keeps_valid_settings_and_drops_everything_else():
+    good = {"min_dte": 3, "top_n": 9, "sort_by": "Strike", "show_all_ranked": True}
+    assert shell.clean(good) == good
+    assert shell.clean({"min_dte": -1, "top_n": 31, "sort_by": "Nope",
+                        "show_all_ranked": "yes", "unknown": 1}) == {}
+    assert shell.clean({"min_dte": True, "top_n": 2.5}) == {}        # bool / float are not ints
+    assert shell.clean(None) == {} and shell.clean({}) == {}
+
+
+def test_hydrate_loads_once_and_never_overrides_the_session():
+    st = _FakeSt(cfg_top_n=7)
+    shell.hydrate(st, {"top_n": 9, "show_all_ranked": True, "sort_by": "Bad"})
+    assert shell.setting(st, "top_n") == 7                           # session value wins
+    assert shell.setting(st, "show_all_ranked") is True
+    assert shell.setting(st, "sort_by") == "Volume"                  # invalid -> default
+    shell.hydrate(st, {"show_all_ranked": False})                    # second call is a no-op
+    assert shell.setting(st, "show_all_ranked") is True
+
+
+def test_save_if_changed_writes_only_on_a_real_change():
+    st = _FakeSt()
+    shell.hydrate(st, {})
+    writes = []
+    assert shell.save_if_changed(st, writes.append) is False         # nothing changed
+    st.session_state["cfg_show_all_ranked"] = True
+    assert shell.save_if_changed(st, writes.append) is True
+    assert shell.save_if_changed(st, writes.append) is False
+    assert writes == [{"min_dte": 1, "top_n": 5, "sort_by": "Volume",
+                       "show_all_ranked": True}]
+
+
+def test_settings_file_round_trip_and_bad_files(tmp_path):
+    from ui import settings_store
+
+    path = str(tmp_path / "data" / "ui_settings.json")              # folder does not exist yet
+    assert settings_store.load(path) == {}
+    settings_store.save({"top_n": 9, "show_all_ranked": True}, path)
+    assert settings_store.load(path) == {"top_n": 9, "show_all_ranked": True}
+    assert sorted(p.name for p in (tmp_path / "data").iterdir()
+                  if not p.name.endswith(".lock")) == ["ui_settings.json"]   # no temp files left
+    (tmp_path / "data" / "ui_settings.json").write_text("{broken")
+    assert settings_store.load(path) == {}
+    (tmp_path / "data" / "ui_settings.json").write_text("[1, 2]")
+    assert settings_store.load(path) == {}
+
+
+def test_settings_file_lives_under_data_which_is_not_in_version_control():
+    from ui import settings_store
+
+    assert Path(settings_store.PATH) == ROOT / "data" / "ui_settings.json"
+
+
+_SAVED = """
+import streamlit as st
+from ui import settings_store, shell
+from ui.widgets import _choice_control
+shell.hydrate(st, settings_store.load())
+shell.render_flow_filters(st, _choice_control)
+shell.render_best_value_settings(st)
+shell.save_if_changed(st, settings_store.save)
+st.json(shell.all_settings(st))
+"""
+
+
+def test_settings_survive_an_app_restart(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    from ui import settings_store
+
+    monkeypatch.setattr(settings_store, "PATH", str(tmp_path / "ui_settings.json"))
+    first = AppTest.from_string(_SAVED).run()
+    assert not first.exception
+    assert not (tmp_path / "ui_settings.json").exists()             # defaults are not written
+    first.toggle(key="w_show_all_ranked").set_value(True).run()
+    first.number_input(key="w_top_n").set_value(8).run()
+    assert json.loads((tmp_path / "ui_settings.json").read_text()) == {
+        "min_dte": 1, "top_n": 8, "sort_by": "Volume", "show_all_ranked": True}
+
+    second = AppTest.from_string(_SAVED).run()                      # a brand-new session
+    assert not second.exception
+    assert json.loads(second.json[0].value) == {
+        "min_dte": 1, "top_n": 8, "sort_by": "Volume", "show_all_ranked": True}
+    assert second.toggle(key="w_show_all_ranked").value is True
+    assert second.number_input(key="w_top_n").value == 8

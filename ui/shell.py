@@ -1,6 +1,6 @@
 """App shell: the left-hand menu, the ticker bar, and settings that persist across pages.
 
-No scoring, no network, no file I/O. ``st`` is passed in so this module never holds
+No scoring, no network, no file I/O (saving to disk is ui/settings_store.py, passed in). ``st`` is passed in so this module never holds
 Streamlit state of its own and can be exercised with AppTest.
 
 The menu is data: edit ``MENU`` to add, remove or regroup entries.
@@ -132,8 +132,55 @@ def render_menu(st, *, material_icons: bool = False, title: str = "Options Scann
 # Streamlit drops a widget's state when the widget is not drawn, so each setting
 # is mirrored into a plain session key that every page can read.
 
-DEFAULTS: dict[str, Any] = {"min_dte": 1, "top_n": 5, "sort_by": "Volume"}
+DEFAULTS: dict[str, Any] = {"min_dte": 1, "top_n": 5, "sort_by": "Volume",
+                            "show_all_ranked": False}
 SORT_OPTIONS = ["Volume", "Premium $", "Strike"]
+LOADED_KEY = "cfg_loaded"
+SAVED_KEY = "cfg_saved"
+
+
+def clean(values: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep only known settings with valid values; anything else is dropped (and the
+    default applies). Protects against a hand-edited or outdated settings file."""
+    out: dict[str, Any] = {}
+    v = values or {}
+    if isinstance(v.get("min_dte"), int) and not isinstance(v.get("min_dte"), bool) \
+            and v["min_dte"] >= 0:
+        out["min_dte"] = v["min_dte"]
+    if isinstance(v.get("top_n"), int) and not isinstance(v.get("top_n"), bool) \
+            and 1 <= v["top_n"] <= 30:
+        out["top_n"] = v["top_n"]
+    if v.get("sort_by") in SORT_OPTIONS:
+        out["sort_by"] = v["sort_by"]
+    if isinstance(v.get("show_all_ranked"), bool):
+        out["show_all_ranked"] = v["show_all_ranked"]
+    return out
+
+
+def hydrate(st, saved: dict[str, Any] | None) -> None:
+    """Once per session, copy saved settings into the session (never over a value the
+    session already holds)."""
+    if st.session_state.get(LOADED_KEY):
+        return
+    st.session_state[LOADED_KEY] = True
+    good = clean(saved)
+    for name, value in good.items():
+        st.session_state.setdefault(_store_key(name), value)
+    st.session_state[SAVED_KEY] = {**DEFAULTS, **good}
+
+
+def all_settings(st) -> dict[str, Any]:
+    return {name: setting(st, name) for name in DEFAULTS}
+
+
+def save_if_changed(st, save: Callable[[dict[str, Any]], None]) -> bool:
+    """Write the settings through ``save`` when they differ from what was last saved."""
+    current = all_settings(st)
+    if st.session_state.get(SAVED_KEY) == current:
+        return False
+    save(current)
+    st.session_state[SAVED_KEY] = current
+    return True
 
 
 def _store_key(name: str) -> str:
@@ -152,6 +199,7 @@ def flow_settings(st) -> dict[str, Any]:
         "min_dte": int(setting(st, "min_dte")),
         "top_n": int(setting(st, "top_n")),
         "sort_by": str(setting(st, "sort_by")),
+        "show_all_ranked": bool(setting(st, "show_all_ranked")),
     }
 
 
@@ -172,6 +220,18 @@ def render_flow_filters(st, choice_control: Callable[..., str]) -> dict[str, Any
     st.session_state[_store_key("top_n")] = int(top_n)
     st.session_state[_store_key("sort_by")] = sort_by
     return flow_settings(st)
+
+
+def render_best_value_settings(st) -> bool:
+    """Draw the Best Value display settings (Settings page) and persist the choice."""
+    show_all = st.toggle(
+        "Show all ranked contracts",
+        value=bool(setting(st, "show_all_ranked")), key="w_show_all_ranked",
+        help="Off: Best Value hides rows outside the Pre-Trade |δ| band 0.35–0.50, "
+             "including missing delta. Does not change scoring or attribution.",
+    )
+    st.session_state[_store_key("show_all_ranked")] = bool(show_all)
+    return bool(show_all)
 
 
 TICKER_STORE = "cfg_ticker"

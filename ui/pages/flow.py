@@ -41,6 +41,7 @@ from ui.market import _cached_vwap_state
 from ui.market import _market_is_closed
 from ui.market import _rsi_plain
 from volume_analysis import fetch_intraday_vwap_df
+from ui import shell
 from ui.components import price_chart
 from ui.context import ScanContext
 from volume_analysis import get_stock_volume_analysis
@@ -1447,25 +1448,22 @@ def _render_best_value_panel(
         )
     disp["Exit by"] = exit_cells
 
-    show_all = st.toggle(
-        "Show all ranked contracts",
-        value=False,
-        key=f"bv_delta_show_all_{str(ticker).upper()}",
-        help="Default hides rows outside the Pre-Trade |δ| band 0.35–0.50, "
-             "including missing delta. Does not change scoring or attribution.",
-    )
+    # Set on the Settings page and saved; not a per-visit toggle any more.
+    show_all = bool(shell.setting(st, "show_all_ranked"))
     vis_top5, n_hidden, n_ranked = filter_ranked_display(
         top5, vol_curr, show_all=show_all,
     )
     if show_all:
         vis_disp = disp
         st.caption(
-            f"Showing all {n_ranked} ranked contracts (delta band filter off)."
+            f"Showing all {n_ranked} ranked contracts (delta band filter off · "
+            "change in Settings)."
         )
     else:
         keep = ranked_delta_band_mask(top5, vol_curr)
         vis_disp = apply_display_keep(disp, keep)
-        st.caption(hidden_delta_band_caption(n_hidden, n_ranked))
+        st.caption(hidden_delta_band_caption(n_hidden, n_ranked)
+                   + " · show them all in Settings")
 
     # Interactive table: ＋ column in-row (st.dataframe cannot host buttons)
     _render_best_value_table_with_plus(

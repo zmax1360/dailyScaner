@@ -17,7 +17,7 @@ from logging_config import LOG_DIR, setup_logging
 import ema_stack
 import gex_page
 import volume_page
-from ui import shell
+from ui import settings_store, shell
 from ui.common import ET
 from ui.archives import (
     _latest_archive,
@@ -261,6 +261,7 @@ def _ema_stack_banner(cfg: dict) -> None:
 
 def _shell() -> dict:
     """Left-hand menu and ticker bar. Returns the cfg every page receives."""
+    shell.hydrate(st, settings_store.load())          # saved settings, once per session
     page = shell.render_menu(st, material_icons=_streamlit_ge(1, 40))
 
     known_tickers = _discover_tickers()
