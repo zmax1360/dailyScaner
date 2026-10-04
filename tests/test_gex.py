@@ -514,6 +514,23 @@ def test_map_html_is_safe_for_markdown_and_keeps_wall_colours(seeded):
     assert "rgb(250, 204, 21)" in html and "rgb(45, 212, 191)" in html     # call / put wall
 
 
+def test_walls_have_an_outline_and_the_header_has_no_stray_label(seeded):
+    shown = _map(_run())
+    css = shown.styles
+    import re
+
+    def outlined_cells(colour):
+        rule = re.search(r"((?:#T_gex_row\d+_col\d+,?\s*)+)\{[^}]*box-shadow: inset 0 0 0 2px "
+                         + re.escape(colour), css)
+        return rule.group(1).count("#T_gex_row") if rule else 0
+
+    # the default view shows two expiries: one call wall and one put wall in each
+    assert outlined_cells(gex_page.CALL_WALL_OUTLINE) == 2
+    assert outlined_cells(gex_page.PUT_WALL_OUTLINE) == 2
+    html = next(m.value for m in _run().markdown if "<table" in m.value)
+    assert ">expiry<" not in html
+
+
 def test_page_expiration_filter(seeded):
     at = _run()
     at.radio(key="gex_exp_mode").set_value(gex_page.EXP_CURRENT).run()

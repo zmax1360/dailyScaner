@@ -16,8 +16,13 @@ import volume_history as vh
 
 POS_RGB = (147, 51, 234)     # purple — call-heavy (positive)
 NEG_RGB = (13, 148, 136)     # teal   — put-heavy (negative)
-CALL_WALL_CSS = "background-color: rgb(250, 204, 21); color: #111; font-weight: 700;"
-PUT_WALL_CSS = "background-color: rgb(45, 212, 191); color: #111; font-weight: 700;"
+# Walls get an inset outline as well as a fill, so they stand out at a glance.
+CALL_WALL_OUTLINE = "rgb(236, 72, 153)"
+PUT_WALL_OUTLINE = "rgb(165, 243, 252)"
+CALL_WALL_CSS = ("background-color: rgb(250, 204, 21); color: #111; font-weight: 700; "
+                 f"box-shadow: inset 0 0 0 2px {CALL_WALL_OUTLINE};")
+PUT_WALL_CSS = ("background-color: rgb(45, 212, 191); color: #111; font-weight: 700; "
+                f"box-shadow: inset 0 0 0 2px {PUT_WALL_OUTLINE};")
 NET_CSS = "font-weight: 700; border-top: 2px solid #666;"
 NET_LABEL = "NET $"
 
@@ -50,6 +55,7 @@ def style_matrix(matrix: pd.DataFrame, wall_map: dict, *, spot_strike: float | N
     labels = [f"{k:g}  ◀ spot" if k == spot_strike else f"{k:g}" for k in matrix.index]
     shown = matrix.copy()
     shown.index = labels
+    shown.columns.name = None            # otherwise "expiry" prints above the strike column
     shown.loc[net_label] = [
         (wall_map.get(str(exp)) or {}).get("net", float("nan")) for exp in matrix.columns
     ]
