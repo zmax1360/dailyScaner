@@ -216,7 +216,8 @@ def test_main_routes_every_menu_entry():
 def test_sidebar_holds_only_the_menu_and_the_scan_watcher():
     tree = _app_tree()
     names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
-    assert "_sidebar" not in names and "_shell" in names and "_render_settings" in names
+    assert "_sidebar" not in names and "_shell" in names
+    assert (ROOT / "ui" / "pages" / "settings.py").exists()
     src = ast.get_source_segment((ROOT / "app.py").read_text(), _func(tree, "_shell"))
     assert "shell.render_menu(" in src and "shell.render_ticker_bar(" in src
     for widget in ("number_input", "st.button(", "checkbox", "multiselect"):

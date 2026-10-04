@@ -19,7 +19,7 @@ PAGES_DIR = ROOT / "ui" / "pages"
 PAGE_MODULES = sorted(p.stem for p in PAGES_DIR.glob("*.py") if p.stem != "__init__")
 
 # app.py may only shrink. Lower this number whenever a page moves out.
-APP_LINE_BUDGET = 1460
+APP_LINE_BUDGET = 400
 
 
 def _run(script: str):
@@ -179,6 +179,89 @@ def test_display_greeks_are_sane_and_obey_put_call_parity():
     assert call[2] < 0                                        # long options decay
 
 
+# ── Settings and Telegram push ──────────────────────────────────────────────
+
+_SETTINGS = """
+import ui.telegram_push as tg
+tg._ENV_FILE = {env!r}
+from ui.pages import settings
+settings.render({cfg!r})
+"""
+
+
+def test_settings_page_shows_scan_filters_and_telegram(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)                     # no archives, no real .env
+    cfg = {"ticker": "AAPL", "top_n": 5, "min_dte": 1, "sort_by": "Volume",
+           "latest_archive": None}
+    at = _run(_SETTINGS.format(env=str(tmp_path / "absent.env"), cfg=cfg))
+    assert any("Run Scan for AAPL" in b.label for b in at.button)
+    assert {n.key for n in at.number_input} == {"w_min_dte", "w_top_n"}
+    assert any("Not configured" in w.value for w in at.warning)
+    send = next(b for b in at.button if "Send to Telegram" in b.label)
+    assert send.disabled                            # nothing to send, nowhere to send it
+
+
+def test_telegram_config_is_read_from_the_env_file(tmp_path, monkeypatch):
+    import ui.telegram_push as tg
+
+    env = tmp_path / ".env"
+    env.write_text('# comment\nTELEGRAM_BOT_TOKEN="abc:123"\nTELEGRAM_CHAT_ID = 42\nOTHER=x\n')
+    monkeypatch.setattr(tg, "_ENV_FILE", str(env))
+    assert tg._load_telegram_config() == ("abc:123", "42")
+    monkeypatch.setattr(tg, "_ENV_FILE", str(tmp_path / "missing.env"))
+    assert tg._load_telegram_config() == (None, None)
+
+
+def test_scan_message_is_built_from_an_archive_payload():
+    import ui.telegram_push as tg
+
+    payload = json.loads((GOLDEN / CURR).read_text())
+    prev = json.loads((GOLDEN / PREV).read_text())
+    include = {k: True for k in ("session", "mtf", "magnets", "volume_expiry", "orb",
+                                 "deltas", "best_value")}
+    msg = tg._format_scan_message(payload=payload, prev_payload=prev, ticker="AAPL",
+                                  top_n=5, include=include)
+    assert isinstance(msg, str) and "AAPL" in msg and len(msg) > 200
+    bare = tg._format_scan_message(payload=payload, prev_payload=None, ticker="AAPL",
+                                   top_n=5, include={k: False for k in include})
+    assert len(bare) < len(msg)
+
+
+def test_archive_lookups(tmp_path, monkeypatch):
+    from ui.archives import _latest_archive, _latest_archive_stamp
+
+    monkeypatch.chdir(tmp_path)
+    assert _latest_archive_stamp("AAPL") is None
+    (tmp_path / "archive").mkdir()
+    for name in (CURR, PREV):
+        shutil.copy(GOLDEN / name, tmp_path / "archive" / name)
+    assert _latest_archive_stamp("AAPL").startswith(CURR + "|")
+    assert _latest_archive("AAPL") == json.loads((GOLDEN / CURR).read_text())
+
+
+def test_unused_functions_are_gone_for_good():
+    """Seven functions had no caller anywhere; they must not creep back unused."""
+    gone = {"_render_expiry_vol_table", "_render_daily_run", "_render_weekly_run",
+            "_load_archive_chain", "_check_card", "_rsi_label", "_bg_scan_worker",
+            "_fmt_dollars"}
+    for path in [ROOT / "app.py", *(ROOT / "ui").rglob("*.py")]:
+        tree = ast.parse(path.read_text())
+        defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        assert not (defined & gone), (path.name, defined & gone)
+
+
+def test_app_has_no_unused_imports():
+    tree = ast.parse((ROOT / "app.py").read_text())
+    imported: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imported |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported |= {a.asname or a.name for a in node.names}
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    assert not (imported - used - {"annotations"}), sorted(imported - used)
+
+
 # ── shared widgets and market helpers ───────────────────────────────────────
 
 _CHOICE = """
@@ -232,7 +315,8 @@ def test_market_clock_is_timezone_aware_eastern():
 # ── the page contract ───────────────────────────────────────────────────────
 
 def test_expected_pages_exist():
-    assert {"news", "spread_gate", "journal", "tickers", "archive", "flow"} <= set(PAGE_MODULES)
+    assert {"news", "spread_gate", "journal", "tickers", "archive", "flow",
+            "settings"} <= set(PAGE_MODULES)
 
 
 @pytest.mark.parametrize("name", PAGE_MODULES)
@@ -275,7 +359,9 @@ def test_app_no_longer_defines_the_moved_pages():
              "_run_daily_scanner", "_scan_archive_metadata", "_render_tab1",
              "_render_best_value_panel", "_render_portfolio_manager", "evaluate_portfolio",
              "_choice_control", "_streamlit_ge", "_now_et", "_market_is_closed",
-             "_cached_vwap_state", "_build_best_value_df", "_rsi_plain"}
+             "_cached_vwap_state", "_build_best_value_df", "_rsi_plain",
+             "_render_settings", "_format_scan_message", "_send_telegram",
+             "_load_telegram_config", "_latest_archive", "_latest_archive_stamp"}
     assert not (defined & moved)
 
 
