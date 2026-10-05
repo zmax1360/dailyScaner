@@ -9,6 +9,7 @@ import streamlit as st
 from chart_indicators import add_indicators, last_session
 from pov_leakage import OVER_PARTICIPATION_THRESH, compute_pov_metrics
 from ui.context import ScanContext
+from ui.gamma_data import gamma_levels, gamma_summary_for
 from ui.widgets import _choice_control
 from volume_analysis import CHART_TIMEFRAMES, fetch_intraday_vwap_df
 
@@ -39,7 +40,7 @@ def prepare(bars: pd.DataFrame, timeframe: str) -> pd.DataFrame:
 
 def build_figure(df: pd.DataFrame, *, ticker: str = "", timeframe: str = DEFAULT_TIMEFRAME,
                  show_stoch: bool = True, show_atr: bool = False,
-                 show_participation: bool = True):
+                 show_participation: bool = True, levels: list[dict] | None = None):
     """One Plotly figure: price / volume / (stochastic) / (ATR), sharing the x axis."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -85,6 +86,16 @@ def build_figure(df: pd.DataFrame, *, ticker: str = "", timeframe: str = DEFAULT
             line=dict(color=VWAP_COLOR, width=1.6, dash="dot"),
             hovertemplate="VWAP %{y:.2f}<extra></extra>",
         ), row=row["price"], col=1)
+
+    # Gamma levels: drawn as shapes, which never stretch the price axis. A level far
+    # from the candles is simply off-screen; the caption below the chart lists them all.
+    for lv in levels or []:
+        fig.add_hline(
+            y=lv["price"], row=row["price"], col=1,
+            line=dict(color=lv["color"], width=1.2, dash="dash"),
+            annotation_text=f"{lv['name']} {lv['price']:g}", annotation_position="top left",
+            annotation_font=dict(color=lv["color"], size=10),
+        )
 
     if "Volume" in df.columns:
         colors = [UP if c >= o else DOWN for o, c in zip(df["Open"], df["Close"])]
@@ -162,13 +173,17 @@ def render(ctx: ScanContext) -> None:
         show_stoch = st.checkbox("Stochastic (14, 3)", value=True, key="chart_stoch")
         show_atr = st.checkbox("ATR (14)", value=False, key="chart_atr")
         show_part = st.checkbox("Participation", value=True, key="chart_participation")
+        show_gamma = st.checkbox("Gamma levels", value=True, key="chart_gamma",
+                                 help="Lines at gamma support, call resistance and the put "
+                                      "wall for the nearest expiry (from the Gamma page).")
 
     df = prepare(_cached_bars(ticker, timeframe), timeframe)
     if df.empty:
         st.caption(f"{timeframe} chart unavailable right now.")
         return
+    levels = gamma_levels(gamma_summary_for(ticker, ctx.spot)) if show_gamma else []
     fig = build_figure(df, ticker=ticker, timeframe=timeframe, show_stoch=show_stoch,
-                       show_atr=show_atr, show_participation=show_part)
+                       show_atr=show_atr, show_participation=show_part, levels=levels)
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
     last = df.iloc[-1]
@@ -183,3 +198,6 @@ def render(ctx: ScanContext) -> None:
     missing = [n.replace("EMA", "EMA ") for n in EMA_COLORS if pd.isna(last.get(n))]
     note = f" · not enough bars for {', '.join(missing)}" if missing else ""
     st.caption("Last bar: " + " · ".join(parts) + note)
+    if levels:
+        st.caption("Gamma levels: " + " · ".join(
+            f"{lv['name']} \\${lv['price']:g}" for lv in levels))

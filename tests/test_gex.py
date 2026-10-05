@@ -674,3 +674,45 @@ def test_page_shares_unit_relabels_the_net_row_and_caption(seeded):
     assert list(_map(at).rows)[-1] == "NET sh"
     cap = next(c.value for c in at.caption if "Snapshot" in c.value)
     assert "shares of dealer hedging per \\$1 move" in cap
+
+
+# ── profile layout ──────────────────────────────────────────────────────────
+
+def test_profile_series_sums_across_the_expiries_shown():
+    m = gex.gex_matrix(_table(_chain()), spot=SPOT, n_strikes=None)
+    net = gex_page.profile_series(m)
+    assert list(net.index) == sorted(net.index, reverse=True)
+    assert net[335.0] == pytest.approx(m.loc[335.0].sum())          # Monday + the later expiry
+    assert net[340.0] == pytest.approx(m.loc[340.0, NEXT_FRI])
+    assert gex_page.profile_series(pd.DataFrame()).empty
+
+
+def test_profile_figure_bars_walls_and_spot_line():
+    m = gex.gex_matrix(_table(_chain()), spot=SPOT, expiries=[MONDAY], n_strikes=None)
+    fig = gex_page.profile_figure(m, spot=SPOT, title="Net GEX")
+    bar = fig.data[0]
+    assert bar.orientation == "h" and list(bar.y) == [335.0, 332.5, 327.5]
+    assert list(bar.x) == pytest.approx(list(m[MONDAY].dropna()))
+    colors = dict(zip(bar.y, bar.marker.color))
+    assert colors[335.0] == gex_page.PROFILE_CALL_WALL               # largest positive
+    assert colors[327.5] == gex_page.PROFILE_PUT_WALL                # most negative
+    assert colors[332.5] == gex_page.PROFILE_POS
+    assert list(bar.text) == [gex.fmt_money(v) for v in bar.x]
+    spot_lines = [s for s in fig.layout.shapes if s.type == "line" and s.y0 == s.y1 == SPOT]
+    assert len(spot_lines) == 1
+    lo, hi = fig.layout.xaxis.range
+    assert lo == pytest.approx(-hi)                                   # zero stays centred
+
+
+def test_profile_figure_handles_an_empty_map():
+    assert len(gex_page.profile_figure(pd.DataFrame(), spot=SPOT).data) == 0
+
+
+def test_page_profile_layout_replaces_the_table_with_a_chart(seeded):
+    at = _run()
+    assert len(at.get("plotly_chart")) == 0 and any("<table" in m.value for m in at.markdown)
+    at.radio(key="gex_layout").set_value(gex_page.LAYOUT_PROFILE).run()
+    assert not at.exception
+    assert len(at.get("plotly_chart")) == 1
+    assert not any("<table" in m.value for m in at.markdown)
+    assert {m.label for m in at.metric} >= {"Gamma support", "Call resistance", "Put wall"}

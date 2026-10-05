@@ -112,6 +112,60 @@ def matrix_html(styled, col_labels: list[str]) -> str:
     return f'<div style="max-height:75vh; overflow:auto;">{flat}</div>'
 
 
+LAYOUT_HEAT, LAYOUT_PROFILE = "Heat", "Profile"
+PROFILE_POS, PROFILE_NEG = "rgb(192, 38, 211)", "rgb(34, 211, 238)"
+PROFILE_CALL_WALL, PROFILE_PUT_WALL = "rgb(250, 204, 21)", "rgb(45, 212, 191)"
+
+
+def profile_series(matrix: pd.DataFrame) -> pd.Series:
+    """Net GEX per strike across the expiries shown (a strike with no usable contract in
+    any of them is left out, never drawn as zero)."""
+    if matrix is None or matrix.empty:
+        return pd.Series(dtype=float)
+    return matrix.sum(axis=1, min_count=1).dropna().sort_index(ascending=False)
+
+
+def profile_figure(matrix: pd.DataFrame, *, spot: float, title: str = ""):
+    """Horizontal bars of net GEX by strike on a price axis: positive to the right,
+    negative to the left, the largest of each highlighted, and a line at spot."""
+    import plotly.graph_objects as go
+
+    net = profile_series(matrix)
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=10, t=34 if title else 10, b=10), showlegend=False,
+        title=dict(text=title, font=dict(size=14, color="#b0bec5"), x=0.5, xanchor="center"),
+        height=min(max(34 * len(net) + 90, 260), 1200), bargap=0.25,
+    )
+    if net.empty:
+        return fig
+    pos, neg = net[net > 0], net[net < 0]
+    call_wall = pos.idxmax() if not pos.empty else None
+    put_wall = neg.idxmin() if not neg.empty else None
+    colors = [PROFILE_CALL_WALL if k == call_wall else PROFILE_PUT_WALL if k == put_wall
+              else PROFILE_POS if v >= 0 else PROFILE_NEG for k, v in net.items()]
+    step = float(pd.Series(net.index).sort_values().diff().dropna().min()) if len(net) > 1 else 1.0
+    fig.add_trace(go.Bar(
+        x=net.values, y=list(net.index), orientation="h", name="Net GEX",
+        marker_color=colors, width=step * 0.7,
+        text=[gex.fmt_money(v) for v in net.values], textposition="outside",
+        textfont=dict(color="#e0e0e0", size=12), cliponaxis=False,
+        hovertemplate="$%{y:g}: %{text}<extra></extra>",
+    ))
+    fig.add_hline(y=float(spot), line=dict(color="rgb(103, 232, 249)", width=1.5, dash="dot"),
+                  annotation_text=f"spot {float(spot):,.2f}", annotation_position="top left",
+                  annotation_font=dict(color="rgb(103, 232, 249)", size=11))
+    fig.add_vline(x=0, line=dict(color="rgba(255,255,255,0.35)", width=1))
+    span = float(net.abs().max())
+    fig.update_xaxes(range=[-span * 1.25, span * 1.25], showgrid=False, zeroline=False,
+                     showticklabels=False)
+    fig.update_yaxes(tickmode="array", tickvals=list(net.index),
+                     ticktext=[f"{k:g}" for k in net.index], showgrid=False,
+                     range=[float(net.index.min()) - step, float(net.index.max()) + step])
+    return fig
+
+
 def build_view(latest: pd.DataFrame, *, spot: float, as_of: datetime, today: date,
                unit: str = gex.UNIT_DOLLAR, iv_source: str = gex.IV_QUOTE,
                mode: str = EXP_WEEK, picked: list[str] | None = None,
@@ -149,6 +203,10 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
 
     # ── panel settings (tucked away, like the reference view) ───────────────
     with settings.popover("Panel settings", use_container_width=True):
+        layout = st.radio("Layout", [LAYOUT_HEAT, LAYOUT_PROFILE], horizontal=True,
+                          key="gex_layout",
+                          help="Heat: a table of strikes by expiry. Profile: bars by strike, "
+                               "summed across the expiries shown.")
         unit_label = st.radio("Units", list(UNIT_LABELS), horizontal=True, key="gex_unit")
         iv_label = st.radio("Implied volatility", list(IV_LABELS), horizontal=True,
                             key="gex_iv_source",
@@ -200,10 +258,18 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
                    else "Net negative: dealer hedging tends to amplify moves.")
 
     # ── panel 2: the map ─────────────────────────────────────────────────────
-    styled = style_matrix(matrix, wall_map, spot_strike=gex.nearest_strike(matrix, spot),
-                          net_label=NET_LABELS[unit])
-    st.markdown(matrix_html(styled, [_fmt_exp(e) for e in matrix.columns]),
-                unsafe_allow_html=True)
+    if layout == LAYOUT_PROFILE:
+        shown = ", ".join(_fmt_exp(e) for e in matrix.columns)
+        total = gex.fmt_money(profile_series(matrix).sum())
+        st.plotly_chart(
+            profile_figure(matrix, spot=spot, title=f"Net GEX · {shown} · net {total}"),
+            use_container_width=True, config={"displayModeBar": False},
+        )
+    else:
+        styled = style_matrix(matrix, wall_map, spot_strike=gex.nearest_strike(matrix, spot),
+                              net_label=NET_LABELS[unit])
+        st.markdown(matrix_html(styled, [_fmt_exp(e) for e in matrix.columns]),
+                    unsafe_allow_html=True)
     st.caption(
         f"Snapshot {as_of.astimezone(tz):%a %b %d %H:%M ET} · "
         f"{len(matrix.columns)} of {len(available)} expiries · {len(matrix)} strikes · "

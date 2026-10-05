@@ -10,6 +10,7 @@ from ui.market import _build_best_value_df
 from ui.services import _SCANNER_DIR
 import pandas as pd
 from ui.common import ET
+from ui.gamma_data import gamma_summary_for  # noqa: F401  (re-exported for the Settings page)
 
 _ENV_FILE    = os.path.join(_SCANNER_DIR, ".env")
 
@@ -382,19 +383,3 @@ def format_gamma_lines(summary: dict | None) -> list[str]:
     as_of = summary["as_of"].astimezone(ET)
     lines.append(f"<i>dollars of hedging per $1 move · snapshot {as_of:%a %b %d %H:%M ET}</i>")
     return lines
-
-
-def gamma_summary_for(ticker: str, spot) -> dict | None:
-    """Gamma read from the latest full-chain snapshot of ``ticker``; None if unavailable."""
-    import gex
-    import volume_history as vh
-
-    try:
-        spot_f = float(spot)
-    except (TypeError, ValueError):
-        return None
-    latest = vh.latest_scan(str(ticker or "").upper())
-    if latest.empty or spot_f <= 0:
-        return None
-    as_of = datetime.fromisoformat(str(latest["ts_et"].iloc[0]))
-    return gex.summary(latest, spot=spot_f, as_of=as_of, today=datetime.now(ET).date())

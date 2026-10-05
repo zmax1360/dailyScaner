@@ -207,10 +207,12 @@ pc.render(ScanContext(ticker="AAPL", curr={"spot": 333.0}))
 """
 
 
-def _run(monkeypatch, bars):
+def _run(monkeypatch, bars, summary=None):
     from streamlit.testing.v1 import AppTest
 
     monkeypatch.setattr(pc, "_cached_bars", lambda ticker, timeframe: bars)
+    # never the real snapshot database
+    monkeypatch.setattr(pc, "gamma_summary_for", lambda ticker, spot: summary)
     at = AppTest.from_string(_SCRIPT, default_timeout=30).run()
     assert not at.exception, at.exception
     return at
@@ -221,7 +223,9 @@ def test_component_renders_with_a_last_bar_read_out(monkeypatch):
     cap = next(c.value for c in at.caption if c.value.startswith("Last bar:"))
     for want in ("EMA 9", "EMA 21", "EMA 50", "VWAP", "Stoch", "ATR"):
         assert want in cap
-    assert {c.key for c in at.checkbox} == {"chart_stoch", "chart_atr", "chart_participation"}
+    assert {c.key for c in at.checkbox} == {"chart_stoch", "chart_atr", "chart_participation",
+                                            "chart_gamma"}
+    assert not any(c.value.startswith("Gamma levels:") for c in at.caption)   # none available
 
 
 def test_component_renders_with_timezone_naive_bars(monkeypatch):
@@ -307,3 +311,43 @@ def test_fifteen_minute_view_has_a_full_session_with_all_three_emas():
     shown = pc.prepare(bars, "15M")
     assert len(shown) == 26                                   # 09:30 .. 15:45
     assert shown[["EMA9", "EMA21", "EMA50"]].notna().all().all()
+
+
+# ── gamma levels on the chart ───────────────────────────────────────────────
+
+_SUMMARY = {"support": 330.0, "resistance": 335.0, "put_wall": 320.0, "call_wall": 330.0}
+
+
+def test_gamma_levels_are_support_resistance_and_put_wall():
+    from ui.gamma_data import gamma_levels
+
+    levels = gamma_levels(_SUMMARY)
+    assert [(lv["key"], lv["price"]) for lv in levels] == [
+        ("resistance", 335.0), ("support", 330.0), ("put_wall", 320.0)]
+    assert gamma_levels(None) == [] and gamma_levels({}) == []
+    assert [lv["key"] for lv in gamma_levels({**_SUMMARY, "support": None})] == [
+        "resistance", "put_wall"]
+
+
+def test_levels_are_drawn_as_lines_that_never_stretch_the_price_axis():
+    from ui.gamma_data import gamma_levels
+
+    df = pc.prepare(_bars(), "5M")
+    plain = pc.build_figure(df)
+    fig = pc.build_figure(df, levels=gamma_levels(_SUMMARY))
+    assert len(fig.data) == len(plain.data)                 # shapes, not traces
+    lines = [s for s in fig.layout.shapes if s.type == "line" and s.yref == "y"]
+    assert sorted(s.y0 for s in lines) == [320.0, 330.0, 335.0]
+    labels = [a.text for a in fig.layout.annotations]
+    assert {"Call resistance 335", "Gamma support 330", "Put wall 320"} <= set(labels)
+    assert not [s for s in plain.layout.shapes if s.yref == "y"]
+
+
+def test_component_lists_gamma_levels_and_the_toggle_removes_them(monkeypatch):
+    summary = {**_SUMMARY, "expiry": "2026-10-05"}
+    at = _run(monkeypatch, _bars(), summary=summary)
+    cap = next(c.value for c in at.caption if c.value.startswith("Gamma levels:"))
+    assert r"Call resistance \$335" in cap and r"Put wall \$320" in cap
+    at.checkbox(key="chart_gamma").set_value(False).run()
+    assert not at.exception
+    assert not any(c.value.startswith("Gamma levels:") for c in at.caption)
