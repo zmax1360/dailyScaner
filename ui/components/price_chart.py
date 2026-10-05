@@ -22,6 +22,7 @@ UP, DOWN = "#00C853", "#FF1744"
 EMA_COLORS = {"EMA9": "#7CFC00", "EMA21": "#2196F3", "EMA50": "#F44336"}
 VWAP_COLOR = "#00E5FF"
 GRID = "rgba(255,255,255,0.06)"
+LEVEL_REACH = 0.35        # a level within this share of the candle range gets a line
 
 
 def prepare(bars: pd.DataFrame, timeframe: str) -> pd.DataFrame:
@@ -87,15 +88,42 @@ def build_figure(df: pd.DataFrame, *, ticker: str = "", timeframe: str = DEFAULT
             hovertemplate="VWAP %{y:.2f}<extra></extra>",
         ), row=row["price"], col=1)
 
-    # Gamma levels: drawn as shapes, which never stretch the price axis. A level far
-    # from the candles is simply off-screen; the caption below the chart lists them all.
-    for lv in levels or []:
-        fig.add_hline(
-            y=lv["price"], row=row["price"], col=1,
-            line=dict(color=lv["color"], width=1.2, dash="dash"),
-            annotation_text=f"{lv['name']} {lv['price']:g}", annotation_position="top left",
-            annotation_font=dict(color=lv["color"], size=10),
-        )
+    # Gamma levels. Plotly stretches the price axis to fit any line drawn on it, so the
+    # axis is fixed to the candles first. A level close to the candles gets a line (and the
+    # axis grows a little to include it); a level far away gets a label at the edge
+    # pointing towards it, instead of squashing the candles.
+    if levels:
+        cols = [c for c in ("Low", "High", "EMA9", "EMA21", "EMA50", "VWAP") if c in df.columns]
+        lo, hi = float(df[cols].min().min()), float(df[cols].max().max())
+        span = max(hi - lo, 1e-9)
+        near = [lv for lv in levels
+                if lo - LEVEL_REACH * span <= lv["price"] <= hi + LEVEL_REACH * span]
+        far = [lv for lv in levels if lv not in near]
+        lo2 = min([lo] + [lv["price"] for lv in near])
+        hi2 = max([hi] + [lv["price"] for lv in near])
+        pad = 0.06 * (hi2 - lo2)
+        y0, y1 = lo2 - pad, hi2 + pad
+        fig.update_yaxes(range=[y0, y1], row=row["price"], col=1)
+        for lv in near:
+            fig.add_hline(
+                y=lv["price"], row=row["price"], col=1,
+                line=dict(color=lv["color"], width=1.2, dash="dash"),
+                annotation_text=f"{lv['name']} {lv['price']:g}",
+                annotation_position="top left",
+                annotation_font=dict(color=lv["color"], size=10),
+            )
+        stacked = {"below": 0, "above": 0}
+        for lv in far:
+            side = "below" if lv["price"] < lo else "above"
+            fig.add_annotation(
+                row=row["price"], col=1, xref="x domain", x=0.0, xanchor="left",
+                y=y0 if side == "below" else y1,
+                yanchor="bottom" if side == "below" else "top",
+                yshift=(14 if side == "below" else -14) * stacked[side],
+                text=f"{lv['name']} {lv['price']:g} {'↓' if side == 'below' else '↑'}",
+                showarrow=False, font=dict(color=lv["color"], size=10),
+            )
+            stacked[side] += 1
 
     if "Volume" in df.columns:
         colors = [UP if c >= o else DOWN for o, c in zip(df["Open"], df["Close"])]

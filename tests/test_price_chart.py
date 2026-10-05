@@ -329,18 +329,68 @@ def test_gamma_levels_are_support_resistance_and_put_wall():
         "resistance", "put_wall"]
 
 
-def test_levels_are_drawn_as_lines_that_never_stretch_the_price_axis():
-    from ui.gamma_data import gamma_levels
+def _levels_for(df, *, near_below=0.2, near_above=0.2, far_below=3.0):
+    """Levels placed relative to the candle range: two close by, one far below."""
+    lo, hi = float(df["Low"].min()), float(df["High"].max())
+    span = hi - lo
+    return lo, hi, [
+        {"key": "resistance", "name": "Call resistance", "price": round(hi + near_above * span, 2),
+         "color": "#C084FC"},
+        {"key": "support", "name": "Gamma support", "price": round(lo - near_below * span, 2),
+         "color": "#FACC15"},
+        {"key": "put_wall", "name": "Put wall", "price": round(lo - far_below * span, 2),
+         "color": "#2DD4BF"},
+    ]
 
+
+def _price_lines(fig):
+    return [s for s in fig.layout.shapes if s.type == "line" and s.yref == "y"]
+
+
+def test_a_far_level_does_not_squash_the_candles():
+    """Regression: a put wall far below the candles stretched the price axis to reach it."""
     df = pc.prepare(_bars(), "5M")
-    plain = pc.build_figure(df)
-    fig = pc.build_figure(df, levels=gamma_levels(_SUMMARY))
-    assert len(fig.data) == len(plain.data)                 # shapes, not traces
-    lines = [s for s in fig.layout.shapes if s.type == "line" and s.yref == "y"]
-    assert sorted(s.y0 for s in lines) == [320.0, 330.0, 335.0]
+    lo, hi, levels = _levels_for(df)
+    fig = pc.build_figure(df, levels=levels)
+    y0, y1 = fig.layout.yaxis.range
+    far = levels[2]["price"]
+    assert y0 > far                                         # the axis does not reach it
+    assert (y1 - y0) < 2.0 * (hi - lo)                      # candles keep most of the panel
+    assert far not in [s.y0 for s in _price_lines(fig)]     # and no line is drawn for it
+    label = next(a for a in fig.layout.annotations if a.text.startswith("Put wall"))
+    assert label.text.endswith("↓") and label.y == pytest.approx(y0)
+
+
+def test_near_levels_get_lines_and_stay_inside_the_axis():
+    df = pc.prepare(_bars(), "5M")
+    lo, hi, levels = _levels_for(df)
+    fig = pc.build_figure(df, levels=levels)
+    y0, y1 = fig.layout.yaxis.range
+    drawn = sorted(s.y0 for s in _price_lines(fig))
+    assert drawn == sorted([levels[0]["price"], levels[1]["price"]])
+    assert all(y0 < y < y1 for y in drawn)
     labels = [a.text for a in fig.layout.annotations]
-    assert {"Call resistance 335", "Gamma support 330", "Put wall 320"} <= set(labels)
-    assert not [s for s in plain.layout.shapes if s.yref == "y"]
+    assert any(t.startswith("Call resistance") for t in labels)
+    assert any(t.startswith("Gamma support") for t in labels)
+
+
+def test_far_levels_above_point_up_and_stack_without_overlapping():
+    df = pc.prepare(_bars(), "5M")
+    lo, hi, _ = _levels_for(df)
+    span = hi - lo
+    levels = [{"key": "a", "name": "A", "price": hi + 3 * span, "color": "#fff"},
+              {"key": "b", "name": "B", "price": hi + 5 * span, "color": "#fff"}]
+    fig = pc.build_figure(df, levels=levels)
+    tags = [a for a in fig.layout.annotations if a.text.endswith("↑")]
+    assert len(tags) == 2 and len({a.yshift for a in tags}) == 2
+    assert not _price_lines(fig)
+
+
+def test_without_levels_the_price_axis_scales_itself():
+    df = pc.prepare(_bars(), "5M")
+    fig = pc.build_figure(df)
+    assert fig.layout.yaxis.range is None and not _price_lines(fig)
+    assert len(pc.build_figure(df, levels=_levels_for(df)[2]).data) == len(fig.data)
 
 
 def test_component_lists_gamma_levels_and_the_toggle_removes_them(monkeypatch):
