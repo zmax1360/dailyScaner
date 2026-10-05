@@ -41,7 +41,10 @@ from ui.market import _cached_vwap_state
 from ui.market import _market_is_closed
 from ui.market import _rsi_plain
 from volume_analysis import fetch_intraday_vwap_df
-from ui import shell
+import ema_stack
+import game_plan
+from ui import game_plan_view, shell
+from ui.gamma_data import gamma_summary_for
 from ui.components import price_chart
 from ui.context import ScanContext
 from volume_analysis import get_stock_volume_analysis
@@ -2012,9 +2015,15 @@ def _usd(v) -> str:
     return f"\\${float(v):.2f}"
 
 
-SECTIONS = ("header", "chart", "context", "positions", "news", "best_value", "details")
+SECTIONS = ("game_plan", "header", "chart", "context", "positions", "news", "best_value",
+            "details")
 # Options Flow shows the market picture. The chart and Best Value have their own pages.
 OVERVIEW = frozenset({"header", "context", "positions", "news", "details"})
+
+
+def render_game_plan(cfg: dict) -> None:
+    """Game Plan page: the scan turned into a plan by fixed rules."""
+    render(cfg, sections=frozenset({"game_plan"}))
 
 
 def render_best_value(cfg: dict) -> None:
@@ -2113,6 +2122,30 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
     if ts_str:
         ts_et = datetime.fromisoformat(ts_str).astimezone(ET)
         st.caption(f"Last run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
+
+    if "game_plan" in sections:
+        # Same ranking inputs as the Best Value page, so the candidate matches it.
+        picks = _build_best_value_df(
+            vol, spot, prev_vol,
+            daily_bias=(daily_bias_info or {}).get("daily_bias"),
+            market_state=(market_state_info or {}).get("market_state"),
+            news_bias=news_bias,
+            vwap_state=vwap_state,
+            profited_shares_pct=(cost_info or {}).get("Profited_Shares_Pct"),
+            upper_1sd=em_range.get("Upper_1SD"),
+            lower_1sd=em_range.get("Lower_1SD"),
+            optimal_strategy=optimal_strat,
+            has_catalyst=has_catalyst,
+            spot_below_support=spot_below_sup,
+            odte_info=odte_info,
+            pov_info=pov_info,
+        )
+        game_plan_view.render(game_plan.build_plan(
+            ticker=ticker, spot=spot,
+            trend=ema_stack.banner_for_archive(curr, now=datetime.now(ET)),
+            gamma=gamma_summary_for(ticker, spot),
+            vwap=vwap_px, expected=em_range, picks=picks,
+        ))
 
     if "header" in sections:
         # ══════════════════════════════════════════════════════════════════════════

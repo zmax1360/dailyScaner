@@ -9,6 +9,8 @@ import urllib.request
 from ui.market import _build_best_value_df
 from ui.services import _SCANNER_DIR
 import pandas as pd
+import ema_stack
+import game_plan
 from ui.common import ET
 from ui.gamma_data import gamma_summary_for  # noqa: F401  (re-exported for the Settings page)
 
@@ -78,6 +80,7 @@ def _format_scan_message(
     include: dict,
     expiry_drill: list[str] | None = None,
     gamma: dict | None = None,
+    plan=None,
 ) -> str:
     """
     Build a Telegram HTML message from an archive payload.
@@ -112,6 +115,11 @@ def _format_scan_message(
     L.append("")
 
     # ── Session summary ───────────────────────────────────────────────────────
+    # ── Game plan (first, because it is the summary) ─────────────────────────
+    if include.get("game_plan") and plan is not None:
+        L.extend(game_plan.plan_lines(plan))
+        L.append("")
+
     if include.get("session", True):
         prev_close = session.get("prev_close")
         open_p     = session.get("open")
@@ -383,3 +391,21 @@ def format_gamma_lines(summary: dict | None) -> list[str]:
     as_of = summary["as_of"].astimezone(ET)
     lines.append(f"<i>dollars of hedging per $1 move · snapshot {as_of:%a %b %d %H:%M ET}</i>")
     return lines
+
+
+def plan_for_message(payload: dict, prev_payload: dict | None, ticker: str,
+                     gamma: dict | None = None):
+    """Game plan from one archive, for the Telegram push. VWAP is not in the archive, so
+    it is left out; the candidate uses the same basic ranking as the message's Best Value
+    section."""
+    from strategy_engine import ticker_expected_range
+
+    spot = float(payload.get("spot") or 0)
+    vol = payload.get("volume") or {}
+    prev_vol = (prev_payload.get("volume") or {}) if prev_payload else None
+    return game_plan.build_plan(
+        ticker=ticker, spot=spot,
+        trend=ema_stack.banner_for_archive(payload, now=datetime.now(ET)),
+        gamma=gamma, vwap=None, expected=ticker_expected_range(spot, vol),
+        picks=_build_best_value_df(vol, spot, prev_vol, min_volume=500),
+    )

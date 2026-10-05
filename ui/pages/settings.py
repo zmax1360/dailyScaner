@@ -15,6 +15,7 @@ from ui.telegram_push import _format_scan_message
 from ui.telegram_push import _load_telegram_config
 from ui.telegram_push import _send_telegram
 from ui.telegram_push import gamma_summary_for
+from ui.telegram_push import plan_for_message
 from ui.widgets import _choice_control
 import streamlit as st
 from ui.common import ET
@@ -118,6 +119,7 @@ def render(cfg: dict) -> None:
         inc_deltas     = st.checkbox("CALL Δ / PUT Δ vs previous run",       value=True,  key="tg_deltas")
         inc_best_value = st.checkbox("⭐ Best Value Option",                  value=True,  key="tg_bestval")
         inc_gamma      = st.checkbox("🧱 Gamma exposure (net, walls)",        value=True,  key="tg_gamma")
+        inc_plan       = st.checkbox("🎯 Game plan (side, day, levels)",      value=True,  key="tg_plan")
 
         # ── Expiry drill-down selector ────────────────────────────────
         tg_expiries: list[str] = []
@@ -148,6 +150,8 @@ def render(cfg: dict) -> None:
             key="tg_send_btn",
         )
         if send_tg and configured and tg_payload:
+            tg_gamma = (gamma_summary_for(tg_ticker, tg_payload.get("spot"))
+                        if (inc_gamma or inc_plan) else None)
             msg = _format_scan_message(
                 payload=tg_payload,
                 prev_payload=tg_prev,
@@ -162,10 +166,12 @@ def render(cfg: dict) -> None:
                     "deltas":        inc_deltas,
                     "best_value":    inc_best_value,
                     "gamma":         inc_gamma,
+                    "game_plan":     inc_plan,
                 },
                 expiry_drill=selected_expiries or None,
-                gamma=(gamma_summary_for(tg_ticker, tg_payload.get("spot"))
-                       if inc_gamma else None),
+                gamma=tg_gamma if inc_gamma else None,
+                plan=(plan_for_message(tg_payload, tg_prev, tg_ticker, gamma=tg_gamma)
+                      if inc_plan else None),
             )
             ok, err = _send_telegram(tg_token, tg_chat, msg)
             if ok:

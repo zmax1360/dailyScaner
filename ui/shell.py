@@ -31,6 +31,7 @@ class Entry:
 # (group title, entries). The first entry of the first group is the landing page.
 MENU: list[tuple[str, list[Entry]]] = [
     ("Trade", [
+        Entry("game_plan", "Game Plan", "flag", "🎯"),
         Entry("flow", "Options Flow", "candlestick_chart", "📈"),
         Entry("best_value", "Best Value", "star", "⭐"),
         Entry("spread_gate", "Spread Gate", "science", "🔬"),

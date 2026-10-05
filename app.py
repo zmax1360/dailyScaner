@@ -347,7 +347,10 @@ def main():
 
     page = cfg["page"]
     latest = cfg.get("latest_archive") or {}
-    if page == "flow":
+    if page == "game_plan":
+        render_market_banner()
+        flow_page.render_game_plan(cfg)
+    elif page == "flow":
         render_market_banner()
         flow_page.render(cfg)
     elif page == "best_value":

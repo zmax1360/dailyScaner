@@ -50,7 +50,7 @@ def test_menu_ids_are_unique_and_settings_is_last():
     ids = shell.page_ids()
     assert len(ids) == len(set(ids))
     assert ids[-1] == "settings"
-    assert shell.default_page() == ids[0] == "flow"
+    assert shell.default_page() == ids[0] == "game_plan"       # the app opens on the plan
 
 
 def test_every_entry_has_a_title_and_both_icon_styles():
@@ -73,7 +73,7 @@ def test_go_rejects_an_unknown_page():
 def test_menu_draws_one_button_per_entry_and_lands_on_the_first():
     at = _app()
     assert len(at.sidebar.button) == len(shell.entries())
-    assert _state(at)["page"] == "flow"
+    assert _state(at)["page"] == "game_plan"
 
 
 def test_clicking_a_menu_entry_switches_page():
@@ -90,7 +90,7 @@ def test_unknown_stored_page_falls_back_to_the_landing_page():
     at.session_state[shell.NAV_KEY] = "removed_page"
     at.run()
     assert not at.exception
-    assert _state(at)["page"] == "flow"
+    assert _state(at)["page"] == "game_plan"
 
 
 def test_go_selects_a_page_before_the_menu_is_drawn():
