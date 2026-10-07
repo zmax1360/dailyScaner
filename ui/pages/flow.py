@@ -40,6 +40,7 @@ from ui.market import _build_best_value_df
 from ui.market import _cached_vwap_state
 from ui.market import _market_is_closed
 from ui.market import _rsi_plain
+from ui.market import live_session_snapshot
 from volume_analysis import fetch_intraday_vwap_df
 import ema_stack
 import game_plan
@@ -2140,14 +2141,26 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
             odte_info=odte_info,
             pov_info=pov_info,
         )
+        # The plan's price, session high and session low come from the latest 5-minute
+        # bars, not from the scan: a scan can be many minutes (or a weekend) old, and a
+        # stale price next to a live VWAP puts the stop and targets in the wrong place.
+        live = live_session_snapshot(_cached_vwap_chart_df(ticker, "5M"))
+        if live:
+            plan_price = live["price"]
+            price_note = f"Price from the {live['at']:%a %b %d %H:%M} 5-minute bar."
+        else:
+            plan_price = spot
+            price_note = "No live bars: price is the one recorded by the scan."
         game_plan_view.render(game_plan.build_plan(
-            ticker=ticker, spot=spot,
+            ticker=ticker, spot=plan_price,
             trend=ema_stack.banner_for_archive(curr, now=datetime.now(ET)),
-            gamma=gamma_summary_for(ticker, spot),
+            gamma=gamma_summary_for(ticker, plan_price),
             vwap=vwap_px, expected=em_range, picks=picks,
-            session_high=day_high, session_low=day_low,
+            session_high=live.get("high", day_high), session_low=live.get("low", day_low),
             stop_buffer_pct=float(shell.setting(st, "stop_buffer_pct")),
             min_reward_to_risk=float(shell.setting(st, "min_reward_to_risk")),
+            price_note=price_note,
+            emas=((curr.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
         ))
 
     if "header" in sections:

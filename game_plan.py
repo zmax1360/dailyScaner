@@ -39,6 +39,8 @@ _OPTION_SIDE = {CALLS: "CALL", PUTS: "PUT"}
 POOLS = (POOL_1DTE, POOL_0DTE)          # shown in this order
 
 STOP_BUFFER_PCT = 0.10                  # the stop sits this far beyond the level, in percent
+MIN_STOP_DISTANCE_PCT = 0.15            # the stop is never closer to the price than this
+MAX_STOP_DISTANCE_PCT = 1.00            # a level farther than this is too far: no trade plan
 SCALE_OUT = (0.30, 0.40, 0.30)          # share closed at targets 1, 2 and 3 (2+ contracts)
 MERGE_WITHIN_PCT = 0.05                 # targets this close together count as one
 MIN_REWARD_TO_RISK = 1.5                # the entry zone ends where reward/risk drops below this
@@ -49,7 +51,7 @@ DELTA_BAND = (0.35, 0.50)               # the pre-trade |delta| band (same as Be
 class Level:
     name: str
     price: float
-    kind: str            # resistance | support | put_wall | flip | vwap | range | spot
+    kind: str            # resistance | support | put_wall | flip | vwap | ema | range | spot
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,7 @@ class TradePlan:
     single_contract: str
     notes: tuple[str, ...]
     other_side: str
+    cautions: tuple[str, ...] = ()       # facts worth knowing that do not block the plan
 
 
 @dataclass(frozen=True)
@@ -106,6 +109,7 @@ class Plan:
     changes: tuple[str, ...]
     missing: tuple[str, ...] = field(default_factory=tuple)
     trade: TradePlan | None = None
+    price_note: str = ""                 # where the current price came from, and when
 
     def candidate_for(self, pool: str) -> Candidate | None:
         return next((c for c in self.candidates if c.pool == pool), None)
@@ -147,7 +151,7 @@ def regime_from_gamma(gamma: dict | None) -> tuple[str, str, float | None]:
 
 
 def build_levels(spot: float | None, gamma: dict | None, vwap: Any = None,
-                 expected: dict | None = None) -> tuple[Level, ...]:
+                 expected: dict | None = None, emas: dict | None = None) -> tuple[Level, ...]:
     """Every level with a price, highest first, with spot placed among them. Levels that
     share a price are merged into one row."""
     raw: list[Level] = []
@@ -163,6 +167,8 @@ def build_levels(spot: float | None, gamma: dict | None, vwap: Any = None,
     add("Put wall", g.get("put_wall"), "put_wall")
     add("First negative strike", g.get("first_negative_below_spot"), "flip")
     add("VWAP", vwap, "vwap")
+    add("15-minute EMA 21", (emas or {}).get("ema21"), "ema")
+    add("15-minute EMA 50", (emas or {}).get("ema50"), "ema")
     add("Expected range high", (expected or {}).get("Upper_1SD"), "range")
     add("Expected range low", (expected or {}).get("Lower_1SD"), "range")
     add("Spot", spot, "spot")
@@ -286,13 +292,17 @@ def build_trade_plan(side: str, *, spot: Any, gamma: dict | None = None, vwap: A
                      expected: dict | None = None, session_high: Any = None,
                      session_low: Any = None, stop_buffer_pct: float = STOP_BUFFER_PCT,
                      scale_out: tuple[float, float, float] = SCALE_OUT,
-                     min_reward_to_risk: float = MIN_REWARD_TO_RISK) -> TradePlan | None:
+                     min_reward_to_risk: float = MIN_REWARD_TO_RISK,
+                     emas: dict | None = None) -> TradePlan | None:
     """The plan for the allowed side, in prices of the stock (not the option premium).
 
-    Calls: stop under the nearest support below price (VWAP or gamma support); targets
-    above price from session high, call resistance and the expected range high.
-    Puts mirror it: stop above the nearest resistance (VWAP or call resistance); targets
-    below from session low, gamma support and the expected range low.
+    Calls: stop under the nearest support below price, chosen from VWAP, the 15-minute
+    EMA 21 and EMA 50 (the lines the trend rule rests on) and gamma support. The stop is
+    never closer to the price than MIN_STOP_DISTANCE_PCT. If the nearest support is
+    farther than MAX_STOP_DISTANCE_PCT there is no plan, because that is not a stop.
+    Targets above price: VWAP (when price is below it), session high, call resistance
+    and the expected range high.
+    Puts mirror it with resistance above price and targets below.
 
     Entry zone: from the stop's level to the price where the reward to target 1 is still
     ``min_reward_to_risk`` times the risk to the stop. Beyond that price the plan says wait.
@@ -318,29 +328,62 @@ def build_trade_plan(side: str, *, spot: Any, gamma: dict | None = None, vwap: A
     if px is None or px <= 0:
         return unready("No current price, so no stop or target can be set.")
 
+    e = emas or {}
+    v = _f(vwap)
+    ema_levels = [("15-minute EMA 21", _f(e.get("ema21")), "ema"),
+                  ("15-minute EMA 50", _f(e.get("ema50")), "ema")]
+    cautions: list[str] = []
     if calls:
-        anchors = [("VWAP", _f(vwap), "vwap"), ("Gamma support", _f(g.get("support")), "support")]
+        anchors = [("VWAP", v, "vwap"), *ema_levels,
+                   ("Gamma support", _f(g.get("support")), "support")]
         anchors = [a for a in anchors if a[1] is not None and a[1] < px]
-        goals = [("Session high", _f(session_high)), ("Call resistance", _f(g.get("resistance"))),
+        goals = [("VWAP", v), ("Session high", _f(session_high)),
+                 ("Call resistance", _f(g.get("resistance"))),
                  ("Expected range high", _f(ex.get("Upper_1SD")))]
         goals = [t for t in goals if t[1] is not None and t[1] > px]
+        if v is not None and v > px:
+            cautions.append(f"Price is below VWAP at {_usd(round(v, 2))}: buyers have not "
+                            "taken back the day's average price, and VWAP is the first "
+                            "resistance overhead.")
     else:
-        anchors = [("VWAP", _f(vwap), "vwap"),
+        anchors = [("VWAP", v, "vwap"), *ema_levels,
                    ("Call resistance", _f(g.get("resistance")), "resistance")]
         anchors = [a for a in anchors if a[1] is not None and a[1] > px]
-        goals = [("Session low", _f(session_low)), ("Gamma support", _f(g.get("support"))),
+        goals = [("VWAP", v), ("Session low", _f(session_low)),
+                 ("Gamma support", _f(g.get("support"))),
                  ("Expected range low", _f(ex.get("Lower_1SD")))]
         goals = [t for t in goals if t[1] is not None and t[1] < px]
+        if v is not None and v < px:
+            cautions.append(f"Price is above VWAP at {_usd(round(v, 2))}: sellers have not "
+                            "taken back the day's average price, and VWAP is the first "
+                            "support underneath.")
+    base["cautions"] = tuple(cautions)
 
+    kind_word = "support level below" if calls else "resistance level above"
     if not anchors:
-        return unready("No " + ("support level below" if calls else "resistance level above")
-                       + " the current price to anchor a stop to.")
-    name, level, kind = max(anchors, key=lambda a: a[1]) if calls else min(anchors, key=lambda a: a[1])
+        return unready(f"No {kind_word} the current price to anchor a stop to.")
+
+    def dist_pct(level: float) -> float:
+        return abs(px - level) / px * 100.0
+
+    name, level, kind = (max(anchors, key=lambda a: a[1]) if calls
+                         else min(anchors, key=lambda a: a[1]))
+    if dist_pct(level) > MAX_STOP_DISTANCE_PCT:
+        side_word = "support" if calls else "resistance"
+        return unready(
+            f"The nearest {side_word} is {name} at {_usd(level)}, "
+            f"{dist_pct(level):.1f}% from the current price. That is too far to be a stop "
+            f"(the limit is {MAX_STOP_DISTANCE_PCT:g}%). No {'calls' if calls else 'puts'} "
+            f"entry until price sits nearer a {side_word} level.")
     buffer = level * stop_buffer_pct / 100.0
-    stop = level - buffer if calls else level + buffer
+    floor = px * MIN_STOP_DISTANCE_PCT / 100.0          # keep the stop out of the noise
+    stop = min(level - buffer, px - floor) if calls else max(level + buffer, px + floor)
+    widened = (stop < level - buffer) if calls else (stop > level + buffer)
     risk = abs(px - stop)
     stop_note = (f"{stop_buffer_pct:g}% {'under' if calls else 'above'} {name} at {_usd(level)}, "
-                 f"the nearest {'support below' if calls else 'resistance above'} price.")
+                 f"the nearest {'support below' if calls else 'resistance above'} price."
+                 + (f" Widened to stay {MIN_STOP_DISTANCE_PCT:g}% away from the price."
+                    if widened else ""))
     anchor = Level(name, level, kind)
 
     merged = _merge_targets(goals, ascending=calls)
@@ -390,7 +433,8 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
                picks: pd.DataFrame | None = None, session_high: Any = None,
                session_low: Any = None,
                stop_buffer_pct: float = STOP_BUFFER_PCT,
-               min_reward_to_risk: float = MIN_REWARD_TO_RISK) -> Plan:
+               min_reward_to_risk: float = MIN_REWARD_TO_RISK,
+               price_note: str = "", emas: dict | None = None) -> Plan:
     side, side_reason = side_from_trend(trend)
     regime, regime_note, net = regime_from_gamma(gamma)
     candidates = []
@@ -413,14 +457,15 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
         ticker=str(ticker or "").upper(), spot=_f(spot), as_of=(trend or {}).get("as_of"),
         stale=stale, side=side, side_reason=side_reason, regime=regime,
         regime_note=regime_note, net_gex=net, gamma_expiry=(gamma or {}).get("expiry"),
-        levels=build_levels(_f(spot), gamma, vwap, expected),
+        levels=build_levels(_f(spot), gamma, vwap, expected, emas),
         candidates=tuple(candidates),
         expect=_expect(side, regime, gamma), changes=_changes(side, regime, gamma, stale),
         missing=missing,
         trade=build_trade_plan(side, spot=spot, gamma=gamma, vwap=vwap, expected=expected,
                                session_high=session_high, session_low=session_low,
                                stop_buffer_pct=stop_buffer_pct,
-                               min_reward_to_risk=min_reward_to_risk),
+                               min_reward_to_risk=min_reward_to_risk, emas=emas),
+        price_note=price_note,
     )
 
 

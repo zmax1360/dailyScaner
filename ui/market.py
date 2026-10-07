@@ -84,3 +84,22 @@ def render_market_banner() -> None:
             f"MARKET CLOSED — DATA IS END-OF-DAY  ({now.strftime('%A %H:%M ET')})",
             icon="🔴",
         )
+
+
+def live_session_snapshot(bars) -> dict:
+    """Latest price and the session's high and low from intraday bars (the last session
+    only). Empty when there are no bars. Nothing is estimated."""
+    if bars is None or getattr(bars, "empty", True):
+        return {}
+    need = {"High", "Low", "Close"}
+    if not need <= set(bars.columns):
+        return {}
+    close = bars["Close"].dropna()
+    if close.empty:
+        return {}
+    return {
+        "price": float(close.iloc[-1]),
+        "high": float(bars["High"].max()),
+        "low": float(bars["Low"].min()),
+        "at": close.index[-1],
+    }

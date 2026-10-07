@@ -414,4 +414,5 @@ def plan_for_message(payload: dict, prev_payload: dict | None, ticker: str,
         session_low=(payload.get("session") or {}).get("day_low"),
         stop_buffer_pct=stop_buffer_pct,
         min_reward_to_risk=min_reward_to_risk,
+        emas=((payload.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
     )

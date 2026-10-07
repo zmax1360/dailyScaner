@@ -12,7 +12,8 @@ from ui.common import ET
 SIDE_STYLE = {gp.CALLS: ("🟢", "rgb(34, 197, 94)"), gp.PUTS: ("🔴", "rgb(239, 68, 68)"),
               gp.STAND_ASIDE: ("⛔", "rgb(250, 204, 21)"), gp.UNKNOWN: ("ℹ️", "#9e9e9e")}
 KIND_COLOR = {"resistance": "#C084FC", "support": "#FACC15", "put_wall": "#2DD4BF",
-              "flip": "#5EEAD4", "vwap": "#00E5FF", "range": "#90A4AE", "spot": "#FFFFFF"}
+              "flip": "#5EEAD4", "vwap": "#00E5FF", "ema": "#60A5FA", "range": "#90A4AE",
+              "spot": "#FFFFFF"}
 
 
 def _md(text: str) -> str:
@@ -93,6 +94,8 @@ def render_trade(trade: gp.TradePlan | None) -> None:
         return
     word = "calls" if trade.side == gp.CALLS else "puts"
     st.markdown(f"**Trade plan · {word}**")
+    for caution in trade.cautions:
+        st.caption(_md("⚠️ " + caution))
     if not trade.ready:
         st.info(_md(trade.notes[0]))
     else:
@@ -110,6 +113,14 @@ def render_trade(trade: gp.TradePlan | None) -> None:
 
 def render(plan: gp.Plan) -> None:
     st.subheader(f"{plan.ticker} game plan")
+    if plan.stale:
+        when = f" ({plan.as_of.astimezone(ET):%a %b %d %H:%M ET})" if plan.as_of else ""
+        st.error(
+            f"The latest scan is more than 30 minutes old{when}. The allowed side, the gamma "
+            "levels and the candidates below come from that scan. Check that the scheduler "
+            "is running, and wait for a new scan before acting on this plan.",
+            icon="⏱️",
+        )
 
     icon, _ = SIDE_STYLE[plan.side]
     cols = st.columns(2 + len(plan.candidates))
@@ -143,5 +154,5 @@ def render(plan: gp.Plan) -> None:
 
     when = f"scan {plan.as_of.astimezone(ET):%a %b %d %H:%M ET}" if plan.as_of else "scan time unknown"
     missing = f" · not available: {', '.join(plan.missing)}" if plan.missing else ""
-    st.caption(f"Built by fixed rules from the {when}{missing}. "
-               "It describes where things stand, not where price will go.")
+    st.caption(f"Built by fixed rules from the {when}{missing}. {plan.price_note} "
+               "It describes where things stand, not where price will go.".replace("  ", " "))

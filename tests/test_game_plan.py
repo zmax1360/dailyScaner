@@ -137,6 +137,13 @@ def test_levels_are_sorted_high_to_low_with_spot_among_them():
     assert prices == sorted(prices, reverse=True)
 
 
+def test_the_15_minute_emas_appear_in_the_levels_ladder():
+    names = [lv.name for lv in _plan(emas=EMAS).levels]
+    assert names.index("Spot") < names.index("15-minute EMA 21") < names.index(
+        "15-minute EMA 50") < names.index("VWAP")
+    assert "15-minute EMA 21" not in [lv.name for lv in _plan().levels]
+
+
 def test_levels_sharing_a_price_are_merged_and_missing_ones_left_out():
     same = {**GAMMA, "first_negative_below_spot": 320.0}
     names = [lv.name for lv in _plan(gamma=same).levels]
@@ -206,17 +213,76 @@ def _trade(side=gp.CALLS, **kw):
     return gp.build_trade_plan(side, **kw)
 
 
+EMAS = {"ema21": 333.13, "ema50": 332.96}
+
+
 def test_calls_stop_sits_under_the_nearest_support_below_price():
     t = _trade()
     assert t.ready and t.better_entry.name == "VWAP"                 # 332.91 beats 330
     assert t.stop == pytest.approx(332.91 * (1 - 0.10 / 100))
     assert t.risk == pytest.approx(333.69 - t.stop)
-    assert "0.1% under VWAP at $332.91" in t.stop_note
-    no_vwap = _trade(vwap=None)
-    assert no_vwap.better_entry.name == "Gamma support"
-    assert no_vwap.stop == pytest.approx(330.0 * 0.999)
-    above = _trade(vwap=334.20)                                      # VWAP above price: not support
-    assert above.better_entry.name == "Gamma support"
+    assert "0.1% under VWAP at $332.91" in t.stop_note and "Widened" not in t.stop_note
+
+
+def test_the_15_minute_emas_are_stop_anchors():
+    """Reported case (Oct 5, 9:58): price just under VWAP left only gamma support at $330,
+    a stop $5.10 away. The EMA 21 the trend rule rests on is the nearer support."""
+    kw = dict(spot=334.77, vwap=334.90, session_high=336.19,
+              gamma={"support": 330.0, "resistance": 340.0},
+              expected={"Upper_1SD": 345.04, "Lower_1SD": 322.3})
+    t = _trade(emas=EMAS, **kw)
+    assert t.better_entry.name == "15-minute EMA 21" and t.better_entry.kind == "ema"
+    assert t.stop == pytest.approx(333.13 * 0.999) and t.risk == pytest.approx(1.97, abs=0.01)
+    ema50_only = _trade(emas={"ema50": 332.96}, **kw)
+    assert ema50_only.better_entry.name == "15-minute EMA 50"
+    above_price = _trade(emas={"ema21": 335.9, "ema50": 335.3}, **kw)      # not below price
+    assert not above_price.ready
+
+
+def test_no_plan_when_the_nearest_support_is_too_far_to_be_a_stop():
+    """Reported case (Oct 7): the only support was gamma support at $320, $14.77 away."""
+    t = _trade(spot=334.45, vwap=335.22, session_high=338.67,
+               gamma={"support": 320.0, "resistance": 337.5},
+               expected={"Upper_1SD": 340.04, "Lower_1SD": 328.9},
+               emas={"ema21": 335.9, "ema50": 335.3})
+    assert not t.ready and t.stop is None and t.entry_limit is None
+    assert t.notes == ("The nearest support is Gamma support at $320, 4.3% from the current "
+                       "price. That is too far to be a stop (the limit is 1%). No calls entry "
+                       "until price sits nearer a support level.",)
+    assert gp.MAX_STOP_DISTANCE_PCT == 1.0
+    edge = _trade(vwap=None)                               # $330 is 1.1% under 333.69
+    assert not edge.ready and "Gamma support at $330" in edge.notes[0]
+    near = _trade(spot=333.0, vwap=None)                   # $330 is 0.9% under 333.00
+    assert near.ready and near.better_entry.name == "Gamma support"
+
+
+def test_stop_is_never_closer_to_price_than_the_minimum_distance():
+    t = _trade(spot=333.20, vwap=334.28, session_high=336.19, emas={"ema21": 333.07,
+                                                                    "ema50": 332.94})
+    assert t.better_entry.name == "15-minute EMA 21"       # only $0.13 under price
+    assert t.stop == pytest.approx(333.20 * (1 - gp.MIN_STOP_DISTANCE_PCT / 100))
+    assert t.stop < 333.07 * 0.999 and "Widened to stay 0.15% away" in t.stop_note
+    assert _trade(gp.PUTS, spot=334.10, vwap=334.20).stop == pytest.approx(
+        334.10 * (1 + gp.MIN_STOP_DISTANCE_PCT / 100))
+
+
+def test_vwap_is_the_first_target_when_price_is_on_the_wrong_side_of_it():
+    t = _trade(spot=333.20, vwap=334.28, session_high=336.19, emas=EMAS | {"ema21": 333.07})
+    assert [x.name for x in t.targets][:2] == ["VWAP", "Call resistance"]
+    assert t.targets[0].price == 334.28
+    assert t.cautions == ("Price is below VWAP at $334.28: buyers have not taken back the "
+                          "day's average price, and VWAP is the first resistance overhead.",)
+    assert _trade().cautions == ()                         # price above VWAP: nothing to say
+    assert "VWAP" not in [x.name for x in _trade().targets]
+    p = _trade(gp.PUTS, vwap=332.91)                       # puts with price above VWAP
+    assert p.targets[0].name == "VWAP" and "first support underneath" in p.cautions[0]
+
+
+def test_at_most_three_targets_the_nearest_ones():
+    t = _trade(spot=333.20, vwap=334.28, session_high=336.19, emas={"ema21": 333.07})
+    assert len(t.targets) == 3
+    assert [x.name for x in t.targets] == ["VWAP", "Call resistance", "Session high"]
+    assert sum(x.share for x in t.targets) == pytest.approx(1.0)
 
 
 def test_stop_buffer_is_adjustable():
@@ -272,10 +338,10 @@ def test_price_above_the_entry_zone_means_wait():
 
 
 def test_price_inside_the_entry_zone_has_no_warning():
-    t = _trade(spot=333.20)
+    t = _trade(spot=333.45, session_high=None)             # target 1 is call resistance
     assert t.in_zone and not t.poor and t.notes == ()
     assert t.reward_to_risk >= 1.5
-    assert t.better_entry.price < 333.20 <= t.entry_limit
+    assert t.better_entry.price < 333.45 <= t.entry_limit
 
 
 def test_puts_entry_limit_is_a_floor():
@@ -373,6 +439,14 @@ def test_view_draws_the_trade_plan_with_a_warning_when_poor():
     assert any("With one contract, exit all of it at target 1." in c.value for c in at.caption)
 
 
+def test_view_shows_cautions_and_the_too_far_message():
+    """Price below VWAP with the only support far away: a caution and no plan table."""
+    at = _run(extra=", vwap=335.22, gamma={**GAMMA, 'support': 320.0}")
+    assert any("Price is below VWAP at" in c.value for c in at.caption)
+    assert any("too far to be a stop" in i.value for i in at.info)
+    assert not any("Target 1" in m.value for m in at.markdown)
+
+
 def test_view_has_no_trade_plan_on_a_stand_aside_day():
     at = _run(trend="MIXED")
     assert "Trade plan" not in " ".join(m.value for m in at.markdown)
@@ -438,7 +512,7 @@ def test_plan_for_message_builds_from_an_archive_without_vwap():
 # ── view ────────────────────────────────────────────────────────────────────
 
 _SCRIPT = """
-from tests.test_game_plan import _plan, {trend}
+from tests.test_game_plan import BEAR, BULL, GAMMA, MIXED, NO_DATA, _plan, _trend
 from ui import game_plan_view
 game_plan_view.render(_plan(trend={trend}{extra}))
 """
@@ -504,3 +578,64 @@ def test_game_plan_page_draws_only_its_section(monkeypatch):
     monkeypatch.setattr(flow, "render", lambda cfg, sections=None: seen.update(s=sections))
     flow.render_game_plan({"ticker": "AAPL"})
     assert seen["s"] == frozenset({"game_plan"})
+
+
+# ── live price and stale scans ──────────────────────────────────────────────
+
+def test_live_session_snapshot_reads_price_high_and_low_from_bars():
+    from ui.market import live_session_snapshot
+
+    idx = pd.date_range("2026-10-05 09:30", periods=4, freq="5min")
+    bars = pd.DataFrame({"Open": [335.2, 335.9, 335.0, 334.6],
+                         "High": [336.2, 336.08, 335.3, 334.9],
+                         "Low": [331.7, 334.56, 334.4, 334.5],
+                         "Close": [335.2, 334.76, 334.6, 334.76]}, index=idx)
+    snap = live_session_snapshot(bars)
+    assert snap == {"price": 334.76, "high": 336.2, "low": 331.7,
+                    "at": pd.Timestamp("2026-10-05 09:45")}
+    assert live_session_snapshot(None) == {} and live_session_snapshot(pd.DataFrame()) == {}
+    assert live_session_snapshot(bars.drop(columns=["High"])) == {}
+    assert live_session_snapshot(bars.assign(Close=float("nan"))) == {}
+
+
+def test_a_live_price_above_vwap_anchors_the_stop_to_vwap_not_to_a_far_level():
+    """Reported case (Oct 5, 9:49): the plan used Friday's 333.69 against a live VWAP of
+    334.90, so VWAP looked like resistance and the stop fell back to $330, $4 away.
+    With the live price VWAP is the support just below, and the stop sits under it."""
+    live = _trade(spot=334.76, vwap=334.47, session_high=336.20,
+                  expected={"Upper_1SD": 345.09, "Lower_1SD": 322.29})
+    assert live.better_entry.name == "VWAP"
+    assert live.stop == pytest.approx(334.47 * 0.999) and live.risk < 1.0
+    assert [t.name for t in live.targets] == ["Call resistance", "Session high",
+                                              "Expected range high"]
+    assert not live.in_zone and round(live.entry_limit, 2) == 334.48     # wait for VWAP
+    stale = _trade(spot=333.69, vwap=334.90, session_high=None,
+                   expected={"Upper_1SD": 345.09, "Lower_1SD": 322.29})
+    assert not stale.ready and "too far to be a stop" in stale.notes[0]  # no $4 stop any more
+
+
+def test_price_note_is_carried_on_the_plan():
+    assert _plan(price_note="Price from the Mon Oct 05 09:45 5-minute bar.").price_note == (
+        "Price from the Mon Oct 05 09:45 5-minute bar.")
+    assert _plan().price_note == ""
+
+
+def test_view_warns_at_the_top_when_the_scan_is_stale():
+    at = _run(trend="_trend(333.44, 333.01, 332.62, stale=True)")
+    assert len(at.error) == 1
+    assert "more than 30 minutes old" in at.error[0].value
+    assert "Check that the scheduler is running" in at.error[0].value
+    assert len(_run().error) == 0                                       # fresh scan: no banner
+
+
+def test_view_caption_says_where_the_price_came_from():
+    at = _run(extra=", price_note='Price from the Mon Oct 05 09:45 5-minute bar.'")
+    assert any("Price from the Mon Oct 05 09:45 5-minute bar." in c.value for c in at.caption)
+
+
+def test_game_plan_section_takes_its_price_from_live_bars():
+    src = (ROOT / "ui" / "pages" / "flow.py").read_text()
+    block = src[src.index('if "game_plan" in sections:'):src.index('if "header" in sections:')]
+    assert "live_session_snapshot(_cached_vwap_chart_df(ticker, \"5M\"))" in block
+    assert "spot=plan_price" in block and "gamma_summary_for(ticker, plan_price)" in block
+    assert 'live.get("high", day_high)' in block and 'live.get("low", day_low)' in block

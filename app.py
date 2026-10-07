@@ -31,6 +31,7 @@ from ui.services import _SCANNER_DIR, _discover_tickers, _scan_archive_metadata
 from ui.pages import archive as archive_page
 from ui.pages import flow as flow_page
 from ui.pages import journal as journal_page
+from ui.pages import scorecard as scorecard_page
 from ui.pages import settings as settings_page
 from ui.pages import news as news_page
 from ui.pages import spread_gate as spread_gate_page
@@ -377,6 +378,8 @@ def main():
         journal_page.render()
     elif page == "pretrade":
         _render_pre_trade(cfg, cand)
+    elif page == "scorecard":
+        scorecard_page.render(cfg)
     elif page == "settings":
         settings_page.render(cfg)
     elif page in COMPONENTS:

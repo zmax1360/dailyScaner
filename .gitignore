@@ -24,6 +24,7 @@ scheduler.pid.lock
 attribution_report.html
 cha.txt
 data/broker/
+data/ui_settings.json
 data/journal copy/
 data/journal.bak/
 data/journal.bak-*/
