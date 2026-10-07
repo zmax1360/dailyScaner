@@ -232,8 +232,14 @@ class _FakeSt:
 
 
 def test_clean_keeps_valid_settings_and_drops_everything_else():
-    good = {"min_dte": 3, "top_n": 9, "sort_by": "Strike", "show_all_ranked": True}
+    good = {"min_dte": 3, "top_n": 9, "sort_by": "Strike", "show_all_ranked": True,
+            "stop_buffer_pct": 0.25, "min_reward_to_risk": 2.0}
     assert shell.clean(good) == good
+    for bad in (0.4, 5.5, "2", True, None):
+        assert shell.clean({"min_reward_to_risk": bad}) == {}
+    assert shell.clean({"stop_buffer_pct": 1}) == {"stop_buffer_pct": 1.0}
+    for bad in (-0.1, 2.5, "0.1", True, None):
+        assert shell.clean({"stop_buffer_pct": bad}) == {}
     assert shell.clean({"min_dte": -1, "top_n": 31, "sort_by": "Nope",
                         "show_all_ranked": "yes", "unknown": 1}) == {}
     assert shell.clean({"min_dte": True, "top_n": 2.5}) == {}        # bool / float are not ints
@@ -259,7 +265,8 @@ def test_save_if_changed_writes_only_on_a_real_change():
     assert shell.save_if_changed(st, writes.append) is True
     assert shell.save_if_changed(st, writes.append) is False
     assert writes == [{"min_dte": 1, "top_n": 5, "sort_by": "Volume",
-                       "show_all_ranked": True}]
+                       "show_all_ranked": True, "stop_buffer_pct": 0.10,
+                       "min_reward_to_risk": 1.5}]
 
 
 def test_settings_file_round_trip_and_bad_files(tmp_path):
@@ -307,11 +314,13 @@ def test_settings_survive_an_app_restart(tmp_path, monkeypatch):
     first.toggle(key="w_show_all_ranked").set_value(True).run()
     first.number_input(key="w_top_n").set_value(8).run()
     assert json.loads((tmp_path / "ui_settings.json").read_text()) == {
-        "min_dte": 1, "top_n": 8, "sort_by": "Volume", "show_all_ranked": True}
+        "min_dte": 1, "top_n": 8, "sort_by": "Volume", "show_all_ranked": True,
+        "stop_buffer_pct": 0.10, "min_reward_to_risk": 1.5}
 
     second = AppTest.from_string(_SAVED).run()                      # a brand-new session
     assert not second.exception
     assert json.loads(second.json[0].value) == {
-        "min_dte": 1, "top_n": 8, "sort_by": "Volume", "show_all_ranked": True}
+        "min_dte": 1, "top_n": 8, "sort_by": "Volume", "show_all_ranked": True,
+        "stop_buffer_pct": 0.10, "min_reward_to_risk": 1.5}
     assert second.toggle(key="w_show_all_ranked").value is True
     assert second.number_input(key="w_top_n").value == 8

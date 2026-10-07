@@ -2145,6 +2145,9 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
             trend=ema_stack.banner_for_archive(curr, now=datetime.now(ET)),
             gamma=gamma_summary_for(ticker, spot),
             vwap=vwap_px, expected=em_range, picks=picks,
+            session_high=day_high, session_low=day_low,
+            stop_buffer_pct=float(shell.setting(st, "stop_buffer_pct")),
+            min_reward_to_risk=float(shell.setting(st, "min_reward_to_risk")),
         ))
 
     if "header" in sections:
