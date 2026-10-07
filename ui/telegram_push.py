@@ -394,7 +394,9 @@ def format_gamma_lines(summary: dict | None) -> list[str]:
 
 
 def plan_for_message(payload: dict, prev_payload: dict | None, ticker: str,
-                     gamma: dict | None = None):
+                     gamma: dict | None = None,
+                     stop_buffer_pct: float = game_plan.STOP_BUFFER_PCT,
+                     min_reward_to_risk: float = game_plan.MIN_REWARD_TO_RISK):
     """Game plan from one archive, for the Telegram push. VWAP is not in the archive, so
     it is left out; the candidate uses the same basic ranking as the message's Best Value
     section."""
@@ -408,4 +410,8 @@ def plan_for_message(payload: dict, prev_payload: dict | None, ticker: str,
         trend=ema_stack.banner_for_archive(payload, now=datetime.now(ET)),
         gamma=gamma, vwap=None, expected=ticker_expected_range(spot, vol),
         picks=_build_best_value_df(vol, spot, prev_vol, min_volume=500),
+        session_high=(payload.get("session") or {}).get("day_high"),
+        session_low=(payload.get("session") or {}).get("day_low"),
+        stop_buffer_pct=stop_buffer_pct,
+        min_reward_to_risk=min_reward_to_risk,
     )

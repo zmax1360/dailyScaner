@@ -6,7 +6,12 @@ nothing here feeds scoring.
     allowed side   <- the 15-minute EMA 9/21/50 trend rule (ema_stack)
     type of day    <- the sign of net gamma exposure for the nearest expiry (gex.summary)
     levels         <- gamma support / resistance / put wall, VWAP, 1SD expected range
-    candidate      <- the top-ranked 1DTE+ Best Value pick on the allowed side
+    candidates     <- the top-ranked Best Value pick on the allowed side, one for each
+                      DTE pool (1DTE+ and 0DTE; the pools are never mixed)
+    trade plan     <- for the allowed side: stop under the nearest support (above the
+                      nearest resistance for puts), targets from session high or low, the
+                      gamma level and the 1SD range edge, scale-out, time exit, and the
+                      reward against the risk from the current price
     what changes it
 
 A missing input is reported as unknown or left out. It is never guessed.
@@ -21,7 +26,8 @@ from typing import Any
 import pandas as pd
 
 import ema_stack
-from scoring_pool import POOL_1DTE
+from scoring_pool import POOL_0DTE, POOL_1DTE
+from time_stop import TIME_STOP_CAP, window_minutes_for_dte
 
 CALLS, PUTS, STAND_ASIDE, UNKNOWN = "CALLS", "PUTS", "STAND_ASIDE", "UNKNOWN"
 POSITIVE, NEGATIVE = "POSITIVE", "NEGATIVE"
@@ -30,6 +36,13 @@ SIDE_LABEL = {CALLS: "Calls only", PUTS: "Puts only", STAND_ASIDE: "Stand aside"
               UNKNOWN: "Unknown"}
 REGIME_LABEL = {POSITIVE: "Positive gamma", NEGATIVE: "Negative gamma", UNKNOWN: "Unknown"}
 _OPTION_SIDE = {CALLS: "CALL", PUTS: "PUT"}
+POOLS = (POOL_1DTE, POOL_0DTE)          # shown in this order
+
+STOP_BUFFER_PCT = 0.10                  # the stop sits this far beyond the level, in percent
+SCALE_OUT = (0.30, 0.40, 0.30)          # share closed at targets 1, 2 and 3 (2+ contracts)
+MERGE_WITHIN_PCT = 0.05                 # targets this close together count as one
+MIN_REWARD_TO_RISK = 1.5                # the entry zone ends where reward/risk drops below this
+DELTA_BAND = (0.35, 0.50)               # the pre-trade |delta| band (same as Best Value's table)
 
 
 @dataclass(frozen=True)
@@ -37,6 +50,42 @@ class Level:
     name: str
     price: float
     kind: str            # resistance | support | put_wall | flip | vwap | range | spot
+
+
+@dataclass(frozen=True)
+class Candidate:
+    pool: str
+    pick: dict[str, Any] | None
+    note: str
+
+
+@dataclass(frozen=True)
+class Target:
+    name: str
+    price: float
+    share: float                         # fraction of the position closed here
+    reward: float                        # distance from the entry price, always positive
+
+
+@dataclass(frozen=True)
+class TradePlan:
+    side: str                            # CALLS or PUTS
+    ready: bool                          # False when a stop or a target cannot be set
+    entry: float | None                  # the current price
+    better_entry: Level | None           # the level the stop is anchored to
+    stop: float | None
+    stop_note: str
+    targets: tuple[Target, ...]
+    risk: float | None
+    reward_to_risk: float | None         # to the first target, entering at the current price
+    entry_limit: float | None            # calls: enter at or below; puts: at or above
+    in_zone: bool                        # the current price is inside the entry zone
+    min_reward_to_risk: float
+    poor: bool                           # True when the current price is outside the zone
+    time_exit: str
+    single_contract: str
+    notes: tuple[str, ...]
+    other_side: str
 
 
 @dataclass(frozen=True)
@@ -52,11 +101,14 @@ class Plan:
     net_gex: float | None
     gamma_expiry: str | None
     levels: tuple[Level, ...]
-    candidate: dict[str, Any] | None
-    candidate_note: str
+    candidates: tuple[Candidate, ...]
     expect: tuple[str, ...]
     changes: tuple[str, ...]
     missing: tuple[str, ...] = field(default_factory=tuple)
+    trade: TradePlan | None = None
+
+    def candidate_for(self, pool: str) -> Candidate | None:
+        return next((c for c in self.candidates if c.pool == pool), None)
 
 
 def _f(v: Any) -> float | None:
@@ -128,8 +180,9 @@ def build_levels(spot: float | None, gamma: dict | None, vwap: Any = None,
     return tuple(sorted(merged.values(), key=lambda lv: (-lv.price, lv.kind != "spot")))
 
 
-def pick_candidate(picks: pd.DataFrame | None, side: str) -> dict[str, Any] | None:
-    """Highest-scoring ranked 1DTE+ contract on the allowed side, or None."""
+def pick_candidate(picks: pd.DataFrame | None, side: str,
+                   pool: str = POOL_1DTE) -> dict[str, Any] | None:
+    """Highest-scoring ranked contract of ``pool`` on the allowed side, or None."""
     want = _OPTION_SIDE.get(side)
     if want is None or picks is None or getattr(picks, "empty", True):
         return None
@@ -137,13 +190,14 @@ def pick_candidate(picks: pd.DataFrame | None, side: str) -> dict[str, Any] | No
     if not need <= set(picks.columns):
         return None
     df = picks[(picks["side"].astype(str).str.upper() == want)
-               & (picks["pool"] == POOL_1DTE) & picks["Value_Score"].notna()]
+               & (picks["pool"] == pool) & picks["Value_Score"].notna()]
     if df.empty:
         return None
     b = df.sort_values("Value_Score", ascending=False).iloc[0]
     oi = _f(b.get("openInterest"))
     vol = _f(b.get("volume"))
     return {
+        "pool": pool,
         "side": want, "strike": float(b["strike"]), "expiry": str(b["expiry"])[:10],
         "dte": None if _f(b.get("dte")) is None else int(b["dte"]),
         "last": _f(b.get("last")), "score": float(b["Value_Score"]),
@@ -199,18 +253,156 @@ def _changes(side: str, regime: str, gamma: dict | None, stale: bool) -> tuple[s
     return tuple(out)
 
 
+def _time_exit_text() -> str:
+    return (f"0DTE: {window_minutes_for_dte(0)} minutes after entry. "
+            f"1DTE+: {window_minutes_for_dte(1)} minutes after entry. "
+            f"Never past {TIME_STOP_CAP:%H:%M} ET.")
+
+
+def _merge_targets(found: list[tuple[str, float]], ascending: bool) -> list[tuple[str, float]]:
+    """Order the targets from nearest to farthest and merge any that sit together."""
+    found = sorted(found, key=lambda t: t[1], reverse=not ascending)
+    out: list[tuple[str, float]] = []
+    for name, price in found:
+        if out and abs(price - out[-1][1]) <= out[-1][1] * MERGE_WITHIN_PCT / 100.0:
+            out[-1] = (f"{out[-1][0]} / {name}", out[-1][1])
+        else:
+            out.append((name, price))
+    return out
+
+
+def _shares(n: int, scale_out: tuple[float, float, float]) -> tuple[float, ...]:
+    """Scale-out for n targets; the last one always closes whatever is left."""
+    if n <= 0:
+        return ()
+    if n == 1:
+        return (1.0,)
+    if n == 2:
+        return (scale_out[0], round(1.0 - scale_out[0], 10))
+    return tuple(scale_out)
+
+
+def build_trade_plan(side: str, *, spot: Any, gamma: dict | None = None, vwap: Any = None,
+                     expected: dict | None = None, session_high: Any = None,
+                     session_low: Any = None, stop_buffer_pct: float = STOP_BUFFER_PCT,
+                     scale_out: tuple[float, float, float] = SCALE_OUT,
+                     min_reward_to_risk: float = MIN_REWARD_TO_RISK) -> TradePlan | None:
+    """The plan for the allowed side, in prices of the stock (not the option premium).
+
+    Calls: stop under the nearest support below price (VWAP or gamma support); targets
+    above price from session high, call resistance and the expected range high.
+    Puts mirror it: stop above the nearest resistance (VWAP or call resistance); targets
+    below from session low, gamma support and the expected range low.
+
+    Entry zone: from the stop's level to the price where the reward to target 1 is still
+    ``min_reward_to_risk`` times the risk to the stop. Beyond that price the plan says wait.
+    None when no side is allowed. A missing level is left out, never assumed.
+    """
+    if side not in (CALLS, PUTS):
+        return None
+    px = _f(spot)
+    g, ex = gamma or {}, expected or {}
+    calls = side == CALLS
+    other = (f"{'Puts' if calls else 'Calls'}: not allowed today under the trend rule. They "
+             f"become allowed only if the 15-minute EMAs stack "
+             f"{'9 below 21 below 50' if calls else '9 above 21 above 50'}.")
+    base = dict(side=side, entry=px, time_exit=_time_exit_text(), other_side=other,
+                single_contract="With one contract, exit all of it at target 1.",
+                min_reward_to_risk=float(min_reward_to_risk))
+
+    def unready(note: str) -> TradePlan:
+        return TradePlan(ready=False, better_entry=None, stop=None, stop_note=note,
+                         targets=(), risk=None, reward_to_risk=None, entry_limit=None,
+                         in_zone=False, poor=False, notes=(note,), **base)
+
+    if px is None or px <= 0:
+        return unready("No current price, so no stop or target can be set.")
+
+    if calls:
+        anchors = [("VWAP", _f(vwap), "vwap"), ("Gamma support", _f(g.get("support")), "support")]
+        anchors = [a for a in anchors if a[1] is not None and a[1] < px]
+        goals = [("Session high", _f(session_high)), ("Call resistance", _f(g.get("resistance"))),
+                 ("Expected range high", _f(ex.get("Upper_1SD")))]
+        goals = [t for t in goals if t[1] is not None and t[1] > px]
+    else:
+        anchors = [("VWAP", _f(vwap), "vwap"),
+                   ("Call resistance", _f(g.get("resistance")), "resistance")]
+        anchors = [a for a in anchors if a[1] is not None and a[1] > px]
+        goals = [("Session low", _f(session_low)), ("Gamma support", _f(g.get("support"))),
+                 ("Expected range low", _f(ex.get("Lower_1SD")))]
+        goals = [t for t in goals if t[1] is not None and t[1] < px]
+
+    if not anchors:
+        return unready("No " + ("support level below" if calls else "resistance level above")
+                       + " the current price to anchor a stop to.")
+    name, level, kind = max(anchors, key=lambda a: a[1]) if calls else min(anchors, key=lambda a: a[1])
+    buffer = level * stop_buffer_pct / 100.0
+    stop = level - buffer if calls else level + buffer
+    risk = abs(px - stop)
+    stop_note = (f"{stop_buffer_pct:g}% {'under' if calls else 'above'} {name} at {_usd(level)}, "
+                 f"the nearest {'support below' if calls else 'resistance above'} price.")
+    anchor = Level(name, level, kind)
+
+    merged = _merge_targets(goals, ascending=calls)
+    if not merged:
+        return TradePlan(ready=False, better_entry=anchor, stop=stop, stop_note=stop_note,
+                         targets=(), risk=risk, reward_to_risk=None, entry_limit=None,
+                         in_zone=False, poor=False,
+                         notes=("No target " + ("above" if calls else "below")
+                                + " the current price among session "
+                                + ("high" if calls else "low")
+                                + ", the gamma level and the expected range.",), **base)
+    targets = tuple(Target(n, p, share, abs(p - px))
+                    for (n, p), share in zip(merged, _shares(len(merged), scale_out)))
+    rr = targets[0].reward / risk if risk > 0 else None
+    # Price at which reward to target 1 equals min_reward_to_risk times the risk to the
+    # stop. Calls must enter at or below it, puts at or above it.
+    k = float(min_reward_to_risk)
+    limit = (targets[0].price + k * stop) / (1.0 + k)
+    in_zone = px <= limit if calls else px >= limit
+    notes = []
+    if not in_zone:
+        notes.append(
+            f"Price is {'above' if calls else 'below'} the entry zone. At {_usd(round(px, 2))} "
+            f"the reward to target 1 is {rr:.1f} times the risk to the stop, and the plan "
+            f"needs {k:g}. Wait for {_usd(round(limit, 2))} or "
+            f"{'lower' if calls else 'higher'}."
+        )
+    return TradePlan(ready=True, better_entry=anchor, stop=stop, stop_note=stop_note,
+                     targets=targets, risk=risk, reward_to_risk=rr, entry_limit=limit,
+                     in_zone=in_zone, poor=not in_zone, notes=tuple(notes), **base)
+
+
+def _delta_note(pick: dict[str, Any]) -> str:
+    """Say so when the pick is outside the pre-trade delta band (it stays the pick)."""
+    d = _f(pick.get("delta"))
+    lo, hi = DELTA_BAND
+    if d is None:
+        return " It has no delta, so it cannot be checked against the pre-trade band."
+    if lo <= abs(d) <= hi:
+        return ""
+    return (f" Its delta is {abs(d):.2f}, outside the {lo:.2f} to {hi:.2f} pre-trade band"
+            + (": a low-probability contract." if abs(d) < lo else "."))
+
+
 def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None = None,
                vwap: Any = None, expected: dict | None = None,
-               picks: pd.DataFrame | None = None) -> Plan:
+               picks: pd.DataFrame | None = None, session_high: Any = None,
+               session_low: Any = None,
+               stop_buffer_pct: float = STOP_BUFFER_PCT,
+               min_reward_to_risk: float = MIN_REWARD_TO_RISK) -> Plan:
     side, side_reason = side_from_trend(trend)
     regime, regime_note, net = regime_from_gamma(gamma)
-    candidate = pick_candidate(picks, side)
-    if side not in (CALLS, PUTS):
-        note = "No candidate while no side is allowed."
-    elif candidate is None:
-        note = f"No ranked 1DTE+ {'call' if side == CALLS else 'put'} in this scan."
-    else:
-        note = "Top-ranked 1DTE+ Best Value pick on the allowed side."
+    candidates = []
+    for pool in POOLS:
+        pick = pick_candidate(picks, side, pool)
+        if side not in (CALLS, PUTS):
+            note = "No candidate while no side is allowed."
+        elif pick is None:
+            note = f"No ranked {pool} {'call' if side == CALLS else 'put'} in this scan."
+        else:
+            note = f"Top-ranked {pool} Best Value pick on the allowed side." + _delta_note(pick)
+        candidates.append(Candidate(pool, pick, note))
     stale = bool((trend or {}).get("stale"))
     missing = tuple(name for name, absent in (
         ("trend", side == UNKNOWN), ("gamma", gamma is None),
@@ -222,9 +414,13 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
         stale=stale, side=side, side_reason=side_reason, regime=regime,
         regime_note=regime_note, net_gex=net, gamma_expiry=(gamma or {}).get("expiry"),
         levels=build_levels(_f(spot), gamma, vwap, expected),
-        candidate=candidate, candidate_note=note,
+        candidates=tuple(candidates),
         expect=_expect(side, regime, gamma), changes=_changes(side, regime, gamma, stale),
         missing=missing,
+        trade=build_trade_plan(side, spot=spot, gamma=gamma, vwap=vwap, expected=expected,
+                               session_high=session_high, session_low=session_low,
+                               stop_buffer_pct=stop_buffer_pct,
+                               min_reward_to_risk=min_reward_to_risk),
     )
 
 
@@ -246,10 +442,30 @@ def plan_lines(plan: Plan) -> list[str]:
         f"🎯 <b>GAME PLAN · {plan.ticker}</b>",
         f"Side: <b>{SIDE_LABEL[plan.side]}</b>" + (" (scan is stale)" if plan.stale else ""),
         f"Day: <b>{REGIME_LABEL[plan.regime]}</b>",
-        f"Candidate: {candidate_text(plan.candidate)}",
-    ]
+    ] + [f"{c.pool}: {candidate_text(c.pick)}" for c in plan.candidates]
+    lines += trade_lines(plan.trade)
     ladder = [f"{lv.name} {_usd(lv.price)}" for lv in plan.levels]
     if ladder:
         lines.append("Levels: " + " &gt; ".join(ladder))
     lines += [f"• {text}" for text in plan.changes]
     return lines
+
+
+def trade_lines(trade: TradePlan | None) -> list[str]:
+    """Compact trade-plan lines for a Telegram (HTML) message."""
+    if trade is None:
+        return []
+    word = "Calls" if trade.side == CALLS else "Puts"
+    if not trade.ready:
+        return [f"{word} plan: {trade.notes[0]}"]
+    out = [f"{word} plan: enter at or {'below' if trade.side == CALLS else 'above'} "
+           f"<b>{_usd(round(trade.entry_limit, 2))}</b>"
+           + ("" if trade.in_zone else f" (now {_usd(round(trade.entry, 2))}: wait)"),
+           f"Stop <b>{_usd(round(trade.stop, 2))}</b> "
+           f"({trade.better_entry.name} {_usd(trade.better_entry.price)})"]
+    out.append("Targets: " + " · ".join(
+        f"{_usd(t.price)} {t.name} ({t.share:.0%})" for t in trade.targets))
+    if trade.reward_to_risk is not None:
+        out.append(f"Reward to risk from here: <b>{trade.reward_to_risk:.1f}</b> "
+                   f"(needs {trade.min_reward_to_risk:g})")
+    return out

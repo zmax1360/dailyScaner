@@ -58,6 +58,10 @@ def render(cfg: dict) -> None:
     st.markdown("**Best Value**")
     shell.render_best_value_settings(st)
 
+    st.divider()
+    st.markdown("**Game plan**")
+    shell.render_game_plan_settings(st)
+
     shell.save_if_changed(st, settings_store.save)
     st.caption("Settings are saved automatically and restored the next time the app starts.")
 
@@ -170,7 +174,11 @@ def render(cfg: dict) -> None:
                 },
                 expiry_drill=selected_expiries or None,
                 gamma=tg_gamma if inc_gamma else None,
-                plan=(plan_for_message(tg_payload, tg_prev, tg_ticker, gamma=tg_gamma)
+                plan=(plan_for_message(tg_payload, tg_prev, tg_ticker, gamma=tg_gamma,
+                                       stop_buffer_pct=float(
+                                           shell.setting(st, "stop_buffer_pct")),
+                                       min_reward_to_risk=float(
+                                           shell.setting(st, "min_reward_to_risk")))
                       if inc_plan else None),
             )
             ok, err = _send_telegram(tg_token, tg_chat, msg)

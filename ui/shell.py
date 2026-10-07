@@ -134,7 +134,10 @@ def render_menu(st, *, material_icons: bool = False, title: str = "Options Scann
 # is mirrored into a plain session key that every page can read.
 
 DEFAULTS: dict[str, Any] = {"min_dte": 1, "top_n": 5, "sort_by": "Volume",
-                            "show_all_ranked": False}
+                            "show_all_ranked": False, "stop_buffer_pct": 0.10,
+                            "min_reward_to_risk": 1.5}
+STOP_BUFFER_RANGE = (0.0, 2.0)
+REWARD_TO_RISK_RANGE = (0.5, 5.0)
 SORT_OPTIONS = ["Volume", "Premium $", "Strike"]
 LOADED_KEY = "cfg_loaded"
 SAVED_KEY = "cfg_saved"
@@ -155,6 +158,14 @@ def clean(values: dict[str, Any] | None) -> dict[str, Any]:
         out["sort_by"] = v["sort_by"]
     if isinstance(v.get("show_all_ranked"), bool):
         out["show_all_ranked"] = v["show_all_ranked"]
+    buf = v.get("stop_buffer_pct")
+    if isinstance(buf, (int, float)) and not isinstance(buf, bool) \
+            and STOP_BUFFER_RANGE[0] <= buf <= STOP_BUFFER_RANGE[1]:
+        out["stop_buffer_pct"] = float(buf)
+    rr = v.get("min_reward_to_risk")
+    if isinstance(rr, (int, float)) and not isinstance(rr, bool) \
+            and REWARD_TO_RISK_RANGE[0] <= rr <= REWARD_TO_RISK_RANGE[1]:
+        out["min_reward_to_risk"] = float(rr)
     return out
 
 
@@ -201,6 +212,8 @@ def flow_settings(st) -> dict[str, Any]:
         "top_n": int(setting(st, "top_n")),
         "sort_by": str(setting(st, "sort_by")),
         "show_all_ranked": bool(setting(st, "show_all_ranked")),
+        "stop_buffer_pct": float(setting(st, "stop_buffer_pct")),
+        "min_reward_to_risk": float(setting(st, "min_reward_to_risk")),
     }
 
 
@@ -233,6 +246,27 @@ def render_best_value_settings(st) -> bool:
     )
     st.session_state[_store_key("show_all_ranked")] = bool(show_all)
     return bool(show_all)
+
+
+def render_game_plan_settings(st) -> float:
+    """Draw the Game Plan settings (Settings page) and persist the choice."""
+    buf = st.number_input(
+        "Stop buffer (%)", min_value=STOP_BUFFER_RANGE[0], max_value=STOP_BUFFER_RANGE[1],
+        step=0.05, format="%.2f", value=float(setting(st, "stop_buffer_pct")),
+        key="w_stop_buffer_pct",
+        help="How far beyond the support or resistance level the Game Plan places the stop, "
+             "as a percentage of that level. 0.10% of $333 is about $0.33.",
+    )
+    st.session_state[_store_key("stop_buffer_pct")] = float(buf)
+    rr = st.number_input(
+        "Minimum reward to risk", min_value=REWARD_TO_RISK_RANGE[0],
+        max_value=REWARD_TO_RISK_RANGE[1], step=0.1, format="%.1f",
+        value=float(setting(st, "min_reward_to_risk")), key="w_min_reward_to_risk",
+        help="The entry zone ends at the price where the reward to target 1 falls below "
+             "this many times the risk to the stop. Higher means a tighter zone.",
+    )
+    st.session_state[_store_key("min_reward_to_risk")] = float(rr)
+    return float(buf)
 
 
 TICKER_STORE = "cfg_ticker"
