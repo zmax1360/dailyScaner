@@ -12,7 +12,9 @@ import pandas as pd
 import streamlit as st
 
 import trade_history as th
+from scoring_pool import POOL_0DTE, POOL_1DTE
 from ui.services import _SCANNER_DIR
+from ui.widgets import centered_table_html
 
 BROKER_DIR = os.path.join(_SCANNER_DIR, "data", "broker")
 SECTIONS = [("pool", "Same-day or later expiry"), ("hold", "Holding time"),
@@ -70,6 +72,28 @@ def format_breakdown(table: pd.DataFrame) -> pd.DataFrame:
         "Average win": table["avg_win"].map(lambda x: money(x, signed=False)),
         "Average loss": table["avg_loss"].map(lambda x: money(x, signed=False)),
     })
+
+
+def format_payoff(trades: pd.DataFrame) -> pd.DataFrame:
+    """Targets and stops as actually traded, for all trades and each expiry type."""
+    rows = []
+    for label, part in (("All trades", trades),
+                        (POOL_0DTE, trades[trades["pool"] == POOL_0DTE]),
+                        (POOL_1DTE, trades[trades["pool"] == POOL_1DTE])):
+        p = th.payoff(part)
+        if not p:
+            continue
+        rows.append({
+            "": label,
+            "Typical win": f"{p['median_win_pct']:+.0%}",
+            "Typical loss": f"{p['median_loss_pct']:+.0%}",
+            "Win rate": f"{p['win_rate']:.0%}",
+            "Win rate to break even": f"{p['breakeven_win_rate']:.0%}",
+            "Average win": money(p["avg_win"], signed=False),
+            "Average win to break even": money(p["win_needed"], signed=False),
+            "Per trade": money(p["per_trade"]),
+        })
+    return pd.DataFrame(rows)
 
 
 def daily_figure(days: pd.DataFrame):
@@ -144,24 +168,31 @@ def render(cfg: dict) -> None:
     st.plotly_chart(daily_figure(th.daily(trades)), use_container_width=True,
                     config={"displayModeBar": False})
 
+    targets = format_payoff(trades)
+    if not targets.empty:
+        st.markdown("**Targets and stops, as you actually traded them**")
+        st.markdown(centered_table_html(targets, "targets"), unsafe_allow_html=True)
+        st.caption("Typical win and loss are the median change in the option's price, from "
+                   "your entry to your exit. \"To break even\" shows what the win rate or the "
+                   "average win would have to be, with everything else unchanged.")
+
     for by, title in SECTIONS:
         table = th.breakdown(trades, by)
         if table.empty:
             continue
         st.markdown(f"**{title}**")
-        st.dataframe(format_breakdown(table), use_container_width=True, hide_index=True,
-                     key=f"scorecard_{by}")
+        st.markdown(centered_table_html(format_breakdown(table), by), unsafe_allow_html=True)
 
     st.markdown("**Largest losses**")
     w = th.worst(trades, 5)
-    st.dataframe(pd.DataFrame({
+    st.markdown(centered_table_html(pd.DataFrame({
         "Contract": w["symbol"],
         "Entered": w["entry"].dt.strftime("%b %d %H:%M"),
         "Held (min)": w["hold_min"].round(0).astype(int),
         "Contracts": w["qty"].astype(int),
         "Result": w["pnl"].map(money),
         "Expired": w["expired"].map({True: "yes", False: ""}),
-    }), use_container_width=True, hide_index=True, key="scorecard_worst")
+    }), "worst"), unsafe_allow_html=True)
 
     extra = []
     if notes["open_contracts"]:

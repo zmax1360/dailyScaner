@@ -57,3 +57,26 @@ def _choice_control(
         else:
             radio_kw["index"] = options.index(default) if default in options else 0
     return st.radio(label, options, **radio_kw)
+
+
+TABLE_STYLES = [
+    {"selector": "", "props": "width:100%; border-collapse:collapse; font-size:0.9rem; "
+                              "font-variant-numeric:tabular-nums;"},
+    {"selector": "th, td", "props": "text-align:center; padding:7px 10px; border:0; "
+                                    "border-bottom:1px solid rgba(255,255,255,0.07);"},
+    {"selector": "th", "props": "font-weight:600; color:#b0bec5;"},
+    {"selector": "td:first-child, th:first-child",
+     "props": "text-align:left; font-weight:500; white-space:nowrap;"},
+]
+
+
+def centered_table_html(frame, uuid: str = "tbl") -> str:
+    """A small table as HTML: values centred, first column left-aligned, no index.
+
+    st.dataframe right-aligns numbers and left-aligns text, which looks uneven for a
+    short summary table. Dollar signs are written as entities so Markdown never reads
+    two amounts as LaTeX, and the HTML is one line so no row becomes a code block."""
+    html = (frame.style.hide(axis="index").set_uuid(uuid)
+            .set_table_styles(TABLE_STYLES).to_html())
+    flat = "".join(line.strip() for line in html.splitlines() if line.strip())
+    return '<div style="overflow-x:auto;">' + flat.replace("$", "&#36;") + "</div>"

@@ -195,3 +195,28 @@ def worst(trades: pd.DataFrame, n: int = 5) -> pd.DataFrame:
     if trades is None or trades.empty:
         return pd.DataFrame(columns=TRADE_COLS)
     return trades.nsmallest(n, "pnl")
+
+
+def payoff(trades: pd.DataFrame) -> dict[str, Any]:
+    """What is actually taken on winners and given up on losers, and what that requires.
+
+    ``breakeven_win_rate`` is the win rate needed to break even at the current average win
+    and loss; ``win_needed`` is the average win needed to break even at the current win
+    rate and average loss. Empty dict without both a winner and a loser."""
+    if trades is None or trades.empty:
+        return {}
+    wins, losses = trades[trades["pnl"] > 0], trades[trades["pnl"] <= 0]
+    if wins.empty or losses.empty:
+        return {}
+    avg_win, avg_loss = float(wins["pnl"].mean()), float(-losses["pnl"].mean())
+    win_rate = len(wins) / len(trades)
+    return {
+        "trades": int(len(trades)), "win_rate": float(win_rate),
+        "median_win_pct": float(wins["ret"].median()),
+        "median_loss_pct": float(losses["ret"].median()),
+        "avg_win": avg_win, "avg_loss": -avg_loss,
+        "payoff_ratio": avg_win / avg_loss if avg_loss > 0 else None,
+        "breakeven_win_rate": avg_loss / (avg_win + avg_loss) if avg_win + avg_loss > 0 else None,
+        "win_needed": avg_loss * (1 - win_rate) / win_rate,
+        "per_trade": float(trades["pnl"].mean()),
+    }

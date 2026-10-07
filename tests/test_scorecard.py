@@ -163,6 +163,25 @@ def test_breakdowns(export):
         th.breakdown(t, "nope")
 
 
+def test_payoff_shows_what_is_taken_and_what_it_requires(export):
+    p = th.payoff(_trades(export)[0])            # wins +10, +20; losses -10, -60
+    assert p["trades"] == 4 and p["win_rate"] == pytest.approx(0.5)
+    assert p["avg_win"] == pytest.approx(15.0) and p["avg_loss"] == pytest.approx(-35.0)
+    assert p["payoff_ratio"] == pytest.approx(15.0 / 35.0)
+    assert p["breakeven_win_rate"] == pytest.approx(35.0 / 50.0)      # needs 70%, has 50%
+    assert p["win_needed"] == pytest.approx(35.0)                     # at a 50% win rate
+    assert p["per_trade"] == pytest.approx(-10.0)
+    # median change in the option's price: wins +10/190 and +20/100, losses -10/30 and -60/60
+    assert p["median_win_pct"] == pytest.approx((10 / 190 + 0.20) / 2)
+    assert p["median_loss_pct"] == pytest.approx((-1 / 3 - 1.0) / 2)
+
+
+def test_payoff_needs_a_winner_and_a_loser(export):
+    t = _trades(export)[0]
+    assert th.payoff(t[t.pnl > 0]) == {} and th.payoff(t[t.pnl <= 0]) == {}
+    assert th.payoff(pd.DataFrame()) == {}
+
+
 def test_daily_and_worst(export):
     t = _trades(export)[0]
     d = th.daily(t)
@@ -195,6 +214,46 @@ def test_page_asks_for_a_file_when_there_is_none(tmp_path, monkeypatch):
     assert len(at.metric) == 0
 
 
+class _Tables(__import__("html.parser", fromlist=["HTMLParser"]).HTMLParser):
+    """Collects every HTML table on the page as a list of rows of cell text."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables, self._row, self._cell, self._style = [], None, None, False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "style":
+            self._style = True
+        elif tag == "table":
+            self.tables.append([])
+        elif tag == "tr":
+            self._row = []
+        elif tag in ("th", "td"):
+            self._cell = ""
+
+    def handle_data(self, data):
+        if self._cell is not None and not self._style:
+            self._cell += data
+
+    def handle_endtag(self, tag):
+        if tag == "style":
+            self._style = False
+        elif tag in ("th", "td") and self._cell is not None:
+            self._row.append(self._cell)
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self.tables[-1].append(self._row)
+            self._row = None
+
+
+def _tables(at):
+    parser = _Tables()
+    for m in at.markdown:
+        if "<table" in m.value:
+            parser.feed(m.value)
+    return parser.tables
+
+
 def test_page_shows_results_and_breakdowns(export, monkeypatch):
     at = _run(monkeypatch, Path(export).parent)
     metrics = {m.label: m.value for m in at.metric}
@@ -203,14 +262,40 @@ def test_page_shows_results_and_breakdowns(export, monkeypatch):
     assert metrics["Average win / loss"] == "$15.00 / -$35.00"
     assert metrics["Closed trades"] == "4"
     titles = " ".join(m.value for m in at.markdown)
-    for title in ("Result by day", "Same-day or later expiry", "Holding time",
-                  "Premium paid per contract", "Time of entry", "Calls or puts",
-                  "Largest losses"):
+    for title in ("Result by day", "Targets and stops", "Same-day or later expiry",
+                  "Holding time", "Premium paid per contract", "Time of entry",
+                  "Calls or puts", "Largest losses"):
         assert title in titles
-    assert len(at.dataframe) == 6 and len(at.get("plotly_chart")) == 1
-    pool = at.dataframe[0].value
-    assert list(pool[""]) == ["0DTE", "1DTE+"] and list(pool["Result"]) == ["-$70.00", "+$30.00"]
-    assert not any(ACCOUNT in str(df.value.to_csv()) for df in at.dataframe)
+    tables = _tables(at)
+    assert len(tables) == 7 and len(at.get("plotly_chart")) == 1
+    assert len(at.dataframe) == 0                         # no unevenly aligned grid widgets
+    pool = next(t for t in tables if t[0][1] == "Trades")
+    assert pool[0] == ["", "Trades", "Result", "Win rate", "Average win", "Average loss"]
+    assert pool[1][:3] == ["0DTE", "2", "-$70.00"] and pool[2][:3] == ["1DTE+", "2", "+$30.00"]
+    assert not any(ACCOUNT in m.value for m in at.markdown)
+
+
+def test_page_targets_table(export, monkeypatch):
+    at = _run(monkeypatch, Path(export).parent)
+    targets = next(t for t in _tables(at) if "Typical win" in t[0])
+    assert targets[0] == ["", "Typical win", "Typical loss", "Win rate",
+                          "Win rate to break even", "Average win",
+                          "Average win to break even", "Per trade"]
+    all_row = targets[1]
+    assert all_row[0] == "All trades" and all_row[3] == "50%" and all_row[4] == "70%"
+    assert all_row[5] == "$15.00" and all_row[6] == "$35.00" and all_row[7] == "-$10.00"
+    assert [r[0] for r in targets[1:]] == ["All trades"]   # each pool here lacks a win or a loss
+
+
+def test_tables_are_centred_one_line_and_safe_for_markdown():
+    from ui.widgets import centered_table_html
+
+    html = centered_table_html(pd.DataFrame({"": ["0DTE"], "Result": ["-$572.01"]}), "x")
+    assert "\n" not in html and "$" not in html and "&#36;572.01" in html
+    css = html.replace(" ", "")
+    assert "#T_xth{text-align:center;" in css and "#T_xtd{text-align:center;" in css
+    assert "#T_xtd:first-child{text-align:left;" in css
+    assert "row_heading" not in html                      # the index is hidden
 
 
 def test_newest_file_wins_and_uploads_are_validated(tmp_path):
