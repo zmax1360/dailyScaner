@@ -219,4 +219,52 @@ def payoff(trades: pd.DataFrame) -> dict[str, Any]:
         "breakeven_win_rate": avg_loss / (avg_win + avg_loss) if avg_win + avg_loss > 0 else None,
         "win_needed": avg_loss * (1 - win_rate) / win_rate,
         "per_trade": float(trades["pnl"].mean()),
+        # Reward to risk, per contract: what a winner makes against what a loser costs.
+        "reward_to_risk": (float((wins["pnl"] / wins["qty"]).mean())
+                           / float(-(losses["pnl"] / losses["qty"]).mean())),
+        # ...and what that ratio must be to break even at the current win rate.
+        "reward_to_risk_needed": (1 - win_rate) / win_rate,
     }
+
+
+def risk_units(trades: pd.DataFrame) -> dict[str, float]:
+    """1R per expiry type: the average loss per contract, in dollars (positive).
+
+    The export records fills, not the stop that was planned, so the typical loss stands
+    in for the risk. A type with no losing trade uses the figure for all trades."""
+    if trades is None or trades.empty:
+        return {}
+    per = trades["pnl"] / trades["qty"]
+    overall = per[trades["pnl"] <= 0]
+    out: dict[str, float] = {}
+    for pool in (POOL_0DTE, POOL_1DTE):
+        losses = per[(trades["pnl"] <= 0) & (trades["pool"] == pool)]
+        src = losses if len(losses) else overall
+        if len(src):
+            out[pool] = float(-src.mean())
+    return out
+
+
+def contract_label(row: Any) -> str:
+    """'AAPL 332.5P Oct 9' from a trade row."""
+    exp = row["expiry"]
+    return f"{row['underlying']} {row['strike']:g}{row['cp']} {exp:%b} {exp.day}"
+
+
+def recent(trades: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+    """The latest closed trades, newest first, with prices per share and the result in R
+    (the result per contract divided by 1R for that expiry type)."""
+    cols = ["contract", "entry", "qty", "bought", "sold", "change", "change_pct", "pnl",
+            "r_multiple", "hold_min", "pool"]
+    if trades is None or trades.empty:
+        return pd.DataFrame(columns=cols)
+    units = risk_units(trades)
+    t = trades.sort_values("exit", ascending=False).head(n).copy()
+    t["contract"] = t.apply(contract_label, axis=1)
+    t["bought"] = t["cost"] / t["qty"] / 100.0
+    t["sold"] = t["proceeds"] / t["qty"] / 100.0
+    t["change"] = t["sold"] - t["bought"]
+    t["change_pct"] = t["ret"]
+    unit = t["pool"].map(units)
+    t["r_multiple"] = (t["pnl"] / t["qty"]) / unit
+    return t[cols].reset_index(drop=True)

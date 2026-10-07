@@ -56,6 +56,11 @@ def save_upload(name: str, data: bytes, folder: str | None = None) -> str:
     return dest
 
 
+def _md(text: str) -> str:
+    """Escape dollar signs so two amounts in one caption are not read as LaTeX."""
+    return text.replace("$", "\\$")
+
+
 def money(v, signed: bool = True) -> str:
     if v is None or pd.isna(v):
         return "—"
@@ -89,11 +94,28 @@ def format_payoff(trades: pd.DataFrame) -> pd.DataFrame:
             "Typical loss": f"{p['median_loss_pct']:+.0%}",
             "Win rate": f"{p['win_rate']:.0%}",
             "Win rate to break even": f"{p['breakeven_win_rate']:.0%}",
-            "Average win": money(p["avg_win"], signed=False),
-            "Average win to break even": money(p["win_needed"], signed=False),
+            "Reward to risk": f"{p['reward_to_risk']:.2f}",
+            "Reward to risk to break even": f"{p['reward_to_risk_needed']:.2f}",
             "Per trade": money(p["per_trade"]),
         })
     return pd.DataFrame(rows)
+
+
+def format_recent(trades: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+    """The latest trades with what was paid, what it sold for, and the result in R."""
+    r = th.recent(trades, n)
+    return pd.DataFrame({
+        "Contract": r["contract"],
+        "Entered": r["entry"].dt.strftime("%b %d %H:%M"),
+        "Contracts": r["qty"].astype(int),
+        "Bought at": r["bought"].map(lambda v: f"${v:.2f}"),
+        "Sold at": r["sold"].map(lambda v: f"${v:.2f}"),
+        "Change": [f"{'+' if c > 0 else '-' if c < 0 else ''}${abs(c):.2f} ({p:+.0%})"
+                   for c, p in zip(r["change"], r["change_pct"])],
+        "Result": r["pnl"].map(money),
+        "In R": r["r_multiple"].map(lambda v: "—" if pd.isna(v) else f"{v:+.1f}R"),
+        "Held (min)": r["hold_min"].round(0).astype(int),
+    })
 
 
 def daily_figure(days: pd.DataFrame):
@@ -173,8 +195,20 @@ def render(cfg: dict) -> None:
         st.markdown("**Targets and stops, as you actually traded them**")
         st.markdown(centered_table_html(targets, "targets"), unsafe_allow_html=True)
         st.caption("Typical win and loss are the median change in the option's price, from "
-                   "your entry to your exit. \"To break even\" shows what the win rate or the "
-                   "average win would have to be, with everything else unchanged.")
+                   "your entry to your exit. Reward to risk is the average win per contract "
+                   "divided by the average loss per contract. \"To break even\" shows what "
+                   "each would have to be, with everything else unchanged.")
+
+    units = th.risk_units(trades)
+    st.markdown("**Latest trades**")
+    st.markdown(centered_table_html(format_recent(trades), "recent"), unsafe_allow_html=True)
+    if units:
+        st.caption(_md("1R is your average loss per contract: "
+                       + " and ".join(f"{money(v, signed=False)} for {k}"
+                                      for k, v in units.items())
+                       + ". A result of +1.5R made one and a half times what you typically "
+                       "lose. The export has fills only, not the stop you planned, so your "
+                       "typical loss stands in for the risk."))
 
     for by, title in SECTIONS:
         table = th.breakdown(trades, by)

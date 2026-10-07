@@ -174,6 +174,33 @@ def test_payoff_shows_what_is_taken_and_what_it_requires(export):
     # median change in the option's price: wins +10/190 and +20/100, losses -10/30 and -60/60
     assert p["median_win_pct"] == pytest.approx((10 / 190 + 0.20) / 2)
     assert p["median_loss_pct"] == pytest.approx((-1 / 3 - 1.0) / 2)
+    # per contract: wins +5 and +20, losses -10 and -30
+    assert p["reward_to_risk"] == pytest.approx(12.5 / 20.0)
+    assert p["reward_to_risk_needed"] == pytest.approx(1.0)           # at a 50% win rate
+
+
+def test_one_r_is_the_average_loss_per_contract_for_each_expiry_type(export):
+    t = _trades(export)[0]
+    units = th.risk_units(t)
+    assert units["0DTE"] == pytest.approx(20.0)                       # -10 and -30 per contract
+    assert units["1DTE+"] == pytest.approx(20.0)                      # no 1DTE+ loss: all trades
+    assert th.risk_units(pd.DataFrame()) == {}
+    assert th.risk_units(t[t.pnl > 0]) == {}                          # no losses at all
+
+
+def test_recent_trades_show_prices_per_share_and_the_result_in_r(export):
+    t = _trades(export)[0]
+    r = th.recent(t, 10)
+    # newest exit first: the puts that expired at the close, then the 14:10 sale
+    assert list(r["contract"])[:2] == ["TEST 330P Oct 7", "TEST 340C Oct 9"]
+    last = r.iloc[1]                                                  # bought $1.00, sold $1.20
+    assert last["bought"] == pytest.approx(1.00) and last["sold"] == pytest.approx(1.20)
+    assert last["change"] == pytest.approx(0.20) and last["change_pct"] == pytest.approx(0.20)
+    assert last["r_multiple"] == pytest.approx(20.0 / 20.0)           # +$20 a contract, 1R = $20
+    expired = r[r["sold"] == 0].iloc[0]
+    assert expired["r_multiple"] == pytest.approx(-30.0 / 20.0) and expired["qty"] == 2
+    assert len(th.recent(t, 2)) == 2 and th.recent(pd.DataFrame()).empty
+    assert th.contract_label(t[t.cp == "P"].iloc[0]) == "TEST 330P Oct 7"
 
 
 def test_payoff_needs_a_winner_and_a_loser(export):
@@ -262,12 +289,13 @@ def test_page_shows_results_and_breakdowns(export, monkeypatch):
     assert metrics["Average win / loss"] == "$15.00 / -$35.00"
     assert metrics["Closed trades"] == "4"
     titles = " ".join(m.value for m in at.markdown)
-    for title in ("Result by day", "Targets and stops", "Same-day or later expiry",
+    for title in ("Result by day", "Targets and stops", "Latest trades",
+                  "Same-day or later expiry",
                   "Holding time", "Premium paid per contract", "Time of entry",
                   "Calls or puts", "Largest losses"):
         assert title in titles
     tables = _tables(at)
-    assert len(tables) == 7 and len(at.get("plotly_chart")) == 1
+    assert len(tables) == 8 and len(at.get("plotly_chart")) == 1
     assert len(at.dataframe) == 0                         # no unevenly aligned grid widgets
     pool = next(t for t in tables if t[0][1] == "Trades")
     assert pool[0] == ["", "Trades", "Result", "Win rate", "Average win", "Average loss"]
@@ -279,12 +307,25 @@ def test_page_targets_table(export, monkeypatch):
     at = _run(monkeypatch, Path(export).parent)
     targets = next(t for t in _tables(at) if "Typical win" in t[0])
     assert targets[0] == ["", "Typical win", "Typical loss", "Win rate",
-                          "Win rate to break even", "Average win",
-                          "Average win to break even", "Per trade"]
+                          "Win rate to break even", "Reward to risk",
+                          "Reward to risk to break even", "Per trade"]
     all_row = targets[1]
     assert all_row[0] == "All trades" and all_row[3] == "50%" and all_row[4] == "70%"
-    assert all_row[5] == "$15.00" and all_row[6] == "$35.00" and all_row[7] == "-$10.00"
+    assert all_row[5] == "0.62" and all_row[6] == "1.00" and all_row[7] == "-$10.00"
     assert [r[0] for r in targets[1:]] == ["All trades"]   # each pool here lacks a win or a loss
+
+
+def test_page_latest_trades_table(export, monkeypatch):
+    at = _run(monkeypatch, Path(export).parent)
+    recent = next(t for t in _tables(at) if "Bought at" in t[0])
+    assert recent[0] == ["Contract", "Entered", "Contracts", "Bought at", "Sold at", "Change",
+                         "Result", "In R", "Held (min)"]
+    assert recent[1] == ["TEST 330P Oct 7", "Oct 07 09:40", "2", "$0.30", "$0.00",
+                         "-$0.30 (-100%)", "-$60.00", "-1.5R", "380"]            # expired
+    assert recent[2] == ["TEST 340C Oct 9", "Oct 07 14:00", "1", "$1.00", "$1.20",
+                         "+$0.20 (+20%)", "+$20.00", "+1.0R", "10"]
+    cap = next(c.value for c in at.caption if c.value.startswith("1R is"))
+    assert r"\$20.00 for 0DTE" in cap and cap.count("$") == cap.count(r"\$")
 
 
 def test_tables_are_centred_one_line_and_safe_for_markdown():
