@@ -481,14 +481,18 @@ def candidate_text(c: dict[str, Any] | None) -> str:
     return " · ".join(parts)
 
 
-def plan_lines(plan: Plan) -> list[str]:
-    """Plain lines for a Telegram (HTML) message."""
+def plan_lines(plan: Plan, compact: bool = False) -> list[str]:
+    """Plain lines for a Telegram (HTML) message. ``compact`` leaves out the levels ladder
+    and the "what changes" notes, for a message that carries other sections too (Telegram
+    cuts a message off at 4,096 characters)."""
     lines = [
         f"🎯 <b>GAME PLAN · {plan.ticker}</b>",
         f"Side: <b>{SIDE_LABEL[plan.side]}</b>" + (" (scan is stale)" if plan.stale else ""),
         f"Day: <b>{REGIME_LABEL[plan.regime]}</b>",
     ] + [f"{c.pool}: {candidate_text(c.pick)}" for c in plan.candidates]
     lines += trade_lines(plan.trade)
+    if compact:
+        return lines
     ladder = [f"{lv.name} {_usd(lv.price)}" for lv in plan.levels]
     if ladder:
         lines.append("Levels: " + " &gt; ".join(ladder))

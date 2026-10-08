@@ -173,6 +173,8 @@ def _available_expiries(payload: dict) -> list[str]:
 _state: dict[int, dict] = {}
 
 _SECTIONS = [
+    ("game_plan",     "🎯 Game Plan"),
+    ("gamma",         "🧱 Gamma"),
     ("session",       "💰 Session"),
     ("mtf",           "📊 Multi-TF"),
     ("magnets",       "🧲 Magnets"),
@@ -401,6 +403,28 @@ def _fmt_report(
         )
 
     L.append("")
+
+    # ── Game plan (first: it is the summary) and gamma ───────────────────────
+    # Built from this archive and the recorded chain snapshot. A failure here is logged
+    # and noted in the message; it never blocks the rest of the report.
+    gamma_block: list[str] = []
+    if include.get("game_plan") or include.get("gamma"):
+        try:
+            import plan_report
+            # Short form inside a full report; the full plan when it is asked for alone.
+            others = [k for k, on in include.items()
+                      if on and k not in ("game_plan", "gamma", "deltas")]
+            plan_block, gamma_block = plan_report.report_lines(
+                payload, ticker, plan=bool(include.get("game_plan")),
+                gamma=bool(include.get("gamma")), compact=bool(others))
+            if plan_block:
+                L.extend(plan_block)
+                L.append("")
+        except Exception as exc:
+            log.warning("Game plan / gamma omitted for %s: %s", ticker, exc, exc_info=True)
+            L.append(f"<i>🎯 Game plan and gamma unavailable ({type(exc).__name__}).</i>")
+            L.append("")
+            gamma_block = []
 
     # ── Session ──────────────────────────────────────────────────────────────
     if include.get("session"):
@@ -642,6 +666,11 @@ def _fmt_report(
                     )
                 L.append(f"<i>{prov}</i>")
                 L.append("")
+
+    # ── Gamma (after Best Value, before the news) ─────────────────────────────
+    if gamma_block:
+        L.extend(gamma_block)
+        L.append("")
 
     # ── Live Catalyst Sentiment ───────────────────────────────────────────────
     if include.get("catalyst"):

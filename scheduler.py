@@ -206,6 +206,8 @@ def _notify_success(ticker: str, env: dict, elapsed: float) -> None:
         text = _fmt_report(
             payload, prev, ticker, top_n,
             include={
+                "game_plan":     True,
+                "gamma":         True,
                 "best_value":    True,
                 "magnets":       True,
                 "volume_expiry": True,

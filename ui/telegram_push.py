@@ -11,6 +11,7 @@ from ui.services import _SCANNER_DIR
 import pandas as pd
 import ema_stack
 import game_plan
+import plan_report
 from ui.common import ET
 from ui.gamma_data import gamma_summary_for  # noqa: F401  (re-exported for the Settings page)
 
@@ -351,46 +352,8 @@ def _format_scan_message(
 
 
 def format_gamma_lines(summary: dict | None) -> list[str]:
-    """Telegram (HTML) lines for the gamma read. ``summary`` comes from ``gex.summary``."""
-    import gex
-
-    if not summary:
-        return ["🧱 <b>GAMMA</b> — no chain snapshot with usable open interest yet"]
-    d = date.fromisoformat(summary["expiry"])
-    net = float(summary["net"])
-    regime = ("positive: dealer hedging tends to dampen moves" if net >= 0
-              else "negative: dealer hedging tends to amplify moves")
-    lines = [
-        f"🧱 <b>GAMMA · {d:%b} {d.day}</b>",
-        f"Net <b>{'+' if net >= 0 else ''}{gex.fmt_money(net)}</b> — {regime}",
-    ]
-    walls = []
-    if summary.get("call_wall") is not None:
-        walls.append(f"Call wall <b>${summary['call_wall']:g}</b> "
-                     f"({gex.fmt_money(summary['call_wall_gex'])})")
-    if summary.get("put_wall") is not None:
-        walls.append(f"Put wall <b>${summary['put_wall']:g}</b> "
-                     f"({gex.fmt_money(summary['put_wall_gex'])})")
-    if walls:
-        lines.append(" · ".join(walls))
-    levels = []
-    if summary.get("support") is not None:
-        levels.append(f"Support <b>${summary['support']:g}</b> "
-                      f"({gex.fmt_money(summary['support_gex'])})")
-    if summary.get("resistance") is not None:
-        levels.append(f"Resistance <b>${summary['resistance']:g}</b> "
-                      f"({gex.fmt_money(summary['resistance_gex'])})")
-    if levels:
-        lines.append(" · ".join(levels))
-    if summary.get("top"):
-        lines.append("Largest: " + " · ".join(
-            f"${k:g} {gex.fmt_money(v)}" for k, v in summary["top"]))
-    if summary.get("first_negative_below_spot") is not None:
-        lines.append(f"First negative strike below spot: "
-                     f"<b>${summary['first_negative_below_spot']:g}</b>")
-    as_of = summary["as_of"].astimezone(ET)
-    lines.append(f"<i>dollars of hedging per $1 move · snapshot {as_of:%a %b %d %H:%M ET}</i>")
-    return lines
+    """Gamma section of the Telegram message (shared with the automatic scan message)."""
+    return plan_report.gamma_lines(summary)
 
 
 def plan_for_message(payload: dict, prev_payload: dict | None, ticker: str,

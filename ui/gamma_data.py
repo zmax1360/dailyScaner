@@ -3,24 +3,7 @@ the Telegram push)."""
 
 from __future__ import annotations
 
-from datetime import datetime
-
-import gex
-import volume_history as vh
-from ui.common import ET
-
-
-def gamma_summary_for(ticker: str, spot) -> dict | None:
-    """``gex.summary`` for the nearest live expiry of ``ticker``; None if unavailable."""
-    try:
-        spot_f = float(spot)
-    except (TypeError, ValueError):
-        return None
-    latest = vh.latest_scan(str(ticker or "").upper())
-    if latest.empty or spot_f <= 0:
-        return None
-    as_of = datetime.fromisoformat(str(latest["ts_et"].iloc[0]))
-    return gex.summary(latest, spot=spot_f, as_of=as_of, today=datetime.now(ET).date())
+from plan_report import gamma_summary_for  # noqa: F401  (shared with the Telegram bot)
 
 
 def gamma_levels(summary: dict | None) -> list[dict]:
