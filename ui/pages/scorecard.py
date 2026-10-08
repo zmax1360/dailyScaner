@@ -182,7 +182,9 @@ def render(cfg: dict) -> None:
     m4.metric("Closed trades", f"{s['trades']:,}", help=f"{s['contracts']:,} contracts over "
               f"{s['days']} trading days. Median holding time {s['median_hold_min']:.0f} minutes.")
     pf = "—" if s["profit_factor"] is None else f"{s['profit_factor']:.2f}"
-    st.caption(f"{s['first']:%b %d} to {s['last']:%b %d, %Y} · {s['green_days']} days up, "
+    scr = f" · {s['wins']} wins, {s['losses']} losses, {s['scratches']} break-even" \
+        if s["scratches"] else f" · {s['wins']} wins, {s['losses']} losses"
+    st.caption(f"{s['first']:%b %d} to {s['last']:%b %d, %Y}{scr} · {s['green_days']} days up, "
                f"{s['red_days']} days down · wins ÷ losses in dollars: {pf} "
                "(above 1.00 means profitable)")
 

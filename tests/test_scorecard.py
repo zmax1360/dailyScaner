@@ -209,6 +209,54 @@ def test_payoff_needs_a_winner_and_a_loser(export):
     assert th.payoff(pd.DataFrame()) == {}
 
 
+# A day with scratches: +20, -10, and two trades closed for exactly what they cost.
+SCRATCH_ROWS = [
+    _trade("2026-10-08", "10:00:00", "BUY", C340, 2, -100.0),
+    _trade("2026-10-08", "10:05:00", "SELL", C340, -2, 120.0),      # +20  (+10 a contract)
+    _trade("2026-10-08", "10:10:00", "BUY", C340, 1, -90.0),
+    _trade("2026-10-08", "10:12:00", "SELL", C340, -1, 80.0),       # -10
+    _trade("2026-10-08", "10:20:00", "BUY", C340, 2, -190.0),
+    _trade("2026-10-08", "10:22:00", "SELL", C340, -2, 190.0),      # scratch
+    _trade("2026-10-08", "10:30:00", "BUY", C340, 1, -85.0),
+    _trade("2026-10-08", "10:31:00", "SELL", C340, -1, 85.0),       # scratch
+]
+
+
+@pytest.fixture
+def scratchy(tmp_path):
+    return th.closed_trades(th.load_activities(_write(tmp_path / "s.csv", SCRATCH_ROWS)))[0]
+
+
+def test_a_break_even_trade_is_a_scratch_not_a_loss(scratchy):
+    """Regression: scratches were counted as losses, which shrank the average loss and so
+    the size of 1R, and made every result in R look bigger than it was."""
+    s = th.summary(scratchy)
+    assert (s["trades"], s["wins"], s["losses"], s["scratches"]) == (4, 1, 1, 2)
+    assert s["avg_loss"] == pytest.approx(-10.0)                    # not (-10 + 0 + 0) / 3
+    assert s["win_rate"] == pytest.approx(0.25)                     # of all four trades
+    assert th.risk_units(scratchy)["1DTE+"] == pytest.approx(10.0)
+    r = th.recent(scratchy).set_index("pnl")["r_multiple"]
+    assert r[20.0] == pytest.approx(1.0) and r[-10.0] == pytest.approx(-1.0)
+    assert (r[0.0] == 0.0).all()
+
+
+def test_payoff_accounts_for_scratches_in_the_break_even_figures(scratchy):
+    p = th.payoff(scratchy)                       # 1 win of 20, 1 loss of 10, 2 scratches
+    assert (p["win_rate"], p["loss_rate"], p["scratch_rate"]) == (0.25, 0.25, 0.5)
+    assert p["avg_win"] == pytest.approx(20.0) and p["avg_loss"] == pytest.approx(-10.0)
+    assert p["reward_to_risk"] == pytest.approx(1.0)                # +10 against -10 a contract
+    assert p["reward_to_risk_needed"] == pytest.approx(1.0)         # one loss per win
+    # break even needs win_rate x 20 = loss_rate x 10 with half the trades scratched
+    assert p["breakeven_win_rate"] == pytest.approx(0.5 * 10 / 30)
+    assert p["win_needed"] == pytest.approx(10.0)
+    assert p["per_trade"] == pytest.approx(2.5)
+
+
+def test_breakdown_average_loss_ignores_scratches(scratchy):
+    pool = th.breakdown(scratchy, "pool").set_index("bucket")
+    assert pool.loc["1DTE+", "trades"] == 4 and pool.loc["1DTE+", "avg_loss"] == pytest.approx(-10.0)
+
+
 def test_daily_and_worst(export):
     t = _trades(export)[0]
     d = th.daily(t)
@@ -380,3 +428,11 @@ def test_scorecard_is_a_menu_page():
     from ui import shell
 
     assert {e.id: e.title for e in shell.entries()}["scorecard"] == "Scorecard"
+
+
+def test_page_reports_break_even_trades(tmp_path, monkeypatch):
+    _write(tmp_path / "broker" / "s.csv", SCRATCH_ROWS)
+    at = _run(monkeypatch, tmp_path / "broker")
+    assert any("1 wins, 1 losses, 2 break-even" in c.value for c in at.caption)
+    recent = next(t for t in _tables(at) if "Bought at" in t[0])
+    assert [row[7] for row in recent[1:]] == ["+0.0R", "+0.0R", "-1.0R", "+1.0R"]

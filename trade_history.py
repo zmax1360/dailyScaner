@@ -9,6 +9,8 @@ only; nothing here feeds scoring.
 - Everything is reported in US dollars. A row booked in CAD is converted with the FX
   rate printed on that row; a CAD row with no rate is left out and counted.
 - The account number is never read into the result.
+- A trade closed for exactly what it cost is a scratch: counted as a trade, but neither a
+  win nor a loss, so it does not water down the average loss.
 """
 
 from __future__ import annotations
@@ -134,12 +136,14 @@ def summary(trades: pd.DataFrame) -> dict[str, Any]:
     """Headline numbers. Empty dict when there are no closed trades."""
     if trades is None or trades.empty:
         return {}
-    wins, losses = trades[trades["pnl"] > 0], trades[trades["pnl"] <= 0]
+    wins, losses = trades[trades["pnl"] > 0], trades[trades["pnl"] < 0]
     days = trades.groupby(trades["entry"].dt.date)["pnl"].sum()
     gross_loss = -losses["pnl"].sum()
     return {
         "trades": int(len(trades)), "contracts": int(trades["qty"].sum()),
         "days": int(days.size), "pnl": float(trades["pnl"].sum()),
+        "wins": int(len(wins)), "losses": int(len(losses)),
+        "scratches": int((trades["pnl"] == 0).sum()),
         "win_rate": float(len(wins) / len(trades)),
         "avg_win": float(wins["pnl"].mean()) if len(wins) else None,
         "avg_loss": float(losses["pnl"].mean()) if len(losses) else None,
@@ -174,7 +178,7 @@ def breakdown(trades: pd.DataFrame, by: str) -> pd.DataFrame:
     key = _bucket(trades, by)
     out = []
     for name, g in trades.groupby(key, observed=True):
-        wins, losses = g[g["pnl"] > 0], g[g["pnl"] <= 0]
+        wins, losses = g[g["pnl"] > 0], g[g["pnl"] < 0]
         out.append({"bucket": str(name), "trades": int(len(g)), "pnl": float(g["pnl"].sum()),
                     "win_rate": float(len(wins) / len(g)),
                     "avg_win": float(wins["pnl"].mean()) if len(wins) else float("nan"),
@@ -205,40 +209,45 @@ def payoff(trades: pd.DataFrame) -> dict[str, Any]:
     rate and average loss. Empty dict without both a winner and a loser."""
     if trades is None or trades.empty:
         return {}
-    wins, losses = trades[trades["pnl"] > 0], trades[trades["pnl"] <= 0]
+    wins, losses = trades[trades["pnl"] > 0], trades[trades["pnl"] < 0]
     if wins.empty or losses.empty:
         return {}
+    n = len(trades)
     avg_win, avg_loss = float(wins["pnl"].mean()), float(-losses["pnl"].mean())
-    win_rate = len(wins) / len(trades)
+    win_rate, loss_rate = len(wins) / n, len(losses) / n
+    scratch_rate = 1.0 - win_rate - loss_rate
     return {
-        "trades": int(len(trades)), "win_rate": float(win_rate),
+        "trades": int(n), "win_rate": float(win_rate), "loss_rate": float(loss_rate),
+        "scratch_rate": float(scratch_rate),
         "median_win_pct": float(wins["ret"].median()),
         "median_loss_pct": float(losses["ret"].median()),
         "avg_win": avg_win, "avg_loss": -avg_loss,
-        "payoff_ratio": avg_win / avg_loss if avg_loss > 0 else None,
-        "breakeven_win_rate": avg_loss / (avg_win + avg_loss) if avg_win + avg_loss > 0 else None,
-        "win_needed": avg_loss * (1 - win_rate) / win_rate,
+        "payoff_ratio": avg_win / avg_loss,
+        # Break-even needs win_rate x avg_win = loss_rate x avg_loss; scratches are neither.
+        "breakeven_win_rate": (1.0 - scratch_rate) * avg_loss / (avg_win + avg_loss),
+        "win_needed": avg_loss * loss_rate / win_rate,
         "per_trade": float(trades["pnl"].mean()),
         # Reward to risk, per contract: what a winner makes against what a loser costs.
         "reward_to_risk": (float((wins["pnl"] / wins["qty"]).mean())
                            / float(-(losses["pnl"] / losses["qty"]).mean())),
-        # ...and what that ratio must be to break even at the current win rate.
-        "reward_to_risk_needed": (1 - win_rate) / win_rate,
+        # ...and what that ratio must be to break even at the current win and loss rates.
+        "reward_to_risk_needed": loss_rate / win_rate,
     }
 
 
 def risk_units(trades: pd.DataFrame) -> dict[str, float]:
-    """1R per expiry type: the average loss per contract, in dollars (positive).
+    """1R per expiry type: the average loss per contract on losing trades, in dollars
+    (positive). Scratches (closed for exactly the cost) are not losses.
 
     The export records fills, not the stop that was planned, so the typical loss stands
     in for the risk. A type with no losing trade uses the figure for all trades."""
     if trades is None or trades.empty:
         return {}
     per = trades["pnl"] / trades["qty"]
-    overall = per[trades["pnl"] <= 0]
+    overall = per[trades["pnl"] < 0]
     out: dict[str, float] = {}
     for pool in (POOL_0DTE, POOL_1DTE):
-        losses = per[(trades["pnl"] <= 0) & (trades["pool"] == pool)]
+        losses = per[(trades["pnl"] < 0) & (trades["pool"] == pool)]
         src = losses if len(losses) else overall
         if len(src):
             out[pool] = float(-src.mean())
