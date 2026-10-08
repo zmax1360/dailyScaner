@@ -13,10 +13,10 @@ import streamlit as st
 
 import trade_history as th
 from scoring_pool import POOL_0DTE, POOL_1DTE
-from ui.services import _SCANNER_DIR
+from ui import broker_files
 from ui.widgets import centered_table_html
 
-BROKER_DIR = os.path.join(_SCANNER_DIR, "data", "broker")
+BROKER_DIR = broker_files.BROKER_DIR
 SECTIONS = [("pool", "Same-day or later expiry"), ("hold", "Holding time"),
             ("premium", "Premium paid per contract"), ("time", "Time of entry"),
             ("side", "Calls or puts")]
@@ -25,12 +25,7 @@ UP, DOWN = "#00C853", "#FF1744"
 
 def latest_export(folder: str | None = None) -> str | None:
     """Newest .csv in the broker folder, or None."""
-    folder = folder or BROKER_DIR
-    try:
-        files = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(".csv")]
-    except OSError:
-        return None
-    return max(files, key=os.path.getmtime) if files else None
+    return broker_files.latest_export(folder or BROKER_DIR)
 
 
 def save_upload(name: str, data: bytes, folder: str | None = None) -> str:

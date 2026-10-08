@@ -31,6 +31,7 @@ from ui.services import _SCANNER_DIR, _discover_tickers, _scan_archive_metadata
 from ui.pages import archive as archive_page
 from ui.pages import flow as flow_page
 from ui.pages import journal as journal_page
+from ui.pages import report as report_page
 from ui.pages import scorecard as scorecard_page
 from ui.pages import settings as settings_page
 from ui.pages import news as news_page
@@ -348,25 +349,18 @@ def main():
 
     page = cfg["page"]
     latest = cfg.get("latest_archive") or {}
-    if page == "game_plan":
+    with_banner = {"game_plan": flow_page.render_game_plan, "flow": flow_page.render,
+                   "best_value": flow_page.render_best_value, "archive": archive_page.render,
+                   "spread_gate": spread_gate_page.render}
+    plain = {"news": news_page.render, "scorecard": scorecard_page.render,
+             "report": report_page.render, "settings": settings_page.render}
+    if page in with_banner:
         render_market_banner()
-        flow_page.render_game_plan(cfg)
-    elif page == "flow":
-        render_market_banner()
-        flow_page.render(cfg)
-    elif page == "best_value":
-        render_market_banner()
-        flow_page.render_best_value(cfg)
-    elif page == "archive":
-        render_market_banner()
-        archive_page.render(cfg)
-    elif page == "spread_gate":
-        render_market_banner()
-        spread_gate_page.render(cfg)
+        with_banner[page](cfg)
+    elif page in plain:
+        plain[page](cfg)
     elif page == "tickers":
         tickers_page.render()
-    elif page == "news":
-        news_page.render(cfg)
     elif page == "volume":
         volume_page.render_volume_page(
             cfg["ticker"], tz=ET, spot=latest.get("spot"),
@@ -378,10 +372,6 @@ def main():
         journal_page.render()
     elif page == "pretrade":
         _render_pre_trade(cfg, cand)
-    elif page == "scorecard":
-        scorecard_page.render(cfg)
-    elif page == "settings":
-        settings_page.render(cfg)
     elif page in COMPONENTS:
         ctx = load_scan_context(cfg["ticker"], top_n=cfg["top_n"])
         if ctx is None:

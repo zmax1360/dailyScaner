@@ -204,6 +204,9 @@ def test_main_routes_every_menu_entry():
         c.value for n in ast.walk(main) if isinstance(n, ast.Compare)
         for c in n.comparators if isinstance(c, ast.Constant) and isinstance(c.value, str)
     }
+    # Pages that take only cfg are routed through dispatch tables: their ids are dict keys.
+    routed |= {k.value for n in ast.walk(main) if isinstance(n, ast.Dict)
+               for k in n.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
     # Component pages are routed through the registry rather than one branch each.
     from ui.components import REGISTRY
 
