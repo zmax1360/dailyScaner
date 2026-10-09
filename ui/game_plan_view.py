@@ -125,7 +125,9 @@ def render(plan: gp.Plan) -> None:
     icon, _ = SIDE_STYLE[plan.side]
     cols = st.columns(2 + len(plan.candidates))
     cols[0].metric("Allowed side", f"{icon} {gp.SIDE_LABEL[plan.side]}",
-                   help="From the 15-minute EMA 9/21/50 trend rule. " + plan.side_reason)
+                   help="A side is allowed when the 15-minute EMA 9/21/50 trend rule and "
+                        "the scanner's top pick agree, inside the entry window. "
+                        + plan.side_reason)
     cols[1].metric("Type of day", gp.REGIME_LABEL[plan.regime],
                    help=plan.regime_note + (f" Net gamma for {plan.gamma_expiry}."
                                             if plan.gamma_expiry else ""))
@@ -133,6 +135,12 @@ def render(plan: gp.Plan) -> None:
     for col, cand in zip(cols[2:], plan.candidates):
         col.metric(f"{cand.pool} candidate", gp.candidate_text(cand.pick).split(" · ")[0],
                    help=cand.note)
+    if plan.hold:
+        st.warning(_md(plan.hold_note), icon="⛔")
+    if plan.flow_note or plan.hold:
+        st.caption(_md(f"Trend rule: **{gp.SIDE_LABEL[plan.trend_side]}** · Scanner side: "
+                       f"**{gp.FLOW_LABEL.get(plan.flow_side, 'Unknown')}**. "
+                       + plan.flow_note))
     for cand in plan.candidates:
         if cand.pick:
             st.caption(_md(f"{cand.pool}: {gp.candidate_text(cand.pick)} — {cand.note}"))

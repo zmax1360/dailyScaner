@@ -639,3 +639,96 @@ def test_game_plan_section_takes_its_price_from_live_bars():
     assert "live_session_snapshot(_cached_vwap_chart_df(ticker, \"5M\"))" in block
     assert "spot=plan_price" in block and "gamma_summary_for(ticker, plan_price)" in block
     assert 'live.get("high", day_high)' in block and 'live.get("low", day_low)' in block
+
+
+# ── scanner side, conflict and the entry window ─────────────────────────────
+IN_WINDOW = datetime(2026, 10, 9, 13, 4, tzinfo=ET)
+
+
+def _flow(*sides):
+    return gp.scanner_side(list(sides))
+
+
+def test_scanner_side_needs_four_of_the_last_six_scans():
+    assert _flow(*["CALL"] * 4, "PUT", "PUT")["side"] == gp.CALLS
+    assert _flow(*["PUT"] * 5, "CALL")["side"] == gp.PUTS
+    assert _flow("CALL", "PUT", "CALL", "PUT", "CALL", "PUT")["side"] == gp.MIXED
+    assert _flow("CALL", "CALL", "CALL", None, None, "PUT")["side"] == gp.MIXED
+    # older scans beyond the last six do not count
+    assert _flow(*["PUT"] * 10, *["CALL"] * 6)["side"] == gp.CALLS
+
+
+def test_scanner_side_is_unknown_without_six_scans():
+    out = _flow("CALL", "CALL", "CALL", "CALL", "CALL")
+    assert out["side"] == gp.UNKNOWN and "only 5 of the last 6" in out["note"]
+    assert gp.scanner_side(None)["side"] == gp.UNKNOWN
+
+
+def test_conflict_shows_no_plan():
+    """2026-10-09: the trend rule said puts for four hours while the scanner ranked a
+    call first. The plan must not offer a put there."""
+    plan = _plan(trend=BEAR, flow=_flow(*["CALL"] * 5, "PUT"), now=IN_WINDOW)
+    assert plan.side == gp.STAND_ASIDE and plan.hold == gp.HOLD_CONFLICT
+    assert plan.trend_side == gp.PUTS and plan.flow_side == gp.CALLS
+    assert plan.trade is None and all(c.pick is None for c in plan.candidates)
+    assert plan.expect == (plan.hold_note,) and "Conflict" in plan.hold_note
+    assert "trend rule says puts" in plan.hold_note and "says calls" in plan.hold_note
+
+
+def test_mixed_scanner_side_is_not_a_confirmation():
+    plan = _plan(trend=BULL, flow=_flow("CALL", "PUT", "CALL", "PUT", "CALL", "PUT"),
+                 now=IN_WINDOW)
+    assert plan.side == gp.STAND_ASIDE and plan.hold == gp.HOLD_UNCONFIRMED
+    assert plan.trade is None
+
+
+def test_agreement_gives_the_plan_as_before():
+    base = _plan(trend=BULL)
+    plan = _plan(trend=BULL, flow=_flow(*["CALL"] * 6), now=IN_WINDOW)
+    assert plan.side == gp.CALLS and plan.hold == "" and plan.trade == base.trade
+    assert plan.candidates == base.candidates and plan.expect == base.expect
+
+
+def test_unknown_scanner_side_leaves_the_trend_rule_standing():
+    plan = _plan(trend=BEAR, flow=_flow("CALL", "CALL"), now=IN_WINDOW)
+    assert plan.side == gp.PUTS and plan.hold == "" and plan.flow_side == gp.UNKNOWN
+
+
+def test_no_flow_and_no_clock_is_the_old_behaviour():
+    plan = _plan(trend=BEAR)
+    assert plan.side == gp.PUTS and plan.hold == "" and plan.flow_note == ""
+
+
+@pytest.mark.parametrize("hh,mm,closed", [(9, 59, True), (10, 0, False), (14, 59, False),
+                                          (15, 0, True), (15, 32, True), (8, 0, True)])
+def test_entry_window(hh, mm, closed):
+    now = datetime(2026, 10, 9, hh, mm, tzinfo=ET)
+    plan = _plan(trend=BULL, flow=_flow(*["CALL"] * 6), now=now)
+    assert (plan.hold == gp.HOLD_WINDOW) is closed
+    if closed:
+        assert plan.side == gp.STAND_ASIDE and plan.trade is None
+        assert plan.trend_side == gp.CALLS            # still shown, for information
+        assert "10:00 and 15:00 ET" in plan.hold_note
+
+
+def test_window_comes_before_conflict():
+    plan = _plan(trend=BEAR, flow=_flow(*["CALL"] * 6),
+                 now=datetime(2026, 10, 9, 15, 30, tzinfo=ET))
+    assert plan.hold == gp.HOLD_WINDOW
+
+
+def test_hold_reaches_the_telegram_lines():
+    plan = _plan(trend=BEAR, flow=_flow(*["CALL"] * 6), now=IN_WINDOW)
+    lines = gp.plan_lines(plan)
+    assert "Side: <b>Stand aside</b>" in lines[1]
+    assert "Trend rule: Puts only · Scanner: Calls" in lines
+    assert lines[-1].startswith("⛔ Conflict") and not any("plan:" in x for x in lines)
+    agreed = gp.plan_lines(_plan(trend=BULL, flow=_flow(*["CALL"] * 6), now=IN_WINDOW))
+    assert "Trend rule: Calls only · Scanner: Calls" in agreed
+    assert any(x.startswith("Calls plan:") for x in agreed)
+    assert not any("Trend rule:" in x for x in gp.plan_lines(_plan(trend=BULL)))
+
+
+def test_view_shows_both_sides_and_the_hold():
+    src = (ROOT / "ui" / "game_plan_view.py").read_text()
+    assert "plan.hold_note" in src and "plan.flow_note" in src and "Scanner side" in src

@@ -6,6 +6,12 @@ nothing here feeds scoring.
     allowed side   <- the 15-minute EMA 9/21/50 trend rule (ema_stack)
     type of day    <- the sign of net gamma exposure for the nearest expiry (gex.summary)
     levels         <- gamma support / resistance / put wall, VWAP, 1SD expected range
+    scanner side   <- the side of the scan's top-ranked 1DTE+ pick over the last six
+                      scans. The trend rule alone was right about the next hour 47% of
+                      the time in the 54-day replay of 2026-10-09, so it no longer names
+                      a side by itself: a plan is shown only when the two agree
+    entry window   <- 10:00 to 15:00 ET. Outside it there is no plan (the owner's trades
+                      entered before 10:00 or after 15:00 lost the most by far)
     candidates     <- the top-ranked Best Value pick on the allowed side, one for each
                       DTE pool (1DTE+ and 0DTE; the pools are never mixed)
     trade plan     <- for the allowed side: stop under the nearest support (above the
@@ -20,8 +26,8 @@ A missing input is reported as unknown or left out. It is never guessed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
+from datetime import datetime, time
+from typing import Any, Sequence
 
 import pandas as pd
 
@@ -45,6 +51,13 @@ SCALE_OUT = (0.30, 0.40, 0.30)          # share closed at targets 1, 2 and 3 (2+
 MERGE_WITHIN_PCT = 0.05                 # targets this close together count as one
 MIN_REWARD_TO_RISK = 1.5                # the entry zone ends where reward/risk drops below this
 DELTA_BAND = (0.35, 0.50)               # the pre-trade |delta| band (same as Best Value's table)
+ENTRY_OPEN, ENTRY_CLOSE = time(10, 0), time(15, 0)   # new entries only in this window, ET
+FLOW_SCANS = 6                          # the scanner side looks at this many latest scans
+FLOW_NEED = 4                           # ...and needs this many on one side
+
+MIXED = "MIXED"
+HOLD_WINDOW, HOLD_CONFLICT, HOLD_UNCONFIRMED = "WINDOW", "CONFLICT", "UNCONFIRMED"
+FLOW_LABEL = {CALLS: "Calls", PUTS: "Puts", MIXED: "Mixed", UNKNOWN: "Unknown"}
 
 
 @dataclass(frozen=True)
@@ -110,6 +123,11 @@ class Plan:
     missing: tuple[str, ...] = field(default_factory=tuple)
     trade: TradePlan | None = None
     price_note: str = ""                 # where the current price came from, and when
+    trend_side: str = UNKNOWN            # what the EMA rule says, before any hold
+    flow_side: str = UNKNOWN             # CALLS, PUTS, MIXED or UNKNOWN
+    flow_note: str = ""
+    hold: str = ""                       # "" or a HOLD_* code: why no plan is shown
+    hold_note: str = ""
 
     def candidate_for(self, pool: str) -> Candidate | None:
         return next((c for c in self.candidates if c.pool == pool), None)
@@ -137,6 +155,47 @@ def side_from_trend(trend: dict | None) -> tuple[str, str]:
     if state == ema_stack.NO_TRADE:
         return STAND_ASIDE, reason
     return UNKNOWN, reason or "No 15-minute EMA data in this scan."
+
+
+def scanner_side(sides: Sequence[Any] | None) -> dict[str, Any]:
+    """The side the scanner has been ranking first. ``sides`` holds the option side
+    ("CALL" / "PUT" / None) of the top-ranked 1DTE+ pick of each recent scan, oldest
+    first. Only the last FLOW_SCANS count, and all of them must be present."""
+    last = [str(x).upper() if x is not None else None for x in (sides or [])][-FLOW_SCANS:]
+    calls, puts = last.count("CALL"), last.count("PUT")
+    if len(last) < FLOW_SCANS:
+        side = UNKNOWN
+        note = (f"Scanner side unknown: only {len(last)} of the last {FLOW_SCANS} scans "
+                "are available.")
+    else:
+        side = CALLS if calls >= FLOW_NEED else PUTS if puts >= FLOW_NEED else MIXED
+        note = (f"The scanner's top 1DTE+ pick was a call in {calls} and a put in {puts} "
+                f"of the last {FLOW_SCANS} scans.")
+    return {"side": side, "calls": calls, "puts": puts, "scans": len(last), "note": note}
+
+
+def resolve_side(trend_side: str, flow: dict | None,
+                 now: datetime | None) -> tuple[str, str, str]:
+    """(allowed side, hold code, hold note). The entry window is checked first, then the
+    scanner side. ``flow`` None means the caller has no scan history: the trend rule
+    stands alone, as it did before. ``now`` None skips the window check."""
+    if now is not None and not (ENTRY_OPEN <= now.time() < ENTRY_CLOSE):
+        return (STAND_ASIDE, HOLD_WINDOW,
+                f"Entry window closed: new entries only between {ENTRY_OPEN:%H:%M} and "
+                f"{ENTRY_CLOSE:%H:%M} ET. Entries outside it have lost the most.")
+    if trend_side not in (CALLS, PUTS) or flow is None:
+        return trend_side, "", ""
+    fside = flow.get("side")
+    if fside == UNKNOWN or fside is None or fside == trend_side:
+        return trend_side, "", ""
+    t = "calls" if trend_side == CALLS else "puts"
+    if fside == MIXED:
+        return (STAND_ASIDE, HOLD_UNCONFIRMED,
+                f"Not confirmed: the trend rule says {t}, but the scanner's top pick has "
+                "no clear side. No plan until they agree.")
+    return (STAND_ASIDE, HOLD_CONFLICT,
+            f"Conflict: the trend rule says {t}, the scanner's top pick says "
+            f"{'calls' if fside == CALLS else 'puts'}. No plan until they agree.")
 
 
 def regime_from_gamma(gamma: dict | None) -> tuple[str, str, float | None]:
@@ -212,10 +271,13 @@ def pick_candidate(picks: pd.DataFrame | None, side: str,
     }
 
 
-def _expect(side: str, regime: str, gamma: dict | None) -> tuple[str, ...]:
+def _expect(side: str, regime: str, gamma: dict | None,
+            hold_note: str = "") -> tuple[str, ...]:
     g = gamma or {}
     sup, res = _f(g.get("support")), _f(g.get("resistance"))
     out: list[str] = []
+    if hold_note:
+        return (hold_note,)
     if side == STAND_ASIDE:
         return ("The 15-minute EMAs are not stacked, so the trend rule allows no trade.",)
     if side == UNKNOWN:
@@ -240,9 +302,16 @@ def _expect(side: str, regime: str, gamma: dict | None) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _changes(side: str, regime: str, gamma: dict | None, stale: bool) -> tuple[str, ...]:
+def _changes(side: str, regime: str, gamma: dict | None, stale: bool,
+             hold: str = "") -> tuple[str, ...]:
     out: list[str] = []
-    if side in (CALLS, PUTS):
+    if hold == HOLD_WINDOW:
+        out.append(f"The clock reaches {ENTRY_OPEN:%H:%M} ET on a trading day: the entry "
+                   "window opens.")
+    elif hold:
+        out.append("The trend rule and the scanner's top pick settle on the same side: "
+                   "a plan appears.")
+    elif side in (CALLS, PUTS):
         out.append("The 15-minute EMAs lose their stack: the allowed side changes or goes "
                    "to stand aside.")
     elif side == STAND_ASIDE:
@@ -434,13 +503,17 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
                session_low: Any = None,
                stop_buffer_pct: float = STOP_BUFFER_PCT,
                min_reward_to_risk: float = MIN_REWARD_TO_RISK,
-               price_note: str = "", emas: dict | None = None) -> Plan:
-    side, side_reason = side_from_trend(trend)
+               price_note: str = "", emas: dict | None = None,
+               flow: dict | None = None, now: datetime | None = None) -> Plan:
+    trend_side, side_reason = side_from_trend(trend)
+    side, hold, hold_note = resolve_side(trend_side, flow, now)
     regime, regime_note, net = regime_from_gamma(gamma)
     candidates = []
     for pool in POOLS:
         pick = pick_candidate(picks, side, pool)
-        if side not in (CALLS, PUTS):
+        if hold:
+            note = "No candidate: " + hold_note.split(":")[0].lower() + "."
+        elif side not in (CALLS, PUTS):
             note = "No candidate while no side is allowed."
         elif pick is None:
             note = f"No ranked {pool} {'call' if side == CALLS else 'put'} in this scan."
@@ -449,7 +522,7 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
         candidates.append(Candidate(pool, pick, note))
     stale = bool((trend or {}).get("stale"))
     missing = tuple(name for name, absent in (
-        ("trend", side == UNKNOWN), ("gamma", gamma is None),
+        ("trend", trend_side == UNKNOWN), ("gamma", gamma is None),
         ("VWAP", _f(vwap) is None),
         ("expected range", _f((expected or {}).get("Upper_1SD")) is None),
     ) if absent)
@@ -459,13 +532,16 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
         regime_note=regime_note, net_gex=net, gamma_expiry=(gamma or {}).get("expiry"),
         levels=build_levels(_f(spot), gamma, vwap, expected, emas),
         candidates=tuple(candidates),
-        expect=_expect(side, regime, gamma), changes=_changes(side, regime, gamma, stale),
+        expect=_expect(side, regime, gamma, hold_note),
+        changes=_changes(side, regime, gamma, stale, hold),
         missing=missing,
         trade=build_trade_plan(side, spot=spot, gamma=gamma, vwap=vwap, expected=expected,
                                session_high=session_high, session_low=session_low,
                                stop_buffer_pct=stop_buffer_pct,
                                min_reward_to_risk=min_reward_to_risk, emas=emas),
         price_note=price_note,
+        trend_side=trend_side, flow_side=(flow or {}).get("side") or UNKNOWN,
+        flow_note=(flow or {}).get("note") or "", hold=hold, hold_note=hold_note,
     )
 
 
@@ -489,7 +565,13 @@ def plan_lines(plan: Plan, compact: bool = False) -> list[str]:
         f"🎯 <b>GAME PLAN · {plan.ticker}</b>",
         f"Side: <b>{SIDE_LABEL[plan.side]}</b>" + (" (scan is stale)" if plan.stale else ""),
         f"Day: <b>{REGIME_LABEL[plan.regime]}</b>",
-    ] + [f"{c.pool}: {candidate_text(c.pick)}" for c in plan.candidates]
+    ]
+    if plan.flow_note or plan.hold:
+        lines.append(f"Trend rule: {SIDE_LABEL[plan.trend_side]} · "
+                     f"Scanner: {FLOW_LABEL.get(plan.flow_side, 'Unknown')}")
+    if plan.hold:
+        return lines + [f"⛔ {plan.hold_note}"]
+    lines += [f"{c.pool}: {candidate_text(c.pick)}" for c in plan.candidates]
     lines += trade_lines(plan.trade)
     if compact:
         return lines

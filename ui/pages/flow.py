@@ -44,6 +44,7 @@ from ui.market import live_session_snapshot
 from volume_analysis import fetch_intraday_vwap_df
 import ema_stack
 import game_plan
+from plan_report import scanner_flow
 from ui import game_plan_view, shell
 from ui.gamma_data import gamma_summary_for
 from ui.components import price_chart
@@ -2022,6 +2023,11 @@ SECTIONS = ("game_plan", "header", "chart", "context", "positions", "news", "bes
 OVERVIEW = frozenset({"header", "context", "positions", "news", "details"})
 
 
+def _plan_now() -> datetime:
+    """The clock the Game Plan's entry window is checked against (a seam for tests)."""
+    return datetime.now(ET)
+
+
 def render_game_plan(cfg: dict) -> None:
     """Game Plan page: the scan turned into a plan by fixed rules."""
     render(cfg, sections=frozenset({"game_plan"}))
@@ -2161,6 +2167,7 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
             min_reward_to_risk=float(shell.setting(st, "min_reward_to_risk")),
             price_note=price_note,
             emas=((curr.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
+            flow=scanner_flow(curr, ticker), now=_plan_now(),
         ))
 
     if "header" in sections:

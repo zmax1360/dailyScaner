@@ -30,6 +30,15 @@ def _row(side, pool, score, strike, expiry, dte, last, delta):
             "openInterest": 4000, "Status": ""}
 
 
+@pytest.fixture(autouse=True)
+def no_real_archive(tmp_path, monkeypatch):
+    """Scanner-side history is read from an empty folder unless a test fills one."""
+    d = tmp_path / "archive"
+    d.mkdir()
+    monkeypatch.setattr(plan_report, "ARCHIVE_DIR", str(d))
+    return d
+
+
 @pytest.fixture
 def payload():
     """A scan archive with a bullish 15-minute stack, spot 333.5 and stored picks."""
@@ -183,3 +192,56 @@ def test_scheduler_asks_for_both_sections_and_the_bot_offers_them():
     assert '"game_plan":     True' in block and '"gamma":         True' in block
     keys = [k for k, _ in telegram_bot._SECTIONS]
     assert keys[:2] == ["game_plan", "gamma"]
+
+
+# ── scanner side from the day's archives ────────────────────────────────────
+def _scan(folder, hhmmss, side, ticker="AAPL", day="20261003"):
+    stamp = f"{day[:4]}-{day[4:6]}-{day[6:]}T{hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:]}-04:00"
+    rows = [] if side is None else [
+        _row(side, "1DTE+", 0.9, 335.0, NEXT_FRI, 6, 1.5, 0.4),
+        _row("PUT" if side == "CALL" else "CALL", "1DTE+", 0.2, 330.0, NEXT_FRI, 6, 1.0, 0.3),
+        _row("PUT" if side == "CALL" else "CALL", "0DTE", 1.0, 335.0, MONDAY, 0, 0.4, 0.3),
+    ]
+    (folder / f"{ticker}_{day}_{hhmmss}.json").write_text(
+        json.dumps({"timestamp": stamp, "best_value": {"rows": rows}}))
+
+
+def test_top_pick_side_is_the_best_ranked_row_of_the_pool(payload):
+    assert plan_report.top_pick_side(payload) == "PUT"            # 0.55 beats 0.31
+    assert plan_report.top_pick_side(payload, "0DTE") == "CALL"
+    assert plan_report.top_pick_side({}) is None
+    payload["best_value"]["rows"][1]["Value_Score"] = float("nan")
+    assert plan_report.top_pick_side(payload) == "CALL"
+
+
+def test_scanner_flow_reads_the_five_scans_before_this_one(payload, no_real_archive):
+    for t in ("101000", "102000", "103000", "104000", "105000"):
+        _scan(no_real_archive, t, "CALL")
+    _scan(no_real_archive, "100000", "PUT")                       # seventh back: ignored
+    _scan(no_real_archive, "110500", "PUT")                       # after this scan: ignored
+    _scan(no_real_archive, "105500", "PUT", ticker="NVDA")        # another ticker
+    _scan(no_real_archive, "105700", "PUT", day="20261002")       # another day
+    flow = plan_report.scanner_flow(payload, "aapl")
+    assert (flow["calls"], flow["puts"], flow["scans"]) == (5, 1, 6)
+    assert flow["side"] == gp.CALLS
+
+
+def test_scanner_flow_skips_a_broken_file_and_this_scans_own_archive(payload, no_real_archive):
+    for t in ("102000", "103000", "104000", "105000"):
+        _scan(no_real_archive, t, "PUT")
+    (no_real_archive / "AAPL_20261003_105500.json").write_text("{not json")
+    (no_real_archive / "AAPL_20261003_105759.json").write_text(json.dumps(payload))
+    flow = plan_report.scanner_flow(payload, "AAPL")
+    assert (flow["puts"], flow["scans"]) == (5, 5) and flow["side"] == gp.UNKNOWN
+
+
+def test_plan_from_archive_holds_on_conflict_and_outside_the_window(payload, snapshot,
+                                                                   no_real_archive):
+    for t in ("101000", "102000", "103000", "104000", "105000"):
+        _scan(no_real_archive, t, "PUT")
+    plan = plan_report.plan_from_archive(payload, "AAPL", now=NOW)   # bullish EMAs, put flow
+    assert plan.hold == gp.HOLD_CONFLICT and plan.trade is None
+    late = plan_report.plan_from_archive(payload, "AAPL", now=NOW.replace(hour=15, minute=10))
+    assert late.hold == gp.HOLD_WINDOW
+    lines, _ = plan_report.report_lines(payload, "AAPL", now=NOW)
+    assert any(x.startswith("⛔ Conflict") for x in lines)

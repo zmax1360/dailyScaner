@@ -8,6 +8,7 @@ Display only; nothing here feeds scoring.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 from datetime import datetime
@@ -24,6 +25,47 @@ import volume_history as vh
 ET = ZoneInfo("America/New_York")
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
                              "ui_settings.json")
+ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive")
+
+
+def top_pick_side(payload: dict | None, pool: str = game_plan.POOL_1DTE) -> str | None:
+    """Option side of the highest-scoring ranked row of ``pool`` in a scan archive."""
+    best, side = None, None
+    for row in ((payload or {}).get("best_value") or {}).get("rows") or []:
+        score = row.get("Value_Score")
+        if row.get("pool") != pool or not isinstance(score, (int, float)) or score != score:
+            continue
+        if best is None or score > best:
+            best, side = score, str(row.get("side") or "").upper() or None
+    return side
+
+
+def scanner_flow(payload: dict, ticker: str, archive_dir: str | None = None) -> dict:
+    """``game_plan.scanner_side`` for the scan in ``payload`` and the scans of the same
+    day just before it. Reads the day's archive files; an unreadable file is skipped."""
+    stamp = str((payload or {}).get("timestamp") or "")
+    sides: list[str | None] = []
+    try:
+        ts = datetime.fromisoformat(stamp).astimezone(ET)
+    except ValueError:
+        return game_plan.scanner_side([top_pick_side(payload)])
+    cutoff = f"{ts:%Y%m%d_%H%M%S}"
+    pattern = os.path.join(archive_dir or ARCHIVE_DIR,
+                           f"{str(ticker).upper()}_{ts:%Y%m%d}_*.json")
+    earlier = [p for p in sorted(glob.glob(pattern))
+               if os.path.basename(p)[len(str(ticker)) + 1:-5] < cutoff]
+    for path in reversed(earlier):                 # newest first, until five are read
+        if len(sides) >= game_plan.FLOW_SCANS - 1:
+            break
+        try:
+            with open(path, encoding="utf-8") as fh:
+                old = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(old, dict) and str(old.get("timestamp") or "") != stamp:
+            sides.append(top_pick_side(old))
+    sides.reverse()
+    return game_plan.scanner_side(sides + [top_pick_side(payload)])
 
 
 def gamma_summary_for(ticker: str, spot: Any, today=None) -> dict | None:
@@ -109,7 +151,8 @@ def picks_from_archive(payload: dict) -> pd.DataFrame:
 
 def plan_from_archive(payload: dict, ticker: str, *, gamma: dict | None = None,
                       now: datetime | None = None,
-                      settings: dict[str, float] | None = None) -> game_plan.Plan:
+                      settings: dict[str, float] | None = None,
+                      archive_dir: str | None = None) -> game_plan.Plan:
     """The Game Plan for one scan archive. VWAP is not stored in the archive, so it is
     left out; candidates come from the ranking the scan itself saved."""
     from strategy_engine import ticker_expected_range
@@ -117,9 +160,11 @@ def plan_from_archive(payload: dict, ticker: str, *, gamma: dict | None = None,
     spot = float(payload.get("spot") or 0)
     session = payload.get("session") or {}
     s = settings or saved_plan_settings()
+    now = now or datetime.now(ET)
     return game_plan.build_plan(
+        flow=scanner_flow(payload, ticker, archive_dir), now=now,
         ticker=ticker, spot=spot,
-        trend=ema_stack.banner_for_archive(payload, now=now or datetime.now(ET)),
+        trend=ema_stack.banner_for_archive(payload, now=now),
         gamma=gamma, vwap=None,
         expected=ticker_expected_range(spot, payload.get("volume") or {}),
         picks=picks_from_archive(payload),
