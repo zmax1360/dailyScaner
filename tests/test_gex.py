@@ -268,12 +268,90 @@ def test_an_otm_contract_never_borrows_from_its_itm_pair():
     assert t.loc["CALL", "iv"] == 0.22 and not t.loc["CALL", "iv_from_pair"]
 
 
-def test_an_itm_contract_with_its_own_usable_quote_keeps_its_own_iv():
+def test_an_itm_contract_always_takes_its_otm_pairs_iv():
+    """Even when its own quote solves: one IV per strike, the out-of-the-money one."""
     call = _quoted("CALL", 331.0, MONDAY, 1000, vendor_iv=0.10, true_iv=0.28)   # ITM, solves
-    put = _quoted("PUT", 331.0, MONDAY, 1000, vendor_iv=0.10, true_iv=0.34)
+    put = _quoted("PUT", 331.0, MONDAY, 1000, vendor_iv=0.10, true_iv=0.34)     # OTM
     t = _table([call, put], iv_source=gex.IV_QUOTE).set_index("side")
-    assert t.loc["CALL", "iv"] == pytest.approx(0.28, abs=3e-3)
-    assert not t.loc["CALL", "iv_from_pair"]
+    assert t.loc["CALL", "iv"] == t.loc["PUT", "iv"]
+    assert bool(t.loc["CALL", "iv_from_pair"]) and not t.loc["PUT", "iv_from_pair"]
+    assert t.loc["CALL", "gamma"] == pytest.approx(t.loc["PUT", "gamma"])
+
+
+# ── option quotes that lag the stock (the Oct 9, 11:23 case) ────────────────
+
+EXPIRY_DAY_AS_OF = datetime(2026, 10, 9, 11, 23, tzinfo=ET)
+LIVE_SPOT, QUOTED_AT = 335.12, 334.19
+
+
+def _lagging(side, strike, oi, true_iv=0.35):
+    """A same-day contract quoted tightly at the price the stock had a few minutes ago."""
+    from greeks import bs_price
+
+    t_days = gex.years_to_expiry("2026-10-09", EXPIRY_DAY_AS_OF) * 365.0
+    p = bs_price(side, QUOTED_AT, strike, t_days, true_iv, r=float(SCORING["risk_free_rate"]))
+    return {"side": side, "strike": strike, "expiry": "2026-10-09", "volume": 1000,
+            "open_interest": oi, "bid": round(p - 0.01, 2), "ask": round(p + 0.01, 2),
+            "last": p, "iv": 0.15}
+
+
+_LAGGING_CHAIN = [
+    _lagging("CALL", 332.5, 3299), _lagging("PUT", 332.5, 6844),
+    _lagging("CALL", 335.0, 10942), _lagging("PUT", 335.0, 13745),
+    _lagging("CALL", 337.5, 11622), _lagging("PUT", 337.5, 9315),
+]
+
+
+def _lagging_table():
+    return gex.gex_table(_latest(_LAGGING_CHAIN), spot=LIVE_SPOT, as_of=EXPIRY_DAY_AS_OF)
+
+
+def test_quote_price_recovers_the_price_the_quotes_were_made_at():
+    r = float(SCORING["risk_free_rate"])
+    t = gex.years_to_expiry("2026-10-09", EXPIRY_DAY_AS_OF)
+    assert gex.quote_price(_LAGGING_CHAIN, LIVE_SPOT, t, r) == pytest.approx(QUOTED_AT, abs=0.02)
+    assert _lagging_table().attrs["quote_price"]["2026-10-09"] == pytest.approx(QUOTED_AT,
+                                                                             abs=0.02)
+
+
+def test_quote_price_needs_tight_quotes_near_spot_and_a_believable_answer():
+    r, t = 0.045, 1 / 365
+    wide = [{"side": "CALL", "strike": 335.0, "bid": 1.0, "ask": 2.4},
+            {"side": "PUT", "strike": 335.0, "bid": 1.0, "ask": 1.02}]
+    assert gex.quote_price(wide, 335.0, t, r) is None                 # call spread too wide
+    far = [{"side": "CALL", "strike": 300.0, "bid": 35.0, "ask": 35.02},
+           {"side": "PUT", "strike": 300.0, "bid": 0.01, "ask": 0.02}]
+    assert gex.quote_price(far, 335.0, t, r) is None                  # not near spot
+    one_side = [{"side": "CALL", "strike": 335.0, "bid": 1.0, "ask": 1.02}]
+    assert gex.quote_price(one_side, 335.0, t, r) is None
+    off = [{"side": "CALL", "strike": 335.0, "bid": 9.0, "ask": 9.02},
+           {"side": "PUT", "strike": 335.0, "bid": 1.0, "ask": 1.02}]
+    assert gex.quote_price(off, 335.0, t, r) is None                  # 343: not believable
+    assert gex.quote_price([], 335.0, t, r) is None
+
+
+def test_lagging_quotes_no_longer_flip_a_put_heavy_strike_positive():
+    """Reported case: $335 held 10,942 calls against 13,745 puts and showed +45M, because
+    the call and the put were solved to different IVs at a stock price newer than the
+    quotes. One IV per strike makes the sign follow the open interest."""
+    t = _lagging_table().set_index(["strike", "side"])
+    for strike in (332.5, 335.0, 337.5):
+        call, put = t.loc[(strike, "CALL")], t.loc[(strike, "PUT")]
+        assert call["iv"] == put["iv"]
+        assert call["iv"] == pytest.approx(0.35, abs=0.02)             # the IV they were quoted at
+    m = gex.gex_matrix(_lagging_table(), spot=LIVE_SPOT, n_strikes=None)["2026-10-09"]
+    assert m[335.0] < 0 and m[332.5] < 0                               # more puts than calls
+    assert m[337.5] > 0                                                # more calls than puts
+    gamma = t.loc[(335.0, "CALL"), "gamma"]
+    assert m[335.0] == pytest.approx(gamma * (10942 - 13745) * 100 * LIVE_SPOT)
+
+
+def test_without_a_quote_price_the_iv_is_solved_at_spot():
+    row = _quoted("CALL", 335.0, MONDAY, 2000, vendor_iv=0.15, true_iv=0.30)
+    t = gex.gex_table(_latest([row]), spot=SPOT, as_of=AS_OF)        # no pair: no parity
+    assert t.attrs["quote_price"][MONDAY] == SPOT
+    assert t.loc[0, "iv"] == pytest.approx(0.30, abs=3e-3)
+    assert "quote_price" not in _table([row]).attrs                   # vendor mode
 
 
 def test_unknown_iv_source_is_rejected():
@@ -716,3 +794,11 @@ def test_page_profile_layout_replaces_the_table_with_a_chart(seeded):
     assert len(at.get("plotly_chart")) == 1
     assert not any("<table" in m.value for m in at.markdown)
     assert {m.label for m in at.metric} >= {"Gamma support", "Call resistance", "Put wall"}
+
+
+def test_lag_note_appears_only_when_quotes_sit_away_from_spot():
+    note = gex_page.lag_note({"2026-10-09": 334.19}, "2026-10-09", 335.12)
+    assert "$334.19" in note and "$335.12" in note and note.startswith("⚠️")
+    assert gex_page.lag_note({"2026-10-09": 335.00}, "2026-10-09", 335.12) == ""   # 0.04%
+    assert gex_page.lag_note({}, "2026-10-09", 335.12) == ""
+    assert gex_page.lag_note({"2026-10-09": 334.19}, "2026-10-12", 335.12) == ""

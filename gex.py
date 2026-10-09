@@ -75,6 +75,54 @@ def years_to_expiry(expiry: str, as_of: datetime) -> float | None:
     return minutes / (365.0 * 24.0 * 60.0)
 
 
+PARITY_NEAR_PCT = 0.015         # strikes this close to spot can set the quote price
+PARITY_MAX_SPREAD = 0.10        # ...if both quotes are this tight (share of the mid)
+PARITY_MIN_SPREAD_ABS = 0.05    # ...or within this many dollars
+PARITY_MAX_SHIFT_PCT = 0.01     # a quote price further than this from spot is not believed
+
+
+def _usable_mid(bid: Any, ask: Any) -> float | None:
+    b, a = _f(bid), _f(ask)
+    if b is None or a is None or b <= 0 or a < b:
+        return None
+    return 0.5 * (b + a)
+
+
+def quote_price(records: list[dict], spot: float, t_years: float, r: float) -> float | None:
+    """The stock price the option quotes of one expiry were made at, from put-call parity:
+    call − put + strike × e^(−rT), at up to three tight-quoted strikes nearest spot
+    (the middle value). None when no strike near spot has two tight quotes, or when the
+    answer is further from spot than is believable.
+
+    Option quotes often lag the stock by several minutes. Solving implied volatility
+    with a newer stock price than the quotes were made at makes calls look cheap and
+    puts look dear (or the reverse), which on expiry day is enough to flip a strike's
+    sign. Solving at the quotes' own price removes that."""
+    by_strike: dict[float, dict[str, tuple[float, float]]] = {}
+    for rec in records:
+        side, k = str(rec.get("side") or "").upper(), _f(rec.get("strike"))
+        mid = _usable_mid(rec.get("bid"), rec.get("ask"))
+        if side not in ("CALL", "PUT") or k is None or mid is None:
+            continue
+        if abs(k - spot) > spot * PARITY_NEAR_PCT:
+            continue
+        spread = _f(rec.get("ask")) - _f(rec.get("bid"))
+        if spread > max(PARITY_MIN_SPREAD_ABS, PARITY_MAX_SPREAD * mid):
+            continue
+        by_strike.setdefault(k, {})[side] = (mid, spread)
+    pairs = sorted((k for k, v in by_strike.items() if len(v) == 2),
+                   key=lambda k: abs(k - spot))[:3]
+    if not pairs:
+        return None
+    est = sorted(by_strike[k]["CALL"][0] - by_strike[k]["PUT"][0] + k * math.exp(-r * t_years)
+                 for k in pairs)
+    price = est[len(est) // 2] if len(est) % 2 else 0.5 * (est[0] + est[1]) if len(est) == 2 \
+        else est[len(est) // 2]
+    if abs(price - spot) > spot * PARITY_MAX_SHIFT_PCT:
+        return None
+    return float(price)
+
+
 def gex_table(
     latest: pd.DataFrame,
     *,
@@ -91,11 +139,18 @@ def gex_table(
     snapshot viewed on a later day does not show dead expiries).
 
     ``iv_source`` "quote" solves IV from each contract's bid/ask mid with the exact
-    time to expiry. An in-the-money contract whose own quote gives no IV takes the IV
-    solved from the out-of-the-money contract at the same strike and expiry (flagged
-    ``iv_from_pair``). Otherwise the vendor IV is kept. IV is never borrowed from a
-    different strike: penny quotes in the far wings solve to inflated IVs, and spreading
-    those to neighbours overstated wing gamma several-fold.
+    time to expiry, at the stock price the quotes themselves imply (``quote_price``;
+    spot when that cannot be told). A call and a put at one strike then share ONE implied
+    volatility whenever the out-of-the-money contract's solves: the in-the-money contract
+    uses it too (flagged ``iv_from_pair``). With one IV per strike the sign of a strike is
+    simply calls against puts in open interest; separate IVs let it flip with quote
+    noise. An out-of-the-money contract never borrows from its in-the-money pair, whose
+    quotes are wide. Without any solved IV the vendor IV is kept. IV is never
+    borrowed from a different strike: penny quotes in the far wings solve to inflated
+    IVs, and spreading those to neighbours overstated wing gamma several-fold.
+
+    Gamma is always evaluated at ``spot``. ``table.attrs["quote_price"]`` maps each expiry
+    to the price its IVs were solved at (absent in vendor mode).
     """
     if unit not in UNITS:
         raise ValueError(f"unknown unit {unit!r}")
@@ -109,8 +164,8 @@ def gex_table(
     snap_day = as_of.astimezone(ET).date()
     scale = {UNIT_DOLLAR: s, UNIT_PCT: s * s * MOVE_PCT, UNIT_SHARES: 1.0}[unit]
 
-    # pass 1: parse, and (quote mode) solve IV from each contract's own mid
-    parsed = []
+    # pass 1: parse; find the price each expiry's quotes were made at
+    records = []
     for rec in latest.to_dict(orient="records"):
         side = str(rec.get("side") or "").upper()
         strike = _f(rec.get("strike"))
@@ -120,39 +175,52 @@ def gex_table(
             continue
         if today is not None and date.fromisoformat(expiry) < today:
             continue
+        records.append({**rec, "side": side, "strike": strike, "expiry": expiry, "t": t})
+
+    priced_at: dict[str, float] = {}
+    if iv_source == IV_QUOTE:
+        by_expiry: dict[str, list[dict]] = {}
+        for rec in records:
+            by_expiry.setdefault(rec["expiry"], []).append(rec)
+        for expiry, recs in by_expiry.items():
+            q = quote_price(recs, s, recs[0]["t"], r)
+            priced_at[expiry] = s if q is None else q
+
+    # pass 2: (quote mode) solve IV from each contract's own mid at that price
+    parsed = []
+    for rec in records:
+        side, strike, expiry, t = rec["side"], rec["strike"], rec["expiry"], rec["t"]
         solved = None
         if iv_source == IV_QUOTE:
-            bid, ask = _f(rec.get("bid")), _f(rec.get("ask"))
-            if bid is not None and ask is not None and bid > 0 and ask >= bid:
-                v = implied_vol(side, s, strike, t * 365.0, 0.5 * (bid + ask), r=r)
+            mid = _usable_mid(rec.get("bid"), rec.get("ask"))
+            if mid is not None:
+                v = implied_vol(side, priced_at[expiry], strike, t * 365.0, mid, r=r)
                 if v is not None and v >= min_iv:
                     solved = v
         parsed.append({"side": side, "strike": strike, "expiry": expiry, "t": t,
                        "oi": _f(rec.get("open_interest")), "vendor_iv": _f(rec.get("iv")),
                        "solved": solved})
 
-    # IV solved from the out-of-the-money contract at each strike. A call and a put at
-    # one strike share an implied volatility, and the OTM quote is the reliable one.
-    otm_iv: dict[tuple[str, float], float] = {}
+    # One IV per strike and expiry whenever the out-of-the-money contract solved: both the
+    # call and the put use it. Out-of-the-money is judged at the quotes' own price. It is
+    # never the other way round: in-the-money quotes are wide and solve to inflated IVs.
+    def _is_otm(p: dict) -> bool:
+        return (p["side"] == "CALL") == (p["strike"] > priced_at.get(p["expiry"], s))
+
+    shared: dict[tuple[str, float], tuple[float, str]] = {}
     for p in parsed:
-        is_otm = (p["side"] == "CALL") == (p["strike"] > s)
-        if is_otm and p["solved"] is not None:
-            otm_iv[(p["expiry"], p["strike"])] = p["solved"]
+        if p["solved"] is not None and _is_otm(p):
+            shared[(p["expiry"], p["strike"])] = (p["solved"], p["side"])
 
     rows = []
     for p in parsed:
         side, strike, expiry, t, oi = p["side"], p["strike"], p["expiry"], p["t"], p["oi"]
         iv, from_quote, from_pair = p["vendor_iv"], False, False
-        if p["solved"] is not None:
-            iv, from_quote = p["solved"], True
-        elif iv_source == IV_QUOTE:
-            # In-the-money contract whose own quote gives no IV (wide or stale, mid under
-            # intrinsic): take the IV of its OTM pair at the same strike. Never the other
-            # way round, and never from a different strike.
-            is_itm = (side == "CALL") == (strike < s)
-            pair = otm_iv.get((expiry, strike))
-            if is_itm and pair is not None:
-                iv, from_quote, from_pair = pair, True, True
+        pick = shared.get((expiry, strike))
+        if pick is not None:
+            iv, from_quote, from_pair = pick[0], True, pick[1] != side
+        elif p["solved"] is not None:
+            iv, from_quote = p["solved"], True          # no out-of-the-money IV to share
         gamma = None
         if iv is not None and iv >= min_iv:
             gamma = bs_gamma(s, strike, iv, t_years=t, r=r)
@@ -170,7 +238,10 @@ def gex_table(
             "gamma": float("nan") if gamma is None else gamma,
             "gex": gex,
         })
-    return pd.DataFrame(rows, columns=TABLE_COLS)
+    out = pd.DataFrame(rows, columns=TABLE_COLS)
+    if priced_at:
+        out.attrs["quote_price"] = priced_at
+    return out
 
 
 def coverage(table: pd.DataFrame) -> dict[str, int]:

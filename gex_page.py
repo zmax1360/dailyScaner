@@ -166,6 +166,20 @@ def profile_figure(matrix: pd.DataFrame, *, spot: float, title: str = ""):
     return fig
 
 
+LAG_NOTE_MIN_PCT = 0.10          # say so when quotes sit this far (percent) from spot
+
+
+def lag_note(quote_prices: dict, expiry: str, spot: float) -> str:
+    """A line for the caption when the option quotes were made at a different stock price
+    than the one shown (they lag the stock). Empty when they agree or it is unknown."""
+    q = quote_prices.get(expiry)
+    if q is None or not spot or abs(q - spot) / spot * 100.0 < LAG_NOTE_MIN_PCT:
+        return ""
+    return (f"⚠️ The option quotes behind this map were made with the stock at ${q:,.2f}; "
+            f"the price shown is ${spot:,.2f}. Quotes lag the stock, so on a fast move the "
+            "strikes nearest the price are the least certain.")
+
+
 def build_view(latest: pd.DataFrame, *, spot: float, as_of: datetime, today: date,
                unit: str = gex.UNIT_DOLLAR, iv_source: str = gex.IV_QUOTE,
                mode: str = EXP_WEEK, picked: list[str] | None = None,
@@ -279,6 +293,9 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
            + " · " if cov["iv_from_quote"] else "")
         + UNIT_CAPTION[unit].replace("$", "\\$")
     )
+    note = lag_note(view["table"].attrs.get("quote_price", {}), str(matrix.columns[0]), spot)
+    if note:
+        st.caption(note.replace("$", "\\$"))
 
     # ── panel 3: how to read it ──────────────────────────────────────────────
     with st.expander("How to read this, and its limits"):
