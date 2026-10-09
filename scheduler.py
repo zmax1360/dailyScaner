@@ -26,7 +26,8 @@ scheduler_config.json schema
   "notify_telegram":      true,      # send Telegram alert after each scan
   "tickers": {                       # per-ticker overrides (optional)
     "AAPL": { "interval_min": 3  },
-    "TSLA": { "interval_min": 10 }
+    "TSLA": { "interval_min": 10 },
+    "SPY":  { "interval_min": 15, "notify": false }   # scan and record, no Telegram
   }
 }
 """
@@ -212,6 +213,13 @@ def _send_plain(url: str, chat_id: str, text: str) -> bool:
     except Exception as exc:
         log.warning(f"Telegram plain-text resend failed: {exc}")
         return False
+
+
+def ticker_notifies(cfg: dict, ticker: str) -> bool:
+    """Telegram after a scan of ``ticker``: the global switch, and the ticker's own
+    ``"notify": false`` (a ticker that is only being recorded stays quiet)."""
+    own = ((cfg or {}).get("tickers") or {}).get(ticker, {})
+    return bool((cfg or {}).get("notify_telegram", True)) and own.get("notify", True) is not False
 
 
 def _notify_success(ticker: str, env: dict, elapsed: float) -> None:
@@ -522,7 +530,7 @@ def main(once: bool = False) -> None:
                     last_scan[ticker] = time.monotonic()
                     handle_scan_result(
                         ticker, code, reason, elapsed,
-                        notify=notify, env=env,
+                        notify=ticker_notifies(cfg, ticker), env=env,
                     )
                     continue
 
@@ -545,7 +553,7 @@ def main(once: bool = False) -> None:
                     last_scan[ticker] = time.monotonic()
                     handle_scan_result(
                         ticker, code, reason, elapsed,
-                        notify=notify, env=env,
+                        notify=ticker_notifies(cfg, ticker), env=env,
                     )
             if once:
                 break
