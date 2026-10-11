@@ -427,3 +427,20 @@ def test_expected_move_can_be_switched_off(monkeypatch):
     monkeypatch.setattr(pc, "_cached_moves", lambda t, d: called.append(t) or [])
     at.checkbox(key="chart_expected_move").uncheck().run()
     assert not at.exception and called == []
+
+
+def test_far_labels_sit_on_the_right_away_from_line_labels():
+    """Regression (2026-10-11): a line just under the top edge had its label printed
+    over by the edge labels of two levels above the chart."""
+    df = pc.prepare(_bars(), "5M")
+    lo, hi, _ = _levels_for(df)
+    span = hi - lo
+    levels = [{"key": "near", "name": "Near", "price": hi + 0.3 * span, "color": "#fff"},
+              {"key": "far1", "name": "Far one", "price": hi + 3 * span, "color": "#fff"},
+              {"key": "far2", "name": "Far two", "price": hi + 4 * span, "color": "#fff"}]
+    fig = pc.build_figure(df, levels=levels)
+    far = [a for a in fig.layout.annotations if a.text.startswith("Far")]
+    near = [a for a in fig.layout.annotations if a.text.startswith("Near")]
+    assert len(far) == 2 and all(a.x == 1.0 and a.xanchor == "right" for a in far)
+    assert len(near) == 1 and near[0].xanchor == "left"
+    assert far[0].yshift != far[1].yshift

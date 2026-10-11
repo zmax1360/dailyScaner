@@ -120,7 +120,9 @@ def build_figure(df: pd.DataFrame, *, ticker: str = "", timeframe: str = DEFAULT
         for lv in far:
             side = "below" if lv["price"] < lo else "above"
             fig.add_annotation(
-                row=row["price"], col=1, xref="x domain", x=0.0, xanchor="left",
+                # right-hand side: the labels of drawn lines sit on the left, and a line
+                # near the top or bottom edge would otherwise be printed over
+                row=row["price"], col=1, xref="x domain", x=1.0, xanchor="right",
                 y=y0 if side == "below" else y1,
                 yanchor="bottom" if side == "below" else "top",
                 yshift=(14 if side == "below" else -14) * stacked[side],
