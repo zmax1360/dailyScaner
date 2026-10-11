@@ -3,11 +3,15 @@ stochastic / ATR panels on one shared time axis."""
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import streamlit as st
 
+import expected_move
 from chart_indicators import add_indicators, last_session
 from pov_leakage import OVER_PARTICIPATION_THRESH, compute_pov_metrics
+from ui.common import ET
 from ui.context import ScanContext
 from ui.gamma_data import gamma_levels, gamma_summary_for
 from ui.widgets import _choice_control
@@ -188,6 +192,17 @@ def _cached_bars(ticker: str, timeframe: str) -> pd.DataFrame:
     return fetch_intraday_vwap_df(ticker, last_session_only=False, timeframe=timeframe)
 
 
+def _today():
+    """Today's date in New York (a seam for tests)."""
+    return datetime.now(ET).date()
+
+
+@st.cache_data(ttl=300)
+def _cached_moves(ticker: str, today_iso: str) -> list[dict]:
+    from datetime import date
+    return expected_move.expected_moves(ticker, date.fromisoformat(today_iso))
+
+
 def render(ctx: ScanContext) -> None:
     ticker = ctx.ticker
     left, right = st.columns([5, 1])
@@ -204,12 +219,19 @@ def render(ctx: ScanContext) -> None:
         show_gamma = st.checkbox("Gamma levels", value=True, key="chart_gamma",
                                  help="Lines at gamma support, call resistance and the put "
                                       "wall for the nearest expiry (from the Gamma page).")
+        show_move = st.checkbox("Expected move", value=True, key="chart_expected_move",
+                                help="The range option prices imply for the two nearest "
+                                     "expiries: the at-the-money straddle, set at the "
+                                     "previous close and fixed for the day.")
 
     df = prepare(_cached_bars(ticker, timeframe), timeframe)
     if df.empty:
         st.caption(f"{timeframe} chart unavailable right now.")
         return
     levels = gamma_levels(gamma_summary_for(ticker, ctx.spot)) if show_gamma else []
+    gamma_count = len(levels)
+    moves = _cached_moves(ticker, _today().isoformat()) if show_move else []
+    levels = levels + expected_move.chart_levels(moves)
     fig = build_figure(df, ticker=ticker, timeframe=timeframe, show_stoch=show_stoch,
                        show_atr=show_atr, show_participation=show_part, levels=levels)
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
@@ -226,6 +248,8 @@ def render(ctx: ScanContext) -> None:
     missing = [n.replace("EMA", "EMA ") for n in EMA_COLORS if pd.isna(last.get(n))]
     note = f" · not enough bars for {', '.join(missing)}" if missing else ""
     st.caption("Last bar: " + " · ".join(parts) + note)
-    if levels:
+    if gamma_count:
         st.caption("Gamma levels: " + " · ".join(
-            f"{lv['name']} \\${lv['price']:g}" for lv in levels))
+            f"{lv['name']} \\${lv['price']:g}" for lv in levels[:gamma_count]))
+    if moves:
+        st.caption(expected_move.caption(moves).replace("$", "\\$"))

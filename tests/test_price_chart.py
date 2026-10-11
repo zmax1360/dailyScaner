@@ -207,8 +207,10 @@ pc.render(ScanContext(ticker="AAPL", curr={"spot": 333.0}))
 """
 
 
-def _run(monkeypatch, bars, summary=None):
+def _run(monkeypatch, bars, summary=None, moves=None):
     from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setattr(pc, "_cached_moves", lambda ticker, today_iso: moves or [])
 
     monkeypatch.setattr(pc, "_cached_bars", lambda ticker, timeframe: bars)
     # never the real snapshot database
@@ -224,7 +226,8 @@ def test_component_renders_with_a_last_bar_read_out(monkeypatch):
     for want in ("EMA 9", "EMA 21", "EMA 50", "VWAP", "Stoch", "ATR"):
         assert want in cap
     assert {c.key for c in at.checkbox} == {"chart_stoch", "chart_atr", "chart_participation",
-                                            "chart_gamma"}
+                                            "chart_gamma", "chart_expected_move"}
+    assert not any(c.value.startswith("Expected move:") for c in at.caption)
     assert not any(c.value.startswith("Gamma levels:") for c in at.caption)   # none available
 
 
@@ -401,3 +404,26 @@ def test_component_lists_gamma_levels_and_the_toggle_removes_them(monkeypatch):
     at.checkbox(key="chart_gamma").set_value(False).run()
     assert not at.exception
     assert not any(c.value.startswith("Gamma levels:") for c in at.caption)
+
+
+# ── expected move on the chart ──────────────────────────────────────────────
+def test_expected_move_is_drawn_and_described(monkeypatch):
+    from datetime import datetime
+
+    bars = _bars()
+    mid = float(bars["Close"].iloc[-1])
+    moves = [{"expiry": "2026-10-12", "anchor": mid, "move": 0.4, "low": round(mid - 0.4, 2),
+              "high": round(mid + 0.4, 2), "strike": 335.0, "same_day": False,
+              "as_of": datetime(2026, 10, 9, 15, 48)}]
+    at = _run(monkeypatch, bars, moves=moves)
+    cap = next(c.value for c in at.caption if c.value.startswith("Expected move:"))
+    assert "Oct 12 ±\\$0.40" in cap and "Fri Oct 9 15:48 snapshot" in cap
+    assert not any(c.value.startswith("Gamma levels:") for c in at.caption)
+
+
+def test_expected_move_can_be_switched_off(monkeypatch):
+    called = []
+    at = _run(monkeypatch, _bars())
+    monkeypatch.setattr(pc, "_cached_moves", lambda t, d: called.append(t) or [])
+    at.checkbox(key="chart_expected_move").uncheck().run()
+    assert not at.exception and called == []
