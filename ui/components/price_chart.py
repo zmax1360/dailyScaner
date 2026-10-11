@@ -27,6 +27,7 @@ EMA_COLORS = {"EMA9": "#7CFC00", "EMA21": "#2196F3", "EMA50": "#F44336"}
 VWAP_COLOR = "#00E5FF"
 GRID = "rgba(255,255,255,0.06)"
 LEVEL_REACH = 0.35        # a level within this share of the candle range gets a line
+EDGE_LABEL_ROW = 0.05     # share of the price range kept free for each edge label
 
 
 def prepare(bars: pd.DataFrame, timeframe: str) -> pd.DataFrame:
@@ -106,7 +107,10 @@ def build_figure(df: pd.DataFrame, *, ticker: str = "", timeframe: str = DEFAULT
         lo2 = min([lo] + [lv["price"] for lv in near])
         hi2 = max([hi] + [lv["price"] for lv in near])
         pad = 0.06 * (hi2 - lo2)
-        y0, y1 = lo2 - pad, hi2 + pad
+        # each edge label needs its own row of free space beyond the last drawn line
+        row_pad = EDGE_LABEL_ROW * (hi2 - lo2)
+        y0 = lo2 - pad - row_pad * sum(lv["price"] < lo for lv in far)
+        y1 = hi2 + pad + row_pad * sum(lv["price"] > hi for lv in far)
         fig.update_yaxes(range=[y0, y1], row=row["price"], col=1)
         for lv in near:
             fig.add_hline(

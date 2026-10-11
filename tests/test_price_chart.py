@@ -444,3 +444,21 @@ def test_far_labels_sit_on_the_right_away_from_line_labels():
     assert len(far) == 2 and all(a.x == 1.0 and a.xanchor == "right" for a in far)
     assert len(near) == 1 and near[0].xanchor == "left"
     assert far[0].yshift != far[1].yshift
+
+
+def test_each_edge_label_gets_room_beyond_the_last_line():
+    """Regression (2026-10-11): the second edge label was struck through by the dashed
+    line of a level just under the top of the chart."""
+    df = pc.prepare(_bars(), "5M")
+    lo, hi, _ = _levels_for(df)
+    span = hi - lo
+    near = {"key": "near", "name": "Near", "price": hi + 0.3 * span, "color": "#fff"}
+    far = [{"key": f"f{i}", "name": f"Far {i}", "price": hi + (3 + i) * span, "color": "#fff"}
+           for i in range(2)]
+    top = lambda levels: pc.build_figure(df, levels=levels).layout.yaxis.range[1]
+    drawn = near["price"] - min(lo, near["price"])
+    base, both = top([near]), top([near] + far)
+    assert base > near["price"]
+    assert both - base == pytest.approx(2 * pc.EDGE_LABEL_ROW * (near["price"] - lo), rel=0.02)
+    bottom = pc.build_figure(df, levels=[near] + far).layout.yaxis.range[0]
+    assert bottom == pytest.approx(pc.build_figure(df, levels=[near]).layout.yaxis.range[0])
