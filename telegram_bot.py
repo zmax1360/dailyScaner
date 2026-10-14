@@ -13,6 +13,7 @@ Conversation flow:
 """
 
 import glob
+import html
 import json
 import logging
 import os
@@ -614,7 +615,7 @@ def _fmt_report(
                     if not ok_sig:
                         L.append(
                             f"⭐ <b>{pool_name}</b> — not ranked "
-                            f"<i>({why_sig})</i>"
+                            f"<i>({html.escape(str(why_sig))})</i>"
                         )
                         continue
                     any_pool = True

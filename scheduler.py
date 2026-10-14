@@ -40,6 +40,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, time as dtime
@@ -182,8 +183,34 @@ def _send_telegram(token: str, chat_id: str, text: str) -> bool:
         req = urllib.request.Request(url, data=body, method="POST")
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200
+    except urllib.error.HTTPError as exc:
+        if exc.code != 400:
+            log.warning(f"Telegram notify failed: {exc}")
+            return False
+        # 400 is almost always HTML Telegram cannot parse. Send the same text as plain
+        # text rather than losing the message.
+        log.warning(f"Telegram notify failed: {exc} — resending as plain text")
+        return _send_plain(url, chat_id, text)
     except Exception as exc:
         log.warning(f"Telegram notify failed: {exc}")
+        return False
+
+
+def plain_text(text: str) -> str:
+    """The message without HTML tags and entities, for Telegram's plain-text mode."""
+    import html as _html
+    import re
+    return _html.unescape(re.sub(r"</?(?:b|i|u|s|code|pre)>", "", text))
+
+
+def _send_plain(url: str, chat_id: str, text: str) -> bool:
+    body = urllib.parse.urlencode({"chat_id": chat_id, "text": plain_text(text)}).encode()
+    try:
+        req = urllib.request.Request(url, data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except Exception as exc:
+        log.warning(f"Telegram plain-text resend failed: {exc}")
         return False
 
 
