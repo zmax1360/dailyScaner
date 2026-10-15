@@ -14,9 +14,19 @@ Total_Count is the number of 1m bars with volume > 0 (print-count proxy).
 
 from __future__ import annotations
 
+from datetime import time
 from typing import Any
 
 import pandas as pd
+
+ET_ZONE = "America/New_York"
+RTH_OPEN, RTH_CLOSE = time(9, 30), time(16, 0)   # regular session, ET
+# The opening 5-minute bar is normally one of the heaviest of the day. When it carries
+# less than this share of the median of the next six bars, its volume is probably
+# missing from the feed, and VWAP leaves out the opening prints.
+OPEN_BAR_MIN_SHARE = 0.5
+OPEN_BAR_WARNING = ("The opening bar has almost no volume in the data feed, so VWAP may "
+                    "leave out the opening trades. Check it against your chart.")
 
 
 def _empty_result(ticker: str) -> dict[str, Any]:
@@ -168,7 +178,51 @@ def _empty_vwap(ticker: str) -> dict[str, Any]:
         "current_price": None,
         "prev_close": None,
         "prev_vwap": None,
+        "VWAP_warning": None,
     }
+
+
+def _et_index(idx) -> pd.DatetimeIndex:
+    """The index in ET wall time. A naive index is already ET: the data sources convert to
+    ET and then drop the zone."""
+    di = pd.DatetimeIndex(idx)
+    if di.tz is not None:
+        return di.tz_convert(ET_ZONE).tz_localize(None)
+    return di
+
+
+def _et_days(idx) -> list:
+    return list(_et_index(idx).date)
+
+
+def regular_session_only(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep the bars that start inside the regular session, 09:30 to 16:00 ET. Pre-market
+    and after-hours bars would pull VWAP and the EMAs away from what the scanner and a
+    regular-hours chart show."""
+    if df is None or df.empty:
+        return df
+    t = _et_index(df.index).time
+    keep = [(RTH_OPEN <= x < RTH_CLOSE) for x in t]
+    return df[keep]
+
+
+def opening_bar_warning(df: pd.DataFrame) -> str | None:
+    """A warning when the last session's first regular-hours bar looks like it is missing
+    its volume (see OPEN_BAR_MIN_SHARE). None when it looks normal or cannot be judged."""
+    if df is None or df.empty or "Volume" not in df.columns:
+        return None
+    et = _et_index(df.index)
+    last_day = et.date[-1]
+    day = df[[d == last_day for d in et.date]]
+    day_t = _et_index(day.index).time
+    day = day[[x >= RTH_OPEN for x in day_t]]
+    if len(day) < 7 or _et_index(day.index).time[0] != RTH_OPEN:
+        return None
+    vol = pd.to_numeric(day["Volume"], errors="coerce").fillna(0.0)
+    later = float(vol.iloc[1:7].median())
+    if later <= 0:
+        return None
+    return OPEN_BAR_WARNING if float(vol.iloc[0]) < OPEN_BAR_MIN_SHARE * later else None
 
 
 def compute_intraday_vwap(df: pd.DataFrame, *, session_reset: bool = True) -> pd.Series:
@@ -195,20 +249,9 @@ def compute_intraday_vwap(df: pd.DataFrame, *, session_reset: bool = True) -> pd
         cum_vol = vol.cumsum().replace(0, float("nan"))
         return tp_vol.cumsum() / cum_vol
 
-    # Day key for session reset
-    idx = work.index
-    try:
-        if getattr(idx, "tz", None) is not None:
-            days = idx.tz_convert("America/New_York").date
-        else:
-            days = pd.DatetimeIndex(idx).tz_localize("UTC").tz_convert(
-                "America/New_York"
-            ).date
-    except Exception:
-        days = pd.DatetimeIndex(idx).date
-
+    # Day key for session reset (ET trading day)
     work = work.copy()
-    work["_day"] = list(days)
+    work["_day"] = _et_days(work.index)
     cum_tp_vol = tp_vol.groupby(work["_day"]).cumsum()
     cum_vol = vol.groupby(work["_day"]).cumsum().replace(0, float("nan"))
     return cum_tp_vol / cum_vol
@@ -286,6 +329,12 @@ def fetch_intraday_vwap_df(
                 return pd.DataFrame()
         hist = hist[need]
 
+        if spec["interval"] != "1d":
+            hist = regular_session_only(hist)
+            if hist.empty:
+                return pd.DataFrame()
+        warning = opening_bar_warning(hist) if spec["interval"] == "5m" else None
+
         if spec["resample"]:
             hist = _ohlc_resample(hist, spec["resample"])
             if hist.empty:
@@ -296,20 +345,12 @@ def fetch_intraday_vwap_df(
         )
 
         if use_last_session and len(hist) > 0:
-            idx = hist.index
-            try:
-                if getattr(idx, "tz", None) is not None:
-                    days = idx.tz_convert("America/New_York").date
-                else:
-                    days = pd.DatetimeIndex(idx).tz_localize("UTC").tz_convert(
-                        "America/New_York"
-                    ).date
-            except Exception:
-                days = pd.DatetimeIndex(idx).date
-            last_day = list(days)[-1]
+            days = _et_days(hist.index)
+            last_day = days[-1]
             hist = hist[[d == last_day for d in days]]
 
         hist = hist.dropna(subset=["Open", "High", "Low", "Close", "VWAP"])
+        hist.attrs["vwap_warning"] = warning
         return hist
     except Exception:
         return pd.DataFrame()
@@ -366,6 +407,7 @@ def get_intraday_vwap_state(ticker: str) -> dict[str, Any]:
             "current_price": round(cur_px, 4),
             "prev_close": round(prev_px, 4),
             "prev_vwap": round(prev_vwap, 4),
+            "VWAP_warning": hist.attrs.get("vwap_warning"),
         }
     except Exception:
         return _empty_vwap(ticker)

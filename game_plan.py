@@ -10,6 +10,8 @@ nothing here feeds scoring.
                       scans. The trend rule alone was right about the next hour 47% of
                       the time in the 54-day replay of 2026-10-09, so it no longer names
                       a side by itself: a plan is shown only when the two agree
+    VWAP side      <- calls need price above VWAP, puts below it (the owner's second
+                      question). On the wrong side of VWAP there is no plan
     entry window   <- 10:00 to 15:00 ET. Outside it there is no plan (the owner's trades
                       entered before 10:00 or after 15:00 lost the most by far)
     candidates     <- the top-ranked Best Value pick on the allowed side, one for each
@@ -57,6 +59,7 @@ FLOW_NEED = 4                           # ...and needs this many on one side
 
 MIXED = "MIXED"
 HOLD_WINDOW, HOLD_CONFLICT, HOLD_UNCONFIRMED = "WINDOW", "CONFLICT", "UNCONFIRMED"
+HOLD_VWAP = "VWAP"
 FLOW_LABEL = {CALLS: "Calls", PUTS: "Puts", MIXED: "Mixed", UNKNOWN: "Unknown"}
 
 
@@ -128,6 +131,7 @@ class Plan:
     flow_note: str = ""
     hold: str = ""                       # "" or a HOLD_* code: why no plan is shown
     hold_note: str = ""
+    vwap_note: str = ""                  # a doubt about the VWAP number itself, if any
 
     def candidate_for(self, pool: str) -> Candidate | None:
         return next((c for c in self.candidates if c.pool == pool), None)
@@ -196,6 +200,24 @@ def resolve_side(trend_side: str, flow: dict | None,
     return (STAND_ASIDE, HOLD_CONFLICT,
             f"Conflict: the trend rule says {t}, the scanner's top pick says "
             f"{'calls' if fside == CALLS else 'puts'}. No plan until they agree.")
+
+
+def vwap_hold(side: str, spot: Any, vwap: Any) -> tuple[str, str, str]:
+    """(side, hold code, hold note). Calls need price above VWAP, puts below it. On the
+    wrong side there is no plan: the trade would start against the day's average price.
+    A missing price or VWAP leaves the side as it is."""
+    px, v = _f(spot), _f(vwap)
+    if side not in (CALLS, PUTS) or px is None or v is None:
+        return side, "", ""
+    if side == CALLS and px < v:
+        return (STAND_ASIDE, HOLD_VWAP,
+                f"Wrong side of VWAP: calls are allowed, but price {_usd(round(px, 2))} is "
+                f"below VWAP at {_usd(round(v, 2))}. Wait for a 15-minute close above VWAP.")
+    if side == PUTS and px > v:
+        return (STAND_ASIDE, HOLD_VWAP,
+                f"Wrong side of VWAP: puts are allowed, but price {_usd(round(px, 2))} is "
+                f"above VWAP at {_usd(round(v, 2))}. Wait for a 15-minute close below VWAP.")
+    return side, "", ""
 
 
 def regime_from_gamma(gamma: dict | None) -> tuple[str, str, float | None]:
@@ -303,11 +325,15 @@ def _expect(side: str, regime: str, gamma: dict | None,
 
 
 def _changes(side: str, regime: str, gamma: dict | None, stale: bool,
-             hold: str = "") -> tuple[str, ...]:
+             hold: str = "", trend_side: str = UNKNOWN) -> tuple[str, ...]:
     out: list[str] = []
     if hold == HOLD_WINDOW:
         out.append(f"The clock reaches {ENTRY_OPEN:%H:%M} ET on a trading day: the entry "
                    "window opens.")
+    elif hold == HOLD_VWAP:
+        out.append("A 15-minute candle closes "
+                   + ("above" if trend_side == CALLS else "below")
+                   + " VWAP: a plan appears.")
     elif hold:
         out.append("The trend rule and the scanner's top pick settle on the same side: "
                    "a plan appears.")
@@ -471,6 +497,16 @@ def build_trade_plan(side: str, *, spot: Any, gamma: dict | None = None, vwap: A
     # stop. Calls must enter at or below it, puts at or above it.
     k = float(min_reward_to_risk)
     limit = (targets[0].price + k * stop) / (1.0 + k)
+    if (limit <= level) if calls else (limit >= level):
+        # Even an entry right at the support (resistance for puts) cannot reach the
+        # needed reward: target 1 is too close to the level. There is no entry zone.
+        return TradePlan(ready=False, better_entry=anchor, stop=stop, stop_note=stop_note,
+                         targets=targets, risk=risk, reward_to_risk=rr, entry_limit=None,
+                         in_zone=False, poor=True,
+                         notes=(f"No entry zone: target 1 ({targets[0].name} at "
+                                f"{_usd(targets[0].price)}) is too close to {name} at "
+                                f"{_usd(level)} for a reward of {k:g} times the risk, even "
+                                f"entering right at {name}. Skip this setup.",), **base)
     in_zone = px <= limit if calls else px >= limit
     notes = []
     if not in_zone:
@@ -504,9 +540,12 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
                stop_buffer_pct: float = STOP_BUFFER_PCT,
                min_reward_to_risk: float = MIN_REWARD_TO_RISK,
                price_note: str = "", emas: dict | None = None,
-               flow: dict | None = None, now: datetime | None = None) -> Plan:
+               flow: dict | None = None, now: datetime | None = None,
+               vwap_warning: str | None = None) -> Plan:
     trend_side, side_reason = side_from_trend(trend)
     side, hold, hold_note = resolve_side(trend_side, flow, now)
+    if not hold:
+        side, hold, hold_note = vwap_hold(side, spot, vwap)
     regime, regime_note, net = regime_from_gamma(gamma)
     candidates = []
     for pool in POOLS:
@@ -533,7 +572,7 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
         levels=build_levels(_f(spot), gamma, vwap, expected, emas),
         candidates=tuple(candidates),
         expect=_expect(side, regime, gamma, hold_note),
-        changes=_changes(side, regime, gamma, stale, hold),
+        changes=_changes(side, regime, gamma, stale, hold, trend_side),
         missing=missing,
         trade=build_trade_plan(side, spot=spot, gamma=gamma, vwap=vwap, expected=expected,
                                session_high=session_high, session_low=session_low,
@@ -542,6 +581,7 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
         price_note=price_note,
         trend_side=trend_side, flow_side=(flow or {}).get("side") or UNKNOWN,
         flow_note=(flow or {}).get("note") or "", hold=hold, hold_note=hold_note,
+        vwap_note=str(vwap_warning or ""),
     )
 
 
@@ -569,6 +609,8 @@ def plan_lines(plan: Plan, compact: bool = False) -> list[str]:
     if plan.flow_note or plan.hold:
         lines.append(f"Trend rule: {SIDE_LABEL[plan.trend_side]} · "
                      f"Scanner: {FLOW_LABEL.get(plan.flow_side, 'Unknown')}")
+    if plan.vwap_note:
+        lines.append(f"⚠️ {plan.vwap_note}")
     if plan.hold:
         return lines + [f"⛔ {plan.hold_note}"]
     lines += [f"{c.pool}: {candidate_text(c.pick)}" for c in plan.candidates]

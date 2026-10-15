@@ -135,6 +135,8 @@ def render(plan: gp.Plan) -> None:
     for col, cand in zip(cols[2:], plan.candidates):
         col.metric(f"{cand.pool} candidate", gp.candidate_text(cand.pick).split(" · ")[0],
                    help=cand.note)
+    if plan.vwap_note:
+        st.warning(_md(plan.vwap_note), icon="⚠️")
     if plan.hold:
         st.warning(_md(plan.hold_note), icon="⛔")
     if plan.flow_note or plan.hold:

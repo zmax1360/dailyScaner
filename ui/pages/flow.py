@@ -2168,6 +2168,7 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
             price_note=price_note,
             emas=((curr.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
             flow=scanner_flow(curr, ticker), now=_plan_now(),
+            vwap_warning=vwap_info.get("VWAP_warning"),
         ))
 
     if "header" in sections:

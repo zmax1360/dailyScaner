@@ -49,7 +49,9 @@ PICKS = pd.DataFrame([
 
 
 def _plan(trend=BULL, gamma=GAMMA, **kw):
-    kw.setdefault("vwap", 332.91)
+    # VWAP sits on the allowed side of price (below it for calls, above it for puts), so
+    # the VWAP hold does not get in the way of tests about something else.
+    kw.setdefault("vwap", 334.47 if trend is BEAR else 332.91)
     kw.setdefault("expected", EXPECTED)
     kw.setdefault("picks", PICKS)
     kw.setdefault("session_high", 334.54)
@@ -439,12 +441,22 @@ def test_view_draws_the_trade_plan_with_a_warning_when_poor():
     assert any("With one contract, exit all of it at target 1." in c.value for c in at.caption)
 
 
-def test_view_shows_cautions_and_the_too_far_message():
-    """Price below VWAP with the only support far away: a caution and no plan table."""
-    at = _run(extra=", vwap=335.22, gamma={**GAMMA, 'support': 320.0}")
-    assert any("Price is below VWAP at" in c.value for c in at.caption)
+def test_view_shows_the_too_far_message():
+    """The only support is far below: no plan table."""
+    at = _run(extra=", vwap=329.0, gamma={**GAMMA, 'support': 320.0}, "
+                    "emas={'ema21': 328.5, 'ema50': 328.0}")
     assert any("too far to be a stop" in i.value for i in at.info)
     assert not any("Target 1" in m.value for m in at.markdown)
+
+
+def test_view_shows_the_vwap_hold_and_the_vwap_doubt():
+    """Calls allowed, price below VWAP: the hold, and no trade plan. A doubt about the
+    VWAP number is shown on its own."""
+    at = _run(extra=", vwap=335.22, vwap_warning='The opening bar has almost no volume.'")
+    warnings = [w.value for w in at.warning]
+    assert any("Wrong side of VWAP" in w for w in warnings)
+    assert any("opening bar has almost no volume" in w for w in warnings)
+    assert "Trade plan" not in " ".join(m.value for m in at.markdown)
 
 
 def test_view_has_no_trade_plan_on_a_stand_aside_day():
@@ -732,3 +744,64 @@ def test_hold_reaches_the_telegram_lines():
 def test_view_shows_both_sides_and_the_hold():
     src = (ROOT / "ui" / "game_plan_view.py").read_text()
     assert "plan.hold_note" in src and "plan.flow_note" in src and "Scanner side" in src
+
+
+# ── VWAP side ───────────────────────────────────────────────────────────────
+
+def test_calls_below_vwap_hold_with_the_reason():
+    plan = _plan(vwap=334.37)                                  # price 333.69 below it
+    assert plan.side == gp.STAND_ASIDE and plan.hold == gp.HOLD_VWAP
+    assert plan.trend_side == gp.CALLS
+    assert plan.hold_note == ("Wrong side of VWAP: calls are allowed, but price $333.69 is "
+                              "below VWAP at $334.37. Wait for a 15-minute close above VWAP.")
+    assert plan.trade is None
+    assert all(c.pick is None or c.note.startswith("No candidate") for c in plan.candidates)
+    assert plan.changes[0] == "A 15-minute candle closes above VWAP: a plan appears."
+
+
+def test_puts_above_vwap_hold():
+    plan = _plan(trend=BEAR, vwap=332.91)                      # price 333.69 above it
+    assert plan.side == gp.STAND_ASIDE and plan.hold == gp.HOLD_VWAP
+    assert "puts are allowed, but price $333.69 is above VWAP at $332.91" in plan.hold_note
+    assert plan.changes[0] == "A 15-minute candle closes below VWAP: a plan appears."
+
+
+def test_right_side_of_vwap_or_no_vwap_keeps_the_side():
+    assert _plan(vwap=332.91).side == gp.CALLS
+    assert _plan(trend=BEAR, vwap=334.47).side == gp.PUTS
+    assert _plan(vwap=None).side == gp.CALLS                   # missing: never guessed
+
+
+def test_window_and_conflict_holds_come_before_the_vwap_hold():
+    from datetime import datetime as dt
+    late = dt(2026, 10, 15, 15, 30, tzinfo=ZoneInfo("America/New_York"))
+    plan = _plan(vwap=334.37, now=late)
+    assert plan.hold == gp.HOLD_WINDOW
+
+
+def test_vwap_doubt_is_carried_and_sent_to_telegram():
+    plan = _plan(vwap_warning="VWAP may be off.")
+    assert plan.vwap_note == "VWAP may be off."
+    assert "⚠️ VWAP may be off." in gp.plan_lines(plan)
+    assert _plan().vwap_note == ""
+
+
+# ── entry zone ──────────────────────────────────────────────────────────────
+
+def test_no_entry_zone_when_target_one_is_too_close_to_the_support():
+    """The Oct 15 plan: stop anchor 344.37, target 1 at 345.00, price 344.42. The entry
+    limit came out below the support itself. That is no zone, not a 2-cent one."""
+    trade = gp.build_trade_plan(gp.CALLS, spot=344.42, vwap=344.37,
+                                gamma={"resistance": 345.0, "support": 340.0},
+                                session_high=347.85, expected={"Upper_1SD": 352.27})
+    assert not trade.ready and trade.entry_limit is None and trade.poor
+    assert trade.notes[0].startswith("No entry zone: target 1 (Call resistance at $345)")
+    assert "Skip this setup." in trade.notes[0]
+    assert gp.trade_lines(trade) == ["Calls plan: " + trade.notes[0]]
+
+
+def test_entry_zone_still_shown_when_it_exists():
+    trade = gp.build_trade_plan(gp.CALLS, spot=333.69, vwap=332.91, gamma=GAMMA,
+                                session_high=334.54, expected=EXPECTED)
+    assert trade.ready and trade.entry_limit is not None
+    assert trade.entry_limit > trade.better_entry.price
