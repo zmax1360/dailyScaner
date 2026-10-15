@@ -34,6 +34,7 @@ from typing import Any, Sequence
 import pandas as pd
 
 import ema_stack
+import htf_trend
 from scoring_pool import POOL_0DTE, POOL_1DTE
 from time_stop import TIME_STOP_CAP, window_minutes_for_dte
 
@@ -132,6 +133,7 @@ class Plan:
     hold: str = ""                       # "" or a HOLD_* code: why no plan is shown
     hold_note: str = ""
     vwap_note: str = ""                  # a doubt about the VWAP number itself, if any
+    htf_note: str = ""                   # the 1-hour and 4-hour trend, for context only
 
     def candidate_for(self, pool: str) -> Candidate | None:
         return next((c for c in self.candidates if c.pool == pool), None)
@@ -541,7 +543,8 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
                min_reward_to_risk: float = MIN_REWARD_TO_RISK,
                price_note: str = "", emas: dict | None = None,
                flow: dict | None = None, now: datetime | None = None,
-               vwap_warning: str | None = None) -> Plan:
+               vwap_warning: str | None = None,
+               htf: dict[str, str] | None = None) -> Plan:
     trend_side, side_reason = side_from_trend(trend)
     side, hold, hold_note = resolve_side(trend_side, flow, now)
     if not hold:
@@ -582,6 +585,7 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
         trend_side=trend_side, flow_side=(flow or {}).get("side") or UNKNOWN,
         flow_note=(flow or {}).get("note") or "", hold=hold, hold_note=hold_note,
         vwap_note=str(vwap_warning or ""),
+        htf_note=htf_trend.plan_line(side, htf) if htf is not None else "",
     )
 
 
@@ -614,6 +618,8 @@ def plan_lines(plan: Plan, compact: bool = False) -> list[str]:
     if plan.hold:
         return lines + [f"⛔ {plan.hold_note}"]
     lines += [f"{c.pool}: {candidate_text(c.pick)}" for c in plan.candidates]
+    if plan.htf_note:
+        lines.append(plan.htf_note)
     lines += trade_lines(plan.trade)
     if compact:
         return lines

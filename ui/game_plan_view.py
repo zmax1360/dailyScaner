@@ -151,6 +151,8 @@ def render(plan: gp.Plan) -> None:
 
     st.markdown("**What to expect**")
     st.markdown("\n".join(f"- {_md(t)}" for t in plan.expect))
+    if plan.htf_note:
+        st.caption(_md(plan.htf_note + " Context only: it does not change the plan."))
 
     render_trade(plan.trade)
 

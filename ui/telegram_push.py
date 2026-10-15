@@ -10,6 +10,7 @@ from ui.market import _build_best_value_df
 from ui.services import _SCANNER_DIR
 import pandas as pd
 import ema_stack
+import htf_trend
 import game_plan
 import plan_report
 from ui.common import ET
@@ -378,4 +379,5 @@ def plan_for_message(payload: dict, prev_payload: dict | None, ticker: str,
         stop_buffer_pct=stop_buffer_pct,
         min_reward_to_risk=min_reward_to_risk,
         emas=((payload.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
+        htf=htf_trend.from_archive(payload),
     )

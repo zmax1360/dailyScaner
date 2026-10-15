@@ -7,6 +7,7 @@ Ali's trading system | June 2026
 import pandas as pd
 
 import ema_stack
+import htf_trend
 import numpy as np
 from datetime import datetime, time as dtime
 import sys
@@ -541,6 +542,8 @@ def analyze_tf(frames):
         }
         if tf == ema_stack.TIMEFRAME:  # display-only trend rule; not used in scoring
             out[tf].update(ema_stack.compute_emas(c))
+        if tf in htf_trend.TIMEFRAMES:  # display-only context; not used in scoring
+            out[tf].update(htf_trend.describe(df))
     return out
 
 def rsi_lbl(v):

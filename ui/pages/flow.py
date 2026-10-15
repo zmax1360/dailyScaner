@@ -43,6 +43,7 @@ from ui.market import _rsi_plain
 from ui.market import live_session_snapshot
 from volume_analysis import fetch_intraday_vwap_df
 import ema_stack
+import htf_trend
 import game_plan
 from plan_report import scanner_flow
 from ui import game_plan_view, shell
@@ -2169,6 +2170,7 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
             emas=((curr.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
             flow=scanner_flow(curr, ticker), now=_plan_now(),
             vwap_warning=vwap_info.get("VWAP_warning"),
+            htf=htf_trend.from_archive(curr),
         ))
 
     if "header" in sections:

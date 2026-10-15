@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 import ema_stack
+import htf_trend
 import game_plan
 import gex
 import volume_history as vh
@@ -172,6 +173,7 @@ def plan_from_archive(payload: dict, ticker: str, *, gamma: dict | None = None,
         stop_buffer_pct=s["stop_buffer_pct"], min_reward_to_risk=s["min_reward_to_risk"],
         emas=((payload.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
         price_note="Price is the one recorded by the scan.",
+        htf=htf_trend.from_archive(payload),
     )
 
 
