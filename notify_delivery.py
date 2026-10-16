@@ -162,9 +162,26 @@ def provenance_line(best_value: Mapping[str, Any] | None, payload: Mapping[str, 
     )
 
 
+def _mults(m: Any) -> dict[str, float]:
+    """The row's multipliers as a plain {name: factor} dict ({} when none)."""
+    if not isinstance(m, dict):
+        return {}
+    out = {}
+    for k, v in m.items():
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f == f:
+            out[str(k)] = round(f, 4)
+    return out
+
+
 def serialize_best_value_rows(df, *, top_n: int = 30) -> dict[str, Any]:
     """
-    Snapshot scored rows for the archive. Call only on a successful scan path.
+    Snapshot scored rows for the archive: the top ``top_n`` of each DTE pool, with the
+    fields every reader needs and the multipliers behind each score. Call only on a
+    successful scan path.
     """
     import math
 
@@ -217,8 +234,14 @@ def serialize_best_value_rows(df, *, top_n: int = 30) -> dict[str, Any]:
                 else:
                     pools_skipped[pname] = "unscored"
 
+    # top_n per DTE pool: "0DTE" sorts before "1DTE+", so a single head(top_n) could
+    # fill up with 0DTE rows and save no 1DTE+ row at all (SPY, any day).
+    if "pool" in scored.columns:
+        kept = scored.groupby("pool", sort=True, dropna=False, group_keys=False).head(int(top_n))
+    else:
+        kept = scored.head(int(top_n))
     rows: list[dict[str, Any]] = []
-    for _, r in scored.head(int(top_n)).iterrows():
+    for _, r in kept.iterrows():
         def _num(x):
             try:
                 f = float(x)
@@ -246,6 +269,17 @@ def serialize_best_value_rows(df, *, top_n: int = 30) -> dict[str, Any]:
             ),
             "_nflow": _num(r.get("_nflow")),
             "_nlev": _num(r.get("_nlev")),
+            # For readers that show the full row (Best Value page, pre-trade check)
+            "delta": _num(r.get("delta")),
+            "iv": _num(r.get("iv")),
+            "bid": _num(r.get("bid")),
+            "ask": _num(r.get("ask")),
+            "extrinsic": _num(r.get("extrinsic")),
+            "Strategy_Tag": str(r.get("Strategy_Tag") or ""),
+            "Optimal_Strategy": str(r.get("Optimal_Strategy") or ""),
+            "_base_score": _num(r.get("_base_score")),
+            # Why it scored what it did: {multiplier name: factor}, e.g. news_with 1.2
+            "multipliers": _mults(r.get("_multipliers")),
         })
 
     return {

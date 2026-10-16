@@ -6,6 +6,12 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-16
 
+- **Best Value snapshot: top 30 per DTE pool, with full rows**
+  (`notify_delivery.serialize_best_value_rows`). Before, one top-30 sorted pool-first
+  ("0DTE" < "1DTE+") could save no 1DTE+ row when 30+ 0DTE contracts scored (SPY in
+  session). Rows now also carry delta, IV, bid/ask, extrinsic, strategy tag and
+  `multipliers` (why each score is what it is), so readers need not re-score.
+  (F-S4-01b, piece 2a of 3)
 - **Best Value scored once per scan** (`dailyScaner._score_best_value`): one scoring
   with daily bias, market state and news; the archive snapshot and the attribution rows
   are both written from it (before: two scorings, the archive one without news).
