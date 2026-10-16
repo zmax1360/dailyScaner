@@ -6,7 +6,6 @@ from datetime import datetime
 import glob
 import json
 
-from best_value import build_best_value_df
 from best_value_archive import add_times_flagged
 from best_value_archive import ensure_archive_loaded
 from best_value_archive import filter_today
@@ -36,7 +35,6 @@ from strategy_engine import resolve_spot_below_support
 from strategy_engine import ticker_expected_range
 from time_stop import format_exit_by_cell
 from ui.components.cost_distribution import cached_cost_distribution as _cached_cost_distribution
-from ui.market import _build_best_value_df
 from ui.market import _cached_vwap_state
 from ui.market import _market_is_closed
 from ui.market import _rsi_plain
@@ -45,7 +43,8 @@ from volume_analysis import fetch_intraday_vwap_df
 import ema_stack
 import htf_trend
 import game_plan
-from plan_report import scanner_flow
+from plan_report import picks_from_archive, scanner_flow
+import bv_saved
 from ui import game_plan_view, shell
 from ui.gamma_data import gamma_summary_for
 from ui.components import price_chart
@@ -602,44 +601,32 @@ def _build_live_scanner_df_for_portfolio(
     stashed = st.session_state.get(stash_key)
     if isinstance(stashed, pd.DataFrame) and not stashed.empty:
         return stashed.copy()
+    # No Best Value table this refresh: prices from the scan's quotes, velocity from
+    # the last stash. Nothing is scored here.
+    return quotes_for_portfolio(ticker, vol_curr,
+                                st.session_state.get(f"bv_velocity_snapshot_{ticker}") or {})
 
-    df = build_best_value_df(
-        vol_curr, spot, vol_prev,
-        min_volume=500,
-        daily_bias=daily_bias,
-        market_state=market_state,
-        news_bias=news_bias,
-    )
-    if df.empty:
-        return pd.DataFrame()
 
-    df = df[df["Value_Score"].notna()].copy()
-    state_key = f"bv_prev_scores_{ticker}"
-    # Use pre-refresh scores if Best Value already overwrote cache this run
-    vel_key = f"bv_velocity_snapshot_{ticker}"
-    vel_map: dict = st.session_state.get(vel_key) or {}
-    prev_scores: dict = st.session_state.get(state_key, {})
-
-    def _ck(row) -> tuple:
-        return (str(row["side"]), float(row["strike"]), str(row["expiry"]))
-
-    def _vel(row) -> float:
-        k = _ck(row)
-        if k in vel_map:
-            return float(vel_map[k])
-        if pd.isna(row["Value_Score"]):
-            return float("nan")
-        prev = prev_scores.get(k)
-        if prev is None:
-            return 0.0
-        return round(float(row["Value_Score"]) - float(prev), 4)
-
-    df["Score_Velocity"] = df.apply(_vel, axis=1)
-    df["Ticker"] = ticker.upper()
-    df["Current_Price"] = df["last"]
-    return df[
-        ["Ticker", "side", "strike", "expiry", "Current_Price", "Score_Velocity"]
-    ].rename(columns={"side": "Side", "strike": "Strike", "expiry": "Expiry"})
+def quotes_for_portfolio(ticker: str, vol_curr: dict | None,
+                         velocity: dict | None = None) -> pd.DataFrame:
+    """Ticker/Side/Strike/Expiry/Current_Price/Score_Velocity for every contract in the
+    scan's volume block. Current_Price is the last trade; no last trade → NaN."""
+    rows = []
+    for side, key in (("CALL", "top_calls"), ("PUT", "top_puts")):
+        for c in (vol_curr or {}).get(key) or []:
+            try:
+                strike = float(c.get("strike"))
+            except (TypeError, ValueError):
+                continue
+            expiry = str(c.get("expiry") or "")
+            last = pd.to_numeric(c.get("lastPrice"), errors="coerce")
+            rows.append({
+                "Ticker": ticker.upper(), "Side": side, "Strike": strike, "Expiry": expiry,
+                "Current_Price": float(last) if pd.notna(last) and last > 0 else float("nan"),
+                "Score_Velocity": float((velocity or {}).get((side, strike, expiry), 0.0)),
+            })
+    return pd.DataFrame(rows, columns=["Ticker", "Side", "Strike", "Expiry",
+                                       "Current_Price", "Score_Velocity"])
 
 
 def _render_portfolio_manager(
@@ -1063,14 +1050,16 @@ def _render_best_value_panel(
     odte_info: dict | None = None,
     pov_info: dict | None = None,
     top_n: int = 5,
+    saved_payload: dict | None = None,
 ) -> None:
     """
-    Best Value Option Scanner — composite rank of all archive contracts.
+    Best Value Option Scanner — the ranking the scan saved (never re-scored here).
 
     Each refresh:
-      1. Scores contracts via calculate_best_value (40% leverage / 60% flow).
-      2. Applies daily + macro (SPY/QQQ/VIX) counter-trend penalties.
-      3. Applies news_bias ±20% CALL/PUT adjustment when BULLISH/BEARISH.
+      1. Reads the scan's saved rows (``bv_saved.saved_rows_df``): scored once per scan
+         with daily bias, market state and news (``dailyScaner._score_best_value``).
+      2. Shows which of those inputs moved the scores (``best_value.inputs``).
+      3. Min Volume only hides rows; it does not change any score.
       4. Computes Score_Velocity = current_score - previous_score (session cache).
       5. Assigns Action_Signal based on velocity thresholds (±0.15).
       6. Extension check: if spot is ≥3.5% off session low, CALL surges become
@@ -1080,7 +1069,6 @@ def _render_best_value_panel(
     No live fetches in this panel — bias/state are computed upstream and passed in.
     """
     daily_bias   = (daily_bias_info or {}).get("daily_bias")
-    market_state = (market_state_info or {}).get("market_state")
     vwap_state   = (vwap_info or {}).get("VWAP_State")
     vwap_px      = (vwap_info or {}).get("VWAP")
     profited_pct = (cost_info or {}).get("Profited_Shares_Pct")
@@ -1098,24 +1086,14 @@ def _render_best_value_panel(
         min_vol_input = st.number_input(
             "Min Volume", min_value=0, value=500, step=100,
             key="bv_min_vol",
-            help="Contracts below this volume threshold are excluded from scoring.",
+            help="Hides saved rows below this volume. Display only: scores come "
+                 "from the scan and do not change.",
         )
     with c1:
-        notes = []
-        if daily_bias in ("HEAVY BEARISH", "HEAVY BULLISH"):
-            notes.append(f"Daily **{daily_bias}** → counter-trend −50%")
-        if market_state in ("BEARISH DRAG", "BULLISH TAILWIND"):
-            notes.append(f"Macro **{market_state}** → counter-trend −70%")
-        if news_bias == "BEARISH":
-            notes.append("News **BEARISH** → CALL ×0.8 · PUT ×1.2")
-        elif news_bias == "BULLISH":
-            notes.append("News **BULLISH** → CALL ×1.2 · PUT ×0.8")
-        if vwap_state == "RECLAIMED UP" and daily_bias == "HEAVY BULLISH":
-            notes.append("VWAP **RECLAIMED UP** → CALL ×1.5 sniper")
-        elif vwap_state == "RECLAIMED DOWN" and daily_bias == "HEAVY BEARISH":
-            notes.append("VWAP **RECLAIMED DOWN** → PUT ×1.5 sniper")
-        elif vwap_state and vwap_state != "UNKNOWN" and vwap_px is not None:
-            notes.append(f"VWAP **{vwap_state}** @ \\${float(vwap_px):.2f}")
+        # What moved the saved scores: the scan's own inputs, not today's live ones.
+        notes = bv_saved.input_notes(bv_saved.saved_inputs(saved_payload))
+        if vwap_state and vwap_state != "UNKNOWN" and vwap_px is not None:
+            notes.append(f"VWAP **{vwap_state}** @ \\${float(vwap_px):.2f} (not in the score)")
         if blue_sky:
             notes.append(
                 f"**{BLUE_SKY_TAG}** "
@@ -1152,28 +1130,19 @@ def _render_best_value_panel(
         st.error(
             f"**{URGENCY_TAG}** — Magenta over-participation "
             f"({ratio:.2f}× vs 15-bar avg) with price above VWAP. "
-            f"Best Value **CALLS** boosted ×1.25."
+            f"Shown for context; not part of the score."
         )
 
-    # ── Score contracts ───────────────────────────────────────────────────────
-    df = _build_best_value_df(
-        vol_curr, spot, vol_prev,
-        min_volume=int(min_vol_input),
-        daily_bias=daily_bias,
-        market_state=market_state,
-        news_bias=news_bias,
-        vwap_state=vwap_state,
-        profited_shares_pct=profited_pct,
-        upper_1sd=upper_1sd,
-        lower_1sd=lower_1sd,
-        optimal_strategy=optimal_strategy,
-        has_catalyst=has_catalyst,
-        spot_below_support=spot_below_support,
-        odte_info=odte_info,
-        pov_info=pov_info,
-    )
+    # ── The scan's saved ranking (scored once per scan; never re-scored here) ──
+    df = bv_saved.saved_rows_df(saved_payload)
     if df.empty:
-        st.info(f"No contracts pass the min-volume filter ({min_vol_input:,}). Lower the threshold.")
+        st.info("This scan saved no Best Value ranking (no contracts passed the scan's "
+                "filters, or the scan predates saved rankings).")
+        return
+    if "volume" in df.columns:
+        df = df[df["volume"].fillna(0) >= int(min_vol_input)].copy()
+    if df.empty:
+        st.info(f"No saved contracts with volume ≥ {min_vol_input:,}. Lower the threshold.")
         return
 
     # Hide expired / after-hours 0DTE / below-threshold rows (no Value_Score)
@@ -1414,12 +1383,12 @@ def _render_best_value_panel(
     )
 
     # Format numeric columns for display
-    disp["Strike"]      = disp["Strike"].apply(lambda x: f"${x:.1f}")
-    disp["DTE"]         = disp["DTE"].apply(lambda x: f"{x}d")
-    disp["Price"]       = disp["Price"].apply(lambda x: f"${x:.2f}")
-    disp["Volume"]      = disp["Volume"].apply(lambda x: f"{int(x):,}")
-    disp["OI"]          = disp["OI"].apply(lambda x: f"{int(x):,}")
-    disp["IV"]          = disp["IV"].apply(lambda x: f"{x:.1%}" if x > 0 else "—")
+    disp["Strike"]      = disp["Strike"].apply(lambda x: f"${x:.1f}" if pd.notna(x) else "—")
+    disp["DTE"]         = disp["DTE"].apply(lambda x: f"{int(x)}d" if pd.notna(x) else "—")
+    disp["Price"]       = disp["Price"].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "—")
+    disp["Volume"]      = disp["Volume"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "—")
+    disp["OI"]          = disp["OI"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "—")
+    disp["IV"]          = disp["IV"].apply(lambda x: f"{x:.1%}" if pd.notna(x) and x > 0 else "—")
     disp["Delta"] = greeks_disp["Delta"].to_numpy() if not greeks_disp.empty else "—"
     disp["Theta/Prem"] = (
         greeks_disp["Theta/Prem"].to_numpy() if not greeks_disp.empty else "—"
@@ -2132,22 +2101,8 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
         st.caption(f"Last run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
 
     if "game_plan" in sections:
-        # Same ranking inputs as the Best Value page, so the candidate matches it.
-        picks = _build_best_value_df(
-            vol, spot, prev_vol,
-            daily_bias=(daily_bias_info or {}).get("daily_bias"),
-            market_state=(market_state_info or {}).get("market_state"),
-            news_bias=news_bias,
-            vwap_state=vwap_state,
-            profited_shares_pct=(cost_info or {}).get("Profited_Shares_Pct"),
-            upper_1sd=em_range.get("Upper_1SD"),
-            lower_1sd=em_range.get("Lower_1SD"),
-            optimal_strategy=optimal_strat,
-            has_catalyst=has_catalyst,
-            spot_below_support=spot_below_sup,
-            odte_info=odte_info,
-            pov_info=pov_info,
-        )
+        # The scan's saved ranking: the same rows Telegram and the Best Value page show.
+        picks = picks_from_archive(curr)
         # The plan's price, session high and session low come from the latest 5-minute
         # bars, not from the scan: a scan can be many minutes (or a weekend) old, and a
         # stale price next to a live VWAP puts the stop and targets in the wrong place.
@@ -2377,6 +2332,7 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
             odte_info=odte_info,
             pov_info=pov_info,
             top_n=top_n,
+            saved_payload=curr,
         )
 
         # 0DTE reflexivity — top strikes MM exposure

@@ -6,6 +6,16 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-16
 
+- **The app no longer scores Best Value; it shows the scan's saved ranking**
+  (`bv_saved.py`). Best Value page, Game Plan candidates, Settings "Send to Telegram"
+  and the portfolio view read `best_value.rows`; the page's notes show the inputs the
+  scan used (`best_value.inputs`). Removed from the score: the app-only boosts (VWAP
+  sniper ×1.5, participation ×1.25, cost-profile / 1SD / 0DTE-flow inputs); VWAP and
+  participation still show as context. Min Volume on the page only hides rows. Portfolio
+  marks come from the scan's quotes. `ui.market._build_best_value_df` removed;
+  `tests/test_ui_reads_saved.py` fails if anything under `ui/` scores. Scans saved
+  before 2026-10-16 show "no saved ranking" / "inputs not recorded".
+  (F-S4-01 and F-S4-01b resolved, piece 2b of 3)
 - **Best Value snapshot: top 30 per DTE pool, with full rows**
   (`notify_delivery.serialize_best_value_rows`). Before, one top-30 sorted pool-first
   ("0DTE" < "1DTE+") could save no 1DTE+ row when 30+ 0DTE contracts scored (SPY in

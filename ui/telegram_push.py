@@ -6,12 +6,12 @@ from datetime import date, datetime
 import os
 import urllib.request
 
-from ui.market import _build_best_value_df
 from ui.services import _SCANNER_DIR
 import pandas as pd
 import ema_stack
 import htf_trend
 import game_plan
+import bv_saved
 import plan_report
 from ui.common import ET
 from ui.gamma_data import gamma_summary_for  # noqa: F401  (re-exported for the Settings page)
@@ -291,8 +291,8 @@ def _format_scan_message(
 
     # ── Best Value Option ─────────────────────────────────────────────────────
     if include.get("best_value"):
-        prev_vol_bv = (prev_payload.get("volume") or {}) if prev_payload else None
-        bv_df = _build_best_value_df(vol, spot, prev_vol_bv, min_volume=500)
+        # The scan's saved ranking; never re-scored here.
+        bv_df = bv_saved.saved_rows_df(payload)
         if not bv_df.empty and bv_df["Status"].astype(str).str.contains("BEST VALUE", na=False).any():
             from scoring_pool import POOL_0DTE, POOL_1DTE
             L.append("⭐ <b>BEST VALUE</b> <i>(per DTE pool)</i>")
@@ -318,6 +318,9 @@ def _format_scan_message(
                     f"score {best['Value_Score']:.2f}  "
                     f"${best['last']:.2f}  vol/OI {voi_b:.1f}x"
                 )
+            L.append("")
+        else:
+            L.append("⭐ <b>BEST VALUE</b> — no saved ranking in this scan")
             L.append("")
 
     # ── Gamma exposure ────────────────────────────────────────────────────────
@@ -368,12 +371,11 @@ def plan_for_message(payload: dict, prev_payload: dict | None, ticker: str,
 
     spot = float(payload.get("spot") or 0)
     vol = payload.get("volume") or {}
-    prev_vol = (prev_payload.get("volume") or {}) if prev_payload else None
     return game_plan.build_plan(
         ticker=ticker, spot=spot,
         trend=ema_stack.banner_for_archive(payload, now=datetime.now(ET)),
         gamma=gamma, vwap=None, expected=ticker_expected_range(spot, vol),
-        picks=_build_best_value_df(vol, spot, prev_vol, min_volume=500),
+        picks=plan_report.picks_from_archive(payload),
         session_high=(payload.get("session") or {}).get("day_high"),
         session_low=(payload.get("session") or {}).get("day_low"),
         stop_buffer_pct=stop_buffer_pct,

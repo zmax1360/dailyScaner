@@ -34,20 +34,17 @@ them. Changes since then: `docs/changelog.md`.
 
 ### Where Best Value is scored (open problem, see F-S4-01 in findings)
 
-`best_value.build_best_value_df` is called from five places with different inputs
-(the scan's two were merged into one on 2026-10-16):
+Since 2026-10-16 Best Value is scored in **one** place: `dailyScaner._score_best_value`,
+once per scan, with daily bias, market state and news. From that one result the scan
+writes the archive snapshot (`best_value.rows`, top 30 per DTE pool, each row with its
+`multipliers`; `best_value.inputs`) and the attribution rows (`_log_scan_attribution`).
 
-| caller | feeds | inputs beyond the chain |
-|---|---|---|
-| `dailyScaner._score_best_value` (once per scan, since 2026-10-16) | archive snapshot → scheduled Telegram, Game Plan scanner side, reports; and the attribution DB (`_log_scan_attribution` logs the same result) | daily, macro, news |
-| `ui/pages/flow.py` `_render_best_value_panel` | Best Value page | daily, macro, news, VWAP state, cost profile, 1SD, 0DTE flow, POV, strategy |
-| `ui/pages/flow.py` `render` (game_plan section) | Game Plan candidates in the app | same as the Best Value page |
-| `ui/pages/flow.py` `_build_live_scanner_df_for_portfolio` | portfolio view | its own subset |
-| `ui/telegram_push.py` `_format_scan_message`, `plan_for_message` | Settings "Send to Telegram" | none of the biases |
-
-`AGENTS.md` says the UI never recomputes scores; the four UI calls break that. Agreed
-direction (not built): score once in the scan with the full input set, save rows with
-their multipliers, and have every reader use the saved rows.
+Readers only read: scheduled Telegram (`telegram_bot._fmt_report`), the Game Plan
+(`plan_report.picks_from_archive`), the Best Value page, the app's Game Plan candidates
+and the Settings push (`bv_saved.saved_rows_df`), reports (`period_report`). The
+portfolio view takes prices from the scan's quotes (`flow.quotes_for_portfolio`).
+`tests/test_ui_reads_saved.py` fails if any module under `ui/` imports or calls the
+scorer.
 
 ### Game Plan (`game_plan.build_plan`, display only, never scoring)
 
