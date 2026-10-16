@@ -95,16 +95,21 @@ def read_plists(plist_dir: str | None = None) -> dict[str, dict]:
     return out
 
 
-def launchctl_jobs(run: Runner = subprocess.run) -> dict[str, dict] | None:
-    """{label: {"pid": int | None, "last_exit": int | None}} for loaded
-    com.optiontrading jobs. None when launchctl is not available."""
+def launchctl_jobs(run: Runner = subprocess.run,
+                   labels: set[str] | None = None) -> dict[str, dict] | None:
+    """{label: {"pid": int | None, "last_exit": int | None}} for loaded jobs that are
+    com.optiontrading.* or in ``labels`` (the repo's plists). None when launchctl is
+    not available."""
     text = _run(["launchctl", "list"], run)
     if text is None:
         return None
     out: dict[str, dict] = {}
     for line in text.splitlines():
         parts = line.split("\t") if "\t" in line else line.split()
-        if len(parts) < 3 or not parts[2].startswith("com.optiontrading."):
+        if len(parts) < 3:
+            continue
+        label = parts[2].strip()
+        if not (label.startswith("com.optiontrading.") or label in (labels or set())):
             continue
         pid = int(parts[0]) if parts[0].strip().lstrip("-").isdigit() and parts[0] != "-" else None
         code = int(parts[1]) if parts[1].strip().lstrip("-").isdigit() else None
@@ -132,7 +137,7 @@ def find_processes(script: str, run: Runner = subprocess.run) -> list[int]:
 def jobs(run: Runner = subprocess.run, plist_dir: str | None = None) -> list[dict[str, Any]]:
     """One row per known job: name, label, how often, status."""
     plists = read_plists(plist_dir)
-    loaded = launchctl_jobs(run)
+    loaded = launchctl_jobs(run, set(plists))
     rows = []
     for label in sorted(set(plists) | set(JOB_NAMES)):
         info = (loaded or {}).get(label)

@@ -56,6 +56,9 @@ def test_launchctl_list_is_parsed_and_filtered():
                     "com.optiontrading.mark-runner": {"pid": None, "last_exit": 0},
                     "com.optiontrading.nightly": {"pid": None, "last_exit": 78}}
     assert js.launchctl_jobs(_Run({})) is None             # not macOS
+    other = js.launchctl_jobs(_Run({("launchctl", "list"): (0, "77\t0\tcom.zmax.scanner.weekly\n")}),
+                              {"com.zmax.scanner.weekly"})
+    assert other == {"com.zmax.scanner.weekly": {"pid": 77, "last_exit": 0}}
 
 
 def test_job_rows_say_running_waiting_failed_and_not_loaded():
