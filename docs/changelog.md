@@ -4,6 +4,16 @@ One line per change that alters what the system does or shows, newest first, in 
 same commit as the change. Scoring-math changes also go in `CHANGES.md` with the new
 `config_hash` (see `AGENTS.md`). Commit ids are from `main`.
 
+## 2026-10-16
+
+- **Best Value scored once per scan** (`dailyScaner._score_best_value`): one scoring
+  with daily bias, market state and news; the archive snapshot and the attribution rows
+  are both written from it (before: two scorings, the archive one without news).
+  Attribution rows are unchanged (they already had news). Archive / Telegram scores now
+  include the news multiplier (×1.2 with, ×0.8 against); snapshots before this date
+  do not. The snapshot records its inputs in `best_value.inputs`. Scoring math and
+  `config_hash` unchanged. (F-S4-01b, piece 1 of 3)
+
 ## 2026-10-15
 
 - **Settings → Scheduler & background jobs** (`jobs_status.py`, `ui/scheduler_panel.py`):

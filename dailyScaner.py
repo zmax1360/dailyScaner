@@ -69,25 +69,74 @@ IS_EOD = _parse_is_eod()
 MIN_OI_FOR_MAGNET = int(SCORING["min_oi_for_magnet"])
 
 
+def _score_best_value(
+    *,
+    ticker: str,
+    spot: float,
+    vol_curr: dict,
+    vol_prev: dict | None,
+    session: dict | None,
+    eod_vol_lookup: dict | None = None,
+    volume_is_session_scoped: bool = False,
+    current_source: str = "yahoo",
+    prev_archive_source: str | None = None,
+    eod_archive_source: str | None = None,
+) -> dict:
+    """
+    The scan's one Best Value scoring. The archive snapshot (read by Telegram, the
+    Game Plan and the app) and the attribution rows are both written from this
+    result, so they always agree.
+
+    Inputs: daily bias and market state (resolve_biases_for_ticker) and news bias
+    (news_service). Returns {"df", "daily_bias", "market_state", "news_bias"}.
+    Fail-soft: on error "df" is an empty DataFrame and the scan goes on.
+    """
+    out: dict = {"df": pd.DataFrame(), "daily_bias": None, "market_state": None,
+                 "news_bias": None}
+    try:
+        from best_value import build_best_value_df, resolve_biases_for_ticker
+
+        out["daily_bias"], out["market_state"] = resolve_biases_for_ticker(
+            ticker, session or {}, spot,
+        )
+        try:
+            from news_service import get_news_sentiment
+            out["news_bias"] = (get_news_sentiment(ticker) or {}).get("news_bias")
+        except Exception:
+            out["news_bias"] = None
+
+        out["df"] = build_best_value_df(
+            vol_curr,
+            spot,
+            vol_prev,
+            min_volume=int(SCORING.get("min_volume", 500)),
+            daily_bias=out["daily_bias"],
+            market_state=out["market_state"],
+            news_bias=out["news_bias"],
+            eod_vol_lookup=eod_vol_lookup,
+            volume_is_session_scoped=volume_is_session_scoped,
+            current_source=current_source,
+            prev_archive_source=prev_archive_source,
+            eod_archive_source=eod_archive_source,
+        )
+    except Exception as exc:
+        log.warning(f"best_value scoring failed: {exc}")
+    return out
+
+
 def _log_scan_attribution(
     *,
     ticker: str,
     spot: float,
     calls_all: pd.DataFrame,
     puts_all: pd.DataFrame,
-    vol_curr: dict,
-    vol_prev: dict | None,
-    session: dict | None,
+    scored: dict,
     run_kind: str = "intraday",
-    eod_vol_lookup: dict | None = None,
-    volume_is_session_scoped: bool = False,
-    current_source: str = "yahoo",
-    prev_archive_source: str | None = None,
-    eod_archive_source: str | None = None,
     daily_closes: list[float] | None = None,
 ) -> None:
     """
-    Score + append attribution rows. Fail-soft: never abort a scan.
+    Append attribution rows for the scan's own scoring (``_score_best_value``):
+    nothing is scored again here. Fail-soft: never abort a scan.
     Lives on the scan path (not Streamlit) so scheduler runs are logged.
     """
     try:
@@ -96,31 +145,13 @@ def _log_scan_attribution(
             engine_sha,
             log_run,
         )
-        from best_value import build_best_value_df, resolve_biases_for_ticker
 
-        daily_bias, market_state = resolve_biases_for_ticker(
-            ticker, session or {}, spot,
-        )
-        news_bias = None
-        try:
-            from news_service import get_news_sentiment
-            news_bias = (get_news_sentiment(ticker) or {}).get("news_bias")
-        except Exception:
-            pass
-
-        bv_df = build_best_value_df(
-            vol_curr,
-            spot,
-            vol_prev,
-            daily_bias=daily_bias,
-            market_state=market_state,
-            news_bias=news_bias,
-            eod_vol_lookup=eod_vol_lookup,
-            volume_is_session_scoped=volume_is_session_scoped,
-            current_source=current_source,
-            prev_archive_source=prev_archive_source,
-            eod_archive_source=eod_archive_source,
-        )
+        bv_df = scored.get("df")
+        if bv_df is None:
+            bv_df = pd.DataFrame()
+        daily_bias = scored.get("daily_bias")
+        market_state = scored.get("market_state")
+        news_bias = scored.get("news_bias")
 
         chain = pd.concat(
             [
@@ -1292,34 +1323,35 @@ def run(source=None):
         session = None
     # ------------------------------------------------------------------------
 
-    # Snapshot Best Value into the archive so Telegram reads scan output
-    # (one gated path) instead of re-scoring independently.
-    _bv_payload = None
-    try:
-        from best_value import build_best_value_df, resolve_biases_for_ticker
-        from notify_delivery import serialize_best_value_rows
-        _vol_bv = {
+    # Best Value is scored once per scan. The archive snapshot (Telegram, Game Plan,
+    # app) and the attribution rows below are both written from this result.
+    _prev_vol_bv = None
+    if prev_result:
+        _prev_vol_bv = (prev_result[0] or {}).get("volume")
+    _scored = _score_best_value(
+        ticker=TICKER,
+        spot=spot,
+        vol_curr={
             "top_calls": _vol_gate.get("top_calls") or [],
             "top_puts": _vol_gate.get("top_puts") or [],
+        },
+        vol_prev=_prev_vol_bv,
+        session=session,
+        eod_vol_lookup=_eod_lookup,
+        volume_is_session_scoped=_session_scoped,
+        current_source=_curr_source,
+        prev_archive_source=_prev_archive_source,
+        eod_archive_source=_eod_archive_source,
+    )
+    _bv_payload = None
+    try:
+        from notify_delivery import serialize_best_value_rows
+        _bv_payload = serialize_best_value_rows(_scored["df"])
+        _bv_payload["inputs"] = {
+            "daily_bias": _scored["daily_bias"],
+            "market_state": _scored["market_state"],
+            "news_bias": _scored["news_bias"],
         }
-        _prev_vol_bv = None
-        if prev_result:
-            _prev_vol_bv = (prev_result[0] or {}).get("volume")
-        _daily_bias, _market_state = resolve_biases_for_ticker(
-            TICKER, session or {}, spot,
-        )
-        _bv_df = build_best_value_df(
-            _vol_bv, spot, _prev_vol_bv,
-            min_volume=int(SCORING.get("min_volume", 500)),
-            daily_bias=_daily_bias,
-            market_state=_market_state,
-            eod_vol_lookup=_eod_lookup,
-            volume_is_session_scoped=_session_scoped,
-            current_source=_curr_source,
-            prev_archive_source=_prev_archive_source,
-            eod_archive_source=_eod_archive_source,
-        )
-        _bv_payload = serialize_best_value_rows(_bv_df)
     except Exception as _bv_exc:
         log.warning(f"best_value archive snapshot failed: {_bv_exc}")
         _bv_payload = None
@@ -1338,14 +1370,8 @@ def run(source=None):
     # Full-chain volume/OI history (fail-soft; display only, never scoring).
     _record_volume_history(fname_json, calls_all, puts_all, source_name=_curr_source, force=IS_EOD)
 
-    # Attribution: every scored contract + ATM controls (fail-soft)
-    vol_curr = {
-        "top_calls": _volume_block_records(calls_all),
-        "top_puts": _volume_block_records(puts_all),
-    }
-    vol_prev_bv = None
-    if prev_result:
-        vol_prev_bv = (prev_result[0] or {}).get("volume")
+    # Attribution: every scored contract + ATM controls (fail-soft), from the
+    # same scoring as the archive snapshot.
     # Daily closes already on frames["1D"] - no extra network call for RV/IV.
     _daily_closes: list[float] | None = None
     try:
@@ -1360,15 +1386,8 @@ def run(source=None):
         spot=spot,
         calls_all=calls_all,
         puts_all=puts_all,
-        vol_curr=vol_curr,
-        vol_prev=vol_prev_bv,
-        session=session,
+        scored=_scored,
         run_kind="eod" if IS_EOD else "intraday",
-        eod_vol_lookup=_eod_lookup,
-        volume_is_session_scoped=_session_scoped,
-        current_source=_curr_source,
-        prev_archive_source=_prev_archive_source,
-        eod_archive_source=_eod_archive_source,
         daily_closes=_daily_closes,
     )
 

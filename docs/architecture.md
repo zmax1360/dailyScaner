@@ -34,12 +34,12 @@ them. Changes since then: `docs/changelog.md`.
 
 ### Where Best Value is scored (open problem, see F-S4-01 in findings)
 
-`best_value.build_best_value_df` is called from six places with different inputs:
+`best_value.build_best_value_df` is called from five places with different inputs
+(the scan's two were merged into one on 2026-10-16):
 
 | caller | feeds | inputs beyond the chain |
 |---|---|---|
-| `dailyScaner._log_scan_attribution` | attribution DB | daily, macro, news |
-| `dailyScaner.run` (archive snapshot) | archive → scheduled Telegram, Game Plan scanner side, reports | daily, macro (no news) |
+| `dailyScaner._score_best_value` (once per scan, since 2026-10-16) | archive snapshot → scheduled Telegram, Game Plan scanner side, reports; and the attribution DB (`_log_scan_attribution` logs the same result) | daily, macro, news |
 | `ui/pages/flow.py` `_render_best_value_panel` | Best Value page | daily, macro, news, VWAP state, cost profile, 1SD, 0DTE flow, POV, strategy |
 | `ui/pages/flow.py` `render` (game_plan section) | Game Plan candidates in the app | same as the Best Value page |
 | `ui/pages/flow.py` `_build_live_scanner_df_for_portfolio` | portfolio view | its own subset |
