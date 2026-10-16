@@ -6,7 +6,7 @@ from datetime import datetime
 import glob
 import json
 
-from ui import settings_store, shell
+from ui import scheduler_panel, settings_store, shell
 from ui.archives import _latest_archive_stamp
 from ui.services import _discover_tickers
 from ui.services import _run_daily_scanner
@@ -66,6 +66,8 @@ def render(cfg: dict) -> None:
     st.caption("Settings are saved automatically and restored the next time the app starts.")
 
     st.divider()
+    scheduler_panel.render()
+
     # ── Telegram push ─────────────────────────────────────────────────
     with st.expander("📨 Telegram", expanded=False):
         tg_token, tg_chat = _load_telegram_config()
