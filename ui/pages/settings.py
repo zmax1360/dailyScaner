@@ -181,8 +181,8 @@ def render(cfg: dict) -> None:
                                            shell.setting(st, "min_reward_to_risk")))
                       if inc_plan else None),
             )
-            ok, err = _send_telegram(tg_token, _load_telegram_config(tg_ticker)[1] or tg_chat,
-                                     msg)
+            own_token, own_chat = _load_telegram_config(tg_ticker)
+            ok, err = _send_telegram(own_token or tg_token, own_chat or tg_chat, msg)
             if ok:
                 st.success("Sent ✈️")
             else:

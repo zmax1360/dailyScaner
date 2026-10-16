@@ -33,7 +33,8 @@ scheduler_config.json schema
 }
 
 Telegram chat per ticker (.env): TELEGRAM_CHAT_ID_SPY=-100... sends SPY's messages to
-its own channel; any ticker without one uses TELEGRAM_CHAT_ID.
+its own channel; any ticker without one uses TELEGRAM_CHAT_ID. TELEGRAM_BOT_TOKEN_SPY
+lets a separate bot post them; without it the shared TELEGRAM_BOT_TOKEN bot does.
 """
 
 import argparse
@@ -232,6 +233,13 @@ def ticker_chat_id(env: dict, ticker: str, cfg: dict | None = None) -> str:
     return (env.get("TELEGRAM_CHAT_ID") or "").strip()
 
 
+def ticker_bot_token(env: dict, ticker: str) -> str:
+    """The bot that posts ``ticker``'s messages: ``TELEGRAM_BOT_TOKEN_<TICKER>`` in .env
+    when set (a bot of its own, e.g. for the SPY channel), else ``TELEGRAM_BOT_TOKEN``."""
+    own = (env.get(f"TELEGRAM_BOT_TOKEN_{(ticker or '').strip().upper()}") or "").strip()
+    return own or (env.get("TELEGRAM_BOT_TOKEN") or "").strip()
+
+
 def ticker_notifies(cfg: dict, ticker: str) -> bool:
     """Telegram after a scan of ``ticker``: the global switch, and the ticker's own
     ``"notify": false`` (a ticker that is only being recorded stays quiet)."""
@@ -241,7 +249,7 @@ def ticker_notifies(cfg: dict, ticker: str) -> bool:
 
 def _notify_success(ticker: str, env: dict, elapsed: float) -> None:
     """After exit 0 only — format from the archive the scan just wrote."""
-    token   = env.get("TELEGRAM_BOT_TOKEN", "")
+    token   = ticker_bot_token(env, ticker)
     chat_id = ticker_chat_id(env, ticker, load_config())
     if not token or not chat_id:
         if token:
@@ -293,7 +301,7 @@ def _notify_refusal_streak(ticker: str, reason: str | None, env: dict) -> None:
     """One alert when consecutive refusals hit 3 — then silent until success."""
     from notify_delivery import REFUSAL_STREAK_ALERT_AT
 
-    token   = env.get("TELEGRAM_BOT_TOKEN", "")
+    token   = ticker_bot_token(env, ticker)
     chat_id = ticker_chat_id(env, ticker, load_config())
     if not token or not chat_id:
         return

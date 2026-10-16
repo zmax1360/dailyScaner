@@ -21,9 +21,9 @@ _ENV_FILE    = os.path.join(_SCANNER_DIR, ".env")
 
 def _load_telegram_config(ticker: str | None = None) -> tuple[str | None, str | None]:
     """
-    Read TELEGRAM_BOT_TOKEN and the chat from the .env file. With a ticker, its own
-    TELEGRAM_CHAT_ID_<TICKER> wins when set (the same rule as the scheduler), else
-    TELEGRAM_CHAT_ID. Returns (token, chat_id) — either may be None if not configured.
+    Read the bot token and the chat from the .env file. With a ticker, its own
+    TELEGRAM_BOT_TOKEN_<TICKER> and TELEGRAM_CHAT_ID_<TICKER> win when set (the same
+    rule as the scheduler), else TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID. Returns (token, chat_id) — either may be None if not configured.
     """
     env: dict[str, str] = {}
     try:
@@ -37,7 +37,9 @@ def _load_telegram_config(ticker: str | None = None) -> tuple[str | None, str | 
     except FileNotFoundError:
         pass
     own = env.get(f"TELEGRAM_CHAT_ID_{(ticker or '').strip().upper()}", "") if ticker else ""
-    return (env.get("TELEGRAM_BOT_TOKEN") or None,
+    own_bot = (env.get(f"TELEGRAM_BOT_TOKEN_{(ticker or '').strip().upper()}", "")
+               if ticker else "")
+    return (own_bot or env.get("TELEGRAM_BOT_TOKEN") or None,
             own or env.get("TELEGRAM_CHAT_ID") or None)
 
 
