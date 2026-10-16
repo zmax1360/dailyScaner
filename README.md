@@ -2,6 +2,10 @@
 
 Institutional-style options flow scanner with a Streamlit dashboard, background scheduler, and Telegram alerts.
 
+> **Current state:** `docs/architecture.md` §0 (system map, updated 2026-10-15) and
+> `docs/changelog.md` (what changed, when). Parts of this README predate the 2026-10-04
+> UI split into `ui/pages/` and the Game Plan; where they disagree, trust those two and the code.
+
 The system separates **data acquisition / signal computation** (`dailyScaner.py`) from a **display + ranking layer** (`app.py` and pure scoring modules). Archive JSON files are the contract between them.
 
 ---

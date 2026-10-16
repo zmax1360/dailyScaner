@@ -22,6 +22,9 @@ Defects observed while documenting. No fixes applied.
 | F-S3-01 | `notify_delivery.py:255` vs `attribution.py:322` | Archive `best_value.engine_sha` is `config_hash(SCORING)`, not `git rev-parse`. | P1 |
 | F-S3-02 | `snapshot_store.py:21-22`, `scheduler.py:52` | `flow_snapshot.json`, `gate_history.json`, and `scheduler.pid` are written at repo root and are not in `.gitignore`. | P2 |
 | F-S3-03 | `script/portfolio_store.py:395-412` | `close_position` computes a second realized-P&L pair beside `scanner.lot_match._pnl`. | P1 |
+| F-S4-01b | `best_value.build_best_value_df` callers (see architecture §0) | 2026-10-15: Best Value is scored in six places with different inputs (news only in the DB path and the app; VWAP/cost/1SD only in the app; none in the Settings push). Same scan can rank differently in the app, Telegram and the DB. Extends F-S4-01. | P1 |
+| F-S6-01 | `dailyScaner.py:817` | Nested same-quote f-string needs Python 3.12+; the module fails to compile on 3.11 (`pyproject` says 3.11+). | P2 |
+| F-S6-02 | `tests/test_spread_gate.py::test_garbage_inputs_never_raise` | Fails on `main`; "done means pytest exits 0" (`AGENTS.md`) is not met. Not investigated. | P1 |
 | F-S4-01 | `app.py:1-4` vs `app.py:2421-2436` | Module docstring says display-only / “No indicators recomputed here”; Best Value panel calls `build_best_value_df` with VWAP/POV/catalyst kwargs. | P1 |
 | F-S4-02 | `app.py:31` vs `app.py:1638` / `:2333` | Imports `calculate_best_value`; panel docstring names that function; the call is `build_best_value_df`. | P2 |
 | F-S4-03 | `chain_quality.py:179-182` | Quality-gate fail uses call `unusable/total` only; `put_stats` are computed and logged, not in the predicate. | P2 |

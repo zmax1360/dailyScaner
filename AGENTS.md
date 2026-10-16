@@ -8,6 +8,7 @@ logs every flag to SQLite, marks outcomes later, reports. Python 3.11+, Streamli
 
 ## Where knowledge lives
 
+- `docs/changelog.md` — what changed and when, one line per change. Start here.
 - `docs/scoring_spec.md`, `docs/data_contract.md`, `docs/architecture.md` — evidence-based descriptions of
   **current** behaviour with `file:line` refs. Read the relevant one before changing that area.
 - `docs/findings.md` — defects observed. **Observations, not approved work.** Don't fix them unless asked.
@@ -36,6 +37,9 @@ logs every flag to SQLite, marks outcomes later, reports. Python 3.11+, Streamli
   `safe_io.locked(path)`; write with `safe_io.write_json_atomic`. Never `open(path, "w")` in place.
 - **Import side effects:** no network calls or `sys.exit` at module import in new code.
 - **Secrets:** never commit `.env` or API keys (Telegram, Finnhub, Massive, Schwab). Check `git diff` first.
+- **Changelog:** every change to what the system does or shows adds one line to
+  `docs/changelog.md` in the same commit (date, what, where). If it changes the flow
+  (who computes what, who reads what), update `docs/architecture.md` §0 too.
 
 ## Setup and tests
 

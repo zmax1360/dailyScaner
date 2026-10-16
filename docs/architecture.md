@@ -6,6 +6,73 @@ Evidence-only. Line refs are the lines that were read. Claims without a line sit
 
 ---
 
+## 0. CURRENT SYSTEM MAP (2026-10-15)
+
+Added 2026-10-15 from the code on `main` (7b7ad26). Refs are module/function names, not
+line numbers. **Sections 1–7 below are the 2026-10-03 snapshot:** their `app.py:NNNN`
+refs predate the 2026-10-04 split of the UI into `ui/pages/*.py`; trust the code over
+them. Changes since then: `docs/changelog.md`.
+
+### Scan → saved outputs
+
+1. `scheduler.py` (launchd `com.optiontrading.scheduler`, KeepAlive) loops every 30 s and
+   re-reads `scheduler_config.json` each pass. Tickers = names with an `archive/*.json`
+   minus `tickers_excluded.json`. Each ticker scans every `interval_min` (AAPL 5, SPY 15)
+   from `market_open` to `eod_time`, plus one EOD scan. Each scan is a subprocess:
+   `dailyScaner.py <TICKER>`.
+2. `dailyScaner.run` fetches bars (5M…1D) and the chain through `sources/` (Yahoo by
+   default), computes per-timeframe indicators (`analyze_tf`, incl. 15M EMA 9/21/50 and
+   `htf_trend.describe` for 1H/4H), and writes:
+   - `archive/{TICKER}_{YYYYMMDD}_{HHMMSS}.json`: spot, session, timeframes, raw option
+     volume (`volume.top_calls/top_puts`), and a Best Value snapshot (`best_value.rows`).
+   - SQLite attribution rows (`_log_scan_attribution` → `attribution.log_run`).
+   - volume history (`volume_history.record_scan`, at most every 15 min).
+3. After a successful scan, `scheduler._notify_success` formats the archive
+   (`telegram_bot._fmt_report`, which reads `best_value.rows` and builds the Game Plan
+   via `plan_report`) and sends it to the ticker's chat (`ticker_chat_id`,
+   `ticker_bot_token`: `TELEGRAM_*_<TICKER>` in `.env`, else the shared ones).
+
+### Where Best Value is scored (open problem, see F-S4-01 in findings)
+
+`best_value.build_best_value_df` is called from six places with different inputs:
+
+| caller | feeds | inputs beyond the chain |
+|---|---|---|
+| `dailyScaner._log_scan_attribution` | attribution DB | daily, macro, news |
+| `dailyScaner.run` (archive snapshot) | archive → scheduled Telegram, Game Plan scanner side, reports | daily, macro (no news) |
+| `ui/pages/flow.py` `_render_best_value_panel` | Best Value page | daily, macro, news, VWAP state, cost profile, 1SD, 0DTE flow, POV, strategy |
+| `ui/pages/flow.py` `render` (game_plan section) | Game Plan candidates in the app | same as the Best Value page |
+| `ui/pages/flow.py` `_build_live_scanner_df_for_portfolio` | portfolio view | its own subset |
+| `ui/telegram_push.py` `_format_scan_message`, `plan_for_message` | Settings "Send to Telegram" | none of the biases |
+
+`AGENTS.md` says the UI never recomputes scores; the four UI calls break that. Agreed
+direction (not built): score once in the scan with the full input set, save rows with
+their multipliers, and have every reader use the saved rows.
+
+### Game Plan (`game_plan.build_plan`, display only, never scoring)
+
+- Allowed side: 15M EMA 9/21/50 stack (`ema_stack`). Then holds, in order: entry window
+  10:00–15:00 ET (`resolve_side`), scanner's top 1DTE+ pick over the last 6 scans must
+  agree (`scanner_side`), price on the right side of VWAP (`vwap_hold`). Any hold → no
+  plan, with the reason.
+- Type of day: sign of net gamma for the nearest expiry (`gex.summary`).
+- Trade plan: stop beyond the nearest support/resistance (VWAP, 15M EMA 21/50, gamma
+  level), targets from session high/low, gamma level and 1SD range; entry zone where
+  reward/risk to target 1 ≥ 1.5; "no entry zone" when that limit is past the stop's level.
+- Higher timeframes: `htf_trend.plan_line` (1H/4H), context only.
+- App: live price and VWAP from 5-minute bars (`volume_analysis`, 09:30–16:00 ET bars).
+  Telegram: the scan's own numbers; VWAP is not in the archive, so no VWAP hold there.
+
+### Background jobs (launchd, `plist/`)
+
+`com.optiontrading.scheduler` (always on), `mark-runner` (every 15 min),
+`nightly` (Mon–Fri 17:15 local), `health-check` (hourly, gated to ET), plus
+`com.zmax.scanner.weekly` (Sun 18:00) and the Telegram menu bot (`telegram_bot.py`,
+started by hand). Status, intervals and restart: Settings → Scheduler & background jobs
+(`jobs_status.py`).
+
+---
+
 ## 1. PROCESS MODEL
 
 Long-running / scheduled processes observed in `plist/`, wrappers, and entry points. Intervals are taken from the plist keys or from the process’s own sleep — not inferred from comments alone.
