@@ -27,9 +27,13 @@ scheduler_config.json schema
   "tickers": {                       # per-ticker overrides (optional)
     "AAPL": { "interval_min": 3  },
     "TSLA": { "interval_min": 10 },
-    "SPY":  { "interval_min": 15, "notify": false }   # scan and record, no Telegram
+    "SPY":  { "interval_min": 15, "own_chat": true }  # only to TELEGRAM_CHAT_ID_SPY
+    "QQQ":  { "interval_min": 15, "notify": false }   # scan and record, no Telegram
   }
 }
+
+Telegram chat per ticker (.env): TELEGRAM_CHAT_ID_SPY=-100... sends SPY's messages to
+its own channel; any ticker without one uses TELEGRAM_CHAT_ID.
 """
 
 import argparse
@@ -215,6 +219,19 @@ def _send_plain(url: str, chat_id: str, text: str) -> bool:
         return False
 
 
+def ticker_chat_id(env: dict, ticker: str, cfg: dict | None = None) -> str:
+    """The Telegram chat for ``ticker``'s messages: ``TELEGRAM_CHAT_ID_<TICKER>`` in .env
+    when it is set (a channel of its own, e.g. TELEGRAM_CHAT_ID_SPY), else the shared
+    ``TELEGRAM_CHAT_ID``. A ticker with ``"own_chat": true`` in the config never falls
+    back to the shared chat: without its own id it gets "" and its messages are skipped."""
+    own = (env.get(f"TELEGRAM_CHAT_ID_{(ticker or '').strip().upper()}") or "").strip()
+    if own:
+        return own
+    if (((cfg or {}).get("tickers") or {}).get(ticker) or {}).get("own_chat"):
+        return ""
+    return (env.get("TELEGRAM_CHAT_ID") or "").strip()
+
+
 def ticker_notifies(cfg: dict, ticker: str) -> bool:
     """Telegram after a scan of ``ticker``: the global switch, and the ticker's own
     ``"notify": false`` (a ticker that is only being recorded stays quiet)."""
@@ -225,8 +242,10 @@ def ticker_notifies(cfg: dict, ticker: str) -> bool:
 def _notify_success(ticker: str, env: dict, elapsed: float) -> None:
     """After exit 0 only — format from the archive the scan just wrote."""
     token   = env.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = env.get("TELEGRAM_CHAT_ID", "")
+    chat_id = ticker_chat_id(env, ticker, load_config())
     if not token or not chat_id:
+        if token:
+            log.info(f"[{ticker}] notify skipped: no TELEGRAM_CHAT_ID_{ticker} in .env yet")
         return
 
     try:
@@ -275,7 +294,7 @@ def _notify_refusal_streak(ticker: str, reason: str | None, env: dict) -> None:
     from notify_delivery import REFUSAL_STREAK_ALERT_AT
 
     token   = env.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = env.get("TELEGRAM_CHAT_ID", "")
+    chat_id = ticker_chat_id(env, ticker, load_config())
     if not token or not chat_id:
         return
     why = reason or "unknown"

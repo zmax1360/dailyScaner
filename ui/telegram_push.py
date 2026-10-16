@@ -19,13 +19,13 @@ from ui.gamma_data import gamma_summary_for  # noqa: F401  (re-exported for the 
 _ENV_FILE    = os.path.join(_SCANNER_DIR, ".env")
 
 
-def _load_telegram_config() -> tuple[str | None, str | None]:
+def _load_telegram_config(ticker: str | None = None) -> tuple[str | None, str | None]:
     """
-    Read TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from the .env file.
-    Returns (token, chat_id) — either may be None if not configured.
+    Read TELEGRAM_BOT_TOKEN and the chat from the .env file. With a ticker, its own
+    TELEGRAM_CHAT_ID_<TICKER> wins when set (the same rule as the scheduler), else
+    TELEGRAM_CHAT_ID. Returns (token, chat_id) — either may be None if not configured.
     """
-    token: str | None = None
-    chat_id: str | None = None
+    env: dict[str, str] = {}
     try:
         with open(_ENV_FILE) as f:
             for line in f:
@@ -33,14 +33,12 @@ def _load_telegram_config() -> tuple[str | None, str | None]:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, val = line.partition("=")
-                val = val.strip().strip('"').strip("'")
-                if key.strip() == "TELEGRAM_BOT_TOKEN":
-                    token = val or None
-                elif key.strip() == "TELEGRAM_CHAT_ID":
-                    chat_id = val or None
+                env[key.strip()] = val.strip().strip('"').strip("'")
     except FileNotFoundError:
         pass
-    return token, chat_id
+    own = env.get(f"TELEGRAM_CHAT_ID_{(ticker or '').strip().upper()}", "") if ticker else ""
+    return (env.get("TELEGRAM_BOT_TOKEN") or None,
+            own or env.get("TELEGRAM_CHAT_ID") or None)
 
 
 def _send_telegram(token: str, chat_id: str, text: str) -> tuple[bool, str]:
