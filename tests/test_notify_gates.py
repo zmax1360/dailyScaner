@@ -105,6 +105,7 @@ def test_streak_resets_after_a_successful_scan():
     sched._reset_refusal_streak("AAPL")
     env = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}
     with patch.object(sched, "_notify_success") as ok, \
+         patch.object(sched, "_gamma_shift_check"), \
          patch.object(sched, "_notify_refusal_streak") as streak:
         for _ in range(REFUSAL_STREAK_ALERT_AT):
             sched.handle_scan_result(

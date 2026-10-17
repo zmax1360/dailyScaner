@@ -28,6 +28,7 @@ scheduler_config.json schema
     "AAPL": { "interval_min": 3  },
     "TSLA": { "interval_min": 10 },
     "SPY":  { "interval_min": 15, "own_chat": true }  # only to TELEGRAM_CHAT_ID_SPY
+    "NVDA": { "gamma_alert": false }   # no alert when the call / put wall moves
     "QQQ":  { "interval_min": 15, "notify": false }   # scan and record, no Telegram
   }
 }
@@ -297,6 +298,39 @@ def _notify_success(ticker: str, env: dict, elapsed: float) -> None:
         log.warning(f"[{ticker}] notify error: {exc}")
 
 
+def ticker_gamma_alert(cfg: dict, ticker: str) -> bool:
+    """Gamma-shift alert for ``ticker``: on unless ``"gamma_alert": false``."""
+    own = ((cfg or {}).get("tickers") or {}).get(ticker, {})
+    return own.get("gamma_alert", True) is not False
+
+
+def _gamma_shift_check(ticker: str, env: dict, *, send: bool) -> None:
+    """After a successful scan: did the call wall or put wall move to another strike?
+    The walls are always recorded (data/gamma_walls.json); the alert goes out only when
+    ``send``. Never raises."""
+    try:
+        import gamma_shift
+        import plan_report
+        from telegram_bot import _load_latest
+        payload, _ = _load_latest(ticker)
+        summary = plan_report.gamma_summary_for(ticker, (payload or {}).get("spot"))
+        events = gamma_shift.update(ticker, summary)
+        if not events:
+            return
+        moved = ", ".join(f"{e['label']} {e['old']:g}->{e['new']:g}" for e in events)
+        log.info(f"[{ticker}] gamma shift: {moved}")
+        token = ticker_bot_token(env, ticker)
+        chat_id = ticker_chat_id(env, ticker, load_config())
+        if not send or not token or not chat_id:
+            return
+        if _send_telegram(token, chat_id, gamma_shift.message(ticker, events, summary)):
+            log.info(f"[{ticker}] gamma shift alert sent")
+        else:
+            log.warning(f"[{ticker}] gamma shift alert failed")
+    except Exception as exc:
+        log.warning(f"[{ticker}] gamma shift check error: {exc}")
+
+
 def _notify_refusal_streak(ticker: str, reason: str | None, env: dict) -> None:
     """One alert when consecutive refusals hit 3 — then silent until success."""
     from notify_delivery import REFUSAL_STREAK_ALERT_AT
@@ -343,6 +377,7 @@ def handle_scan_result(
         log.info(f"[{ticker}] scan OK ({elapsed:.0f}s)")
         if notify:
             _notify_success(ticker, env, elapsed)
+        _gamma_shift_check(ticker, env, send=notify and ticker_gamma_alert(load_config(), ticker))
         return
 
     if exit_code == 3:

@@ -15,6 +15,7 @@ files.zip
 data/schwab_tokens.json
 data/mark_runner_cap_hits.jsonl
 data/mark_runner_cursor.json
+data/gamma_walls.json
 *.log
 logs/
 report/

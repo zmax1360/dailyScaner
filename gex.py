@@ -336,8 +336,9 @@ def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
             today: date | None = None, n_strikes: int = 16, top: int = 3) -> dict | None:
     """Headline gamma read for the nearest live expiry, in dollars per $1 move.
 
-    Net, the call and put walls, the largest positive strikes, and the highest
-    negative strike below spot. None when nothing usable is in the snapshot.
+    Net, the call and put walls, the largest positive strikes, the highest negative
+    strike below spot, and every strike's net GEX (``by_strike``). None when nothing
+    usable is in the snapshot.
     """
     table = gex_table(latest, spot=spot, as_of=as_of, today=today)
     expiries = available_expiries(table)
@@ -366,6 +367,7 @@ def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
         "top": [(float(k), float(v))
                 for k, v in col[col > 0].sort_values(ascending=False).head(top).items()],
         "first_negative_below_spot": None if below.empty else float(below.index.max()),
+        "by_strike": {float(k): float(v) for k, v in col.items()},
         "as_of": as_of,
         "coverage": coverage(table),
     }

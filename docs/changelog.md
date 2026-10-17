@@ -6,6 +6,14 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-16
 
+- **Telegram: gamma-shift alert** (`gamma_shift.py`, `scheduler._gamma_shift_check`).
+  After each scan, when the nearest expiry's call wall or put wall moves to another
+  strike, a short message says from where to where, both strikes' gamma now, and the
+  day's path (e.g. $345 → $342.5 → $340 → $345, "back to an earlier level"). A new
+  strike must beat the old one by 10% (no flip-flop on near ties); the first read of a
+  day or expiry only sets the baseline. Walls are kept in `data/gamma_walls.json`.
+  `"gamma_alert": false` per ticker turns the message off. `gex.summary` now carries
+  every strike's GEX (`by_strike`). Alert only; nothing feeds scoring.
 - **The app no longer scores Best Value; it shows the scan's saved ranking**
   (`bv_saved.py`). Best Value page, Game Plan candidates, Settings "Send to Telegram"
   and the portfolio view read `best_value.rows`; the page's notes show the inputs the

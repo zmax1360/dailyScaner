@@ -31,6 +31,10 @@ them. Changes since then: `docs/changelog.md`.
    (`telegram_bot._fmt_report`, which reads `best_value.rows` and builds the Game Plan
    via `plan_report`) and sends it to the ticker's chat (`ticker_chat_id`,
    `ticker_bot_token`: `TELEGRAM_*_<TICKER>` in `.env`, else the shared ones).
+4. Then `scheduler._gamma_shift_check` compares the nearest expiry's call / put wall
+   (`plan_report.gamma_summary_for`) with the last ones seen today
+   (`gamma_shift.update`, `data/gamma_walls.json`) and sends a short alert when one
+   moved to another strike (`"gamma_alert": false` per ticker turns it off).
 
 ### Where Best Value is scored (open problem, see F-S4-01 in findings)
 
