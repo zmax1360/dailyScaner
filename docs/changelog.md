@@ -6,6 +6,11 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- **Game Plan type of day reads the gamma flip** (`game_plan.regime_from_gamma`). The
+  sign now comes from the nearest expiry's net over every strike (`net_all_strikes`;
+  older snapshots fall back to `net`), and the day is **UNSETTLED** when price is within
+  0.15% of that expiry's gamma flip (`gamma_flip_nearest`). "What changes it" names the
+  flip. Display only: the allowed side and the trade plan are unchanged.
 - Gamma page heat map: colour scale tops out at the 90th percentile of non-zero |GEX|
   (`gex_page.color_scale_max`) instead of the largest cell, so one outlier near the
   money no longer washes out the rest. Display only.
