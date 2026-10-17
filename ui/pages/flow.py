@@ -46,7 +46,7 @@ import game_plan
 from plan_report import picks_from_archive, scanner_flow
 import bv_saved
 from ui import game_plan_view, shell
-from ui.gamma_data import gamma_summary_for
+from ui.gamma_data import saved_gamma
 from ui.components import price_chart
 from ui.context import ScanContext
 from volume_analysis import get_stock_volume_analysis
@@ -2116,7 +2116,7 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
         game_plan_view.render(game_plan.build_plan(
             ticker=ticker, spot=plan_price,
             trend=ema_stack.banner_for_archive(curr, now=datetime.now(ET)),
-            gamma=gamma_summary_for(ticker, plan_price),
+            gamma=saved_gamma(curr),
             vwap=vwap_px, expected=em_range, picks=picks,
             session_high=live.get("high", day_high), session_low=live.get("low", day_low),
             stop_buffer_pct=float(shell.setting(st, "stop_buffer_pct")),

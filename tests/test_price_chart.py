@@ -214,7 +214,7 @@ def _run(monkeypatch, bars, summary=None, moves=None):
 
     monkeypatch.setattr(pc, "_cached_bars", lambda ticker, timeframe: bars)
     # never the real snapshot database
-    monkeypatch.setattr(pc, "gamma_summary_for", lambda ticker, spot: summary)
+    monkeypatch.setattr(pc, "saved_gamma", lambda payload: summary)
     at = AppTest.from_string(_SCRIPT, default_timeout=30).run()
     assert not at.exception, at.exception
     return at

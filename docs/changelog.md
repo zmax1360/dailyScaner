@@ -4,6 +4,19 @@ One line per change that alters what the system does or shows, newest first, in 
 same commit as the change. Scoring-math changes also go in `CHANGES.md` with the new
 `config_hash` (see `AGENTS.md`). Commit ids are from `main`.
 
+## 2026-10-17
+
+- **Gamma worked out once per scan and saved** (`dailyScaner._gamma_snapshot`,
+  `payload["gamma"]`, `plan_report.saved_gamma`). The scan computes the gamma read
+  (nearest live expiry: net, walls, support / resistance, every strike) from its own
+  chain. The Telegram message, gamma-shift alert, Game Plan (app and Telegram), price
+  chart lines and Settings push read it; none works gamma out again
+  (`tests/test_plan_report.py::test_no_reader_works_gamma_out_again`). Before: each
+  read the newest database snapshot, saved only every 15 min, so a 5-minute scan's
+  message carried gamma up to 10 min older than the scan, and an old scan showed
+  today's walls. Scans saved before this show "not saved in this scan". The Gamma page
+  heatmap still reads the 15-minute history. (Step 1 of 2: the Game Plan is next.)
+
 ## 2026-10-16
 
 - **Settings in three tabs: Settings, Telegram, Scheduler** (`ui/telegram_panel.py`,

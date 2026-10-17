@@ -343,7 +343,7 @@ def _gamma_shift_check(ticker: str, env: dict, *, send: bool) -> None:
         import plan_report
         from telegram_bot import _load_latest
         payload, _ = _load_latest(ticker)
-        summary = plan_report.gamma_summary_for(ticker, (payload or {}).get("spot"))
+        summary = plan_report.saved_gamma(payload)
         events = gamma_shift.update(ticker, summary)
         if not events:
             return

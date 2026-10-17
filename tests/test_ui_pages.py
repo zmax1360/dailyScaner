@@ -271,7 +271,7 @@ def test_gamma_lines_for_telegram():
         "Support <b>$330</b> (15.25M) · Resistance <b>$335</b> (6.91M)",
         "Largest: $330 15.25M · $335 6.91M · $332.5 5.46M",
         "First negative strike below spot: <b>$325</b>",
-        "<i>dollars of hedging per $1 move · snapshot Sun Oct 04 16:18 ET</i>",
+        "<i>dollars of hedging per $1 move · from the Sun Oct 04 16:18 ET scan</i>",
     ]
 
 
@@ -286,7 +286,7 @@ def test_gamma_lines_say_so_when_gamma_is_negative_or_missing():
     assert lines[3] == "Resistance <b>$335</b> (6.91M)"            # no support line part
     assert not any("First negative" in line for line in lines)
     assert tg.format_gamma_lines(None) == [
-        "🧱 <b>GAMMA</b> — no chain snapshot with usable open interest yet"]
+        "🧱 <b>GAMMA</b> — not saved in this scan"]
 
 
 def test_scan_message_includes_gamma_only_when_asked():
@@ -305,29 +305,30 @@ def test_scan_message_includes_gamma_only_when_asked():
     assert len(with_gamma) < 4096                       # Telegram's message limit
 
 
-def test_gamma_summary_for_reads_the_latest_snapshot(tmp_path, monkeypatch):
+def test_scan_saves_gamma_from_its_own_chain_and_readers_get_it_back():
     import pandas as pd
-
-    import ui.telegram_push as tg
-    import volume_history as vh
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    db = str(tmp_path / "vh.db")
-    monkeypatch.setattr(vh, "DB_PATH", db)
-    assert tg.gamma_summary_for("AAPL", 333.0) is None          # no snapshot yet
+    import dailyScaner
+    import plan_report
+
     cols = ["strike", "lastPrice", "volume", "openInterest", "impliedVolatility", "bid", "ask",
             "expiry"]
     far = "2099-01-16"                                          # never expires under the test
     calls = pd.DataFrame([dict(zip(cols, (335.0, 9.0, 5000, 9000, 0.30, 8.9, 9.1, far)))])
     puts = pd.DataFrame([dict(zip(cols, (325.0, 7.0, 3000, 6000, 0.33, 6.9, 7.1, far)))])
-    vh.record_scan(calls, puts, ticker="AAPL", scan_id="AAPL_20261002_100000",
-                   ts=datetime(2026, 10, 2, 10, 0, tzinfo=ZoneInfo("America/New_York")),
-                   db_path=db)
-    s = tg.gamma_summary_for("aapl", "333.0")
+    ts = datetime(2026, 10, 2, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+    block = dailyScaner._gamma_snapshot(calls, puts, 333.0, ts)
+    json.dumps(block)                                           # archive-safe
+    s = plan_report.saved_gamma({"gamma": block})
     assert s["expiry"] == far and s["call_wall"] == 335.0 and s["put_wall"] == 325.0
-    assert tg.gamma_summary_for("AAPL", None) is None
-    assert tg.gamma_summary_for("AAPL", 0) is None
+    assert s["as_of"] == ts and set(s["by_strike"]) == {335.0, 325.0}
+    assert dailyScaner._gamma_snapshot(calls.iloc[0:0], puts.iloc[0:0], 333.0, ts) is None
+    assert dailyScaner._gamma_snapshot(calls, puts, None, ts) is None
+    assert dailyScaner._gamma_snapshot("garbage", None, 333.0, ts) is None
+    assert plan_report.saved_gamma({}) is None and plan_report.saved_gamma(None) is None
+    assert plan_report.saved_gamma({"gamma": {"expiry": "x"}}) is None
 
 
 def test_archive_lookups(tmp_path, monkeypatch):

@@ -1,9 +1,8 @@
-"""Gamma read for a ticker from its latest full-chain snapshot (shared by the chart and
-the Telegram push)."""
+"""Gamma levels for the chart, from the gamma read the scan saved (``saved_gamma``)."""
 
 from __future__ import annotations
 
-from plan_report import gamma_summary_for  # noqa: F401  (shared with the Telegram bot)
+from plan_report import saved_gamma  # noqa: F401  (the scan's saved gamma read)
 
 
 def gamma_levels(summary: dict | None) -> list[dict]:

@@ -15,7 +15,7 @@ from ui.services import _scan_archive_metadata
 from ui.telegram_push import _format_scan_message
 from ui.telegram_push import _load_telegram_config
 from ui.telegram_push import _send_telegram
-from ui.telegram_push import gamma_summary_for
+from ui.telegram_push import saved_gamma
 from ui.telegram_push import plan_for_message
 from ui.widgets import _choice_control
 import streamlit as st
@@ -162,7 +162,7 @@ def render(cfg: dict) -> None:
             key="tg_send_btn",
         )
         if send_tg and configured and tg_payload:
-            tg_gamma = (gamma_summary_for(tg_ticker, tg_payload.get("spot"))
+            tg_gamma = (saved_gamma(tg_payload)
                         if (inc_gamma or inc_plan) else None)
             msg = _format_scan_message(
                 payload=tg_payload,

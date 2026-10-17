@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import game_plan as gp
+import gex
 import plan_report
 import volume_history as vh
 from tests.test_gex import LATER, MONDAY, NEXT_FRI, TODAY, _leg
@@ -56,7 +57,9 @@ def payload():
 
 
 @pytest.fixture
-def snapshot(tmp_path, monkeypatch):
+def snapshot(tmp_path, monkeypatch, payload):
+    """The chain a scan saw on Fri Oct 2 16:05, and the gamma read that scan saved in
+    ``payload['gamma']`` (readers use the saved read, never the database)."""
     db = str(tmp_path / "vh.db")
     monkeypatch.setattr(vh, "DB_PATH", db)
     calls = _leg([(335.0, 0.01, 5000, 9000, 0.30, 0.01, 0.02, TODAY),
@@ -68,6 +71,9 @@ def snapshot(tmp_path, monkeypatch):
                  (325.0, 1.1, 1500, 5000, 0.31, 1.05, 1.15, NEXT_FRI)])
     vh.record_scan(calls, puts, ticker="AAPL", scan_id="AAPL_20261002_160500",
                    ts=datetime(2026, 10, 2, 16, 5, tzinfo=ET), db_path=db)
+    payload["gamma"] = gex.summary_to_json(gex.summary(
+        vh.latest_scan("AAPL", db_path=db), spot=333.5,
+        as_of=datetime(2026, 10, 2, 16, 5, tzinfo=ET), today=NOW.date()))
     return db
 
 
@@ -81,7 +87,7 @@ def test_picks_come_from_the_ranking_the_scan_saved(payload):
 
 
 def test_plan_from_archive_uses_the_archive_only(payload, snapshot):
-    gamma = plan_report.gamma_summary_for("AAPL", 333.5, today=NOW.date())
+    gamma = plan_report.saved_gamma(payload)
     plan = plan_report.plan_from_archive(payload, "AAPL", gamma=gamma, now=NOW,
                                          settings={"stop_buffer_pct": 0.1,
                                                    "min_reward_to_risk": 1.5})
@@ -178,10 +184,19 @@ def test_a_failure_never_blocks_the_rest_of_the_message(payload, monkeypatch):
     assert "Options Scanner" in msg and "snapshot unreadable" not in msg
 
 
-def test_gamma_section_says_so_when_there_is_no_snapshot(payload, tmp_path, monkeypatch):
+def test_gamma_section_says_so_when_the_scan_saved_none(payload, tmp_path, monkeypatch):
     monkeypatch.setattr(vh, "DB_PATH", str(tmp_path / "empty.db"))
     msg = _report(payload, gamma=True)
-    assert "no chain snapshot with usable open interest yet" in msg
+    assert "GAMMA</b> — not saved in this scan" in msg
+
+
+def test_readers_use_the_saved_gamma_not_the_database(payload, snapshot, monkeypatch):
+    """A newer chain in the database must not change what an older scan shows."""
+    saved = plan_report.saved_gamma(payload)
+    monkeypatch.setattr(vh, "latest_scan", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("a reader opened the snapshot database")))
+    _, gamma = plan_report.report_lines(payload, "AAPL", plan=False, now=NOW)
+    assert gamma == plan_report.gamma_lines(saved) and saved["call_wall"] is not None
 
 
 def test_scheduler_asks_for_both_sections_and_the_bot_offers_them():
@@ -245,3 +260,23 @@ def test_plan_from_archive_holds_on_conflict_and_outside_the_window(payload, sna
     assert late.hold == gp.HOLD_WINDOW
     lines, _ = plan_report.report_lines(payload, "AAPL", now=NOW)
     assert any(x.startswith("⛔ Conflict") for x in lines)
+
+
+def test_no_reader_works_gamma_out_again():
+    """Only the scan computes the gamma read (dailyScaner._gamma_snapshot). The Telegram
+    message, the gamma alert, the Game Plan and the app read ``payload['gamma']``. The
+    Gamma and Volume pages (gex_page.py, volume_page.py) are the full-history views and
+    are not readers of a scan."""
+    import ast
+    readers = [ROOT / "plan_report.py", ROOT / "telegram_bot.py", ROOT / "scheduler.py",
+               *sorted((ROOT / "ui").rglob("*.py"))]
+    banned = {"summary", "gex_table", "gex_matrix", "latest_scan"}
+    found = []
+    for path in readers:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in {"gex", "vh", "volume_history"}
+                    and node.func.attr in banned):
+                found.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+    assert found == []

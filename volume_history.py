@@ -92,6 +92,12 @@ def _rows(leg: pd.DataFrame | None, side: str) -> Iterable[dict]:
     return out
 
 
+def chain_frame(calls: pd.DataFrame | None, puts: pd.DataFrame | None) -> pd.DataFrame:
+    """A scan's traded contracts in the shape ``latest_scan`` returns (what ``gex`` reads),
+    straight from the scan's chain, without the database."""
+    return pd.DataFrame(list(_rows(calls, "CALL")) + list(_rows(puts, "PUT")))
+
+
 def record_scan(
     calls: pd.DataFrame | None,
     puts: pd.DataFrame | None,

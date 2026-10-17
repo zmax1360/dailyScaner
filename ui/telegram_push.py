@@ -16,7 +16,7 @@ import game_plan
 import bv_saved
 import plan_report
 from ui.common import ET
-from ui.gamma_data import gamma_summary_for  # noqa: F401  (re-exported for the Settings page)
+from ui.gamma_data import saved_gamma  # noqa: F401  (re-exported for the Settings page)
 
 _ENV_FILE    = os.path.join(_SCANNER_DIR, ".env")
 

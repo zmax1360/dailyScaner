@@ -373,6 +373,32 @@ def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
     }
 
 
+def summary_to_json(s: dict | None) -> dict | None:
+    """``summary`` in a JSON-safe shape for the scan archive (``payload["gamma"]``)."""
+    if not s:
+        return None
+    out = dict(s)
+    out["as_of"] = s["as_of"].isoformat()
+    out["by_strike"] = [[float(k), float(v)] for k, v in sorted((s.get("by_strike") or {}).items())]
+    out["top"] = [[float(k), float(v)] for k, v in (s.get("top") or [])]
+    return out
+
+
+def summary_from_json(d: Any) -> dict | None:
+    """Back from ``summary_to_json``; None for a missing or unreadable block."""
+    if not isinstance(d, dict) or not d.get("expiry") or not d.get("as_of"):
+        return None
+    try:
+        out = dict(d)
+        out["as_of"] = datetime.fromisoformat(str(d["as_of"]))
+        out["by_strike"] = {float(k): float(v) for k, v in (d.get("by_strike") or [])}
+        out["top"] = [(float(k), float(v)) for k, v in (d.get("top") or [])]
+        out["spot"] = float(d["spot"])
+        return out
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
 def nearest_strike(matrix: pd.DataFrame, spot: float) -> float | None:
     if matrix is None or matrix.empty:
         return None

@@ -69,25 +69,17 @@ def scanner_flow(payload: dict, ticker: str, archive_dir: str | None = None) -> 
     return game_plan.scanner_side(sides + [top_pick_side(payload)])
 
 
-def gamma_summary_for(ticker: str, spot: Any, today=None) -> dict | None:
-    """``gex.summary`` for the nearest live expiry of ``ticker``; None if unavailable.
-    ``today`` (a date) defaults to the current date in New York."""
-    try:
-        spot_f = float(spot)
-    except (TypeError, ValueError):
-        return None
-    latest = vh.latest_scan(str(ticker or "").upper())
-    if latest.empty or spot_f <= 0:
-        return None
-    as_of = datetime.fromisoformat(str(latest["ts_et"].iloc[0]))
-    return gex.summary(latest, spot=spot_f, as_of=as_of,
-                       today=today or datetime.now(ET).date())
+def saved_gamma(payload: dict | None) -> dict | None:
+    """The gamma read the scan saved (``payload["gamma"]``, ``gex.summary`` shape), or
+    None for a scan saved before 2026-10-17 or one whose chain had nothing usable.
+    Readers never work gamma out again."""
+    return gex.summary_from_json((payload or {}).get("gamma"))
 
 
 def gamma_lines(summary: dict | None) -> list[str]:
     """Telegram (HTML) lines for the gamma read. ``summary`` comes from ``gex.summary``."""
     if not summary:
-        return ["🧱 <b>GAMMA</b> — no chain snapshot with usable open interest yet"]
+        return ["🧱 <b>GAMMA</b> — not saved in this scan"]
     d = datetime.strptime(summary["expiry"], "%Y-%m-%d")
     net = float(summary["net"])
     regime = ("positive: dealer hedging tends to dampen moves" if net >= 0
@@ -121,7 +113,7 @@ def gamma_lines(summary: dict | None) -> list[str]:
         lines.append(f"First negative strike below spot: "
                      f"<b>${summary['first_negative_below_spot']:g}</b>")
     as_of = summary["as_of"].astimezone(ET)
-    lines.append(f"<i>dollars of hedging per $1 move · snapshot {as_of:%a %b %d %H:%M ET}</i>")
+    lines.append(f"<i>dollars of hedging per $1 move · from the {as_of:%a %b %d %H:%M ET} scan</i>")
     return lines
 
 
@@ -182,8 +174,7 @@ def report_lines(payload: dict, ticker: str, *, plan: bool = True, gamma: bool =
                  compact: bool = False) -> tuple[list[str], list[str]]:
     """(game plan lines, gamma lines) for a scan message. Either list is empty when it was
     not asked for or could not be built; the reason is not hidden: the caller logs it."""
-    summary = (gamma_summary_for(ticker, payload.get("spot"), today=now.date() if now else None)
-               if (plan or gamma) else None)
+    summary = saved_gamma(payload) if (plan or gamma) else None
     plan_out = (game_plan.plan_lines(plan_from_archive(payload, ticker, gamma=summary, now=now),
                                      compact=compact)
                 if plan else [])

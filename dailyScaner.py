@@ -947,6 +947,7 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
         ),
         "chain_volume_rollover": bool(chain_volume_rollover),
         "best_value": best_value,
+        "gamma": _gamma_snapshot(calls_all, puts_all, spot, ts_aware),
         "spot": spot,
         "or_data": or_data,        # dashboard: OR band + breakout state per run
         "direction": direction,    # dashboard: scanner's direction verdict per run
@@ -987,6 +988,24 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
         json.dump(payload, f, indent=2)
 
     return fname, fname.replace(".json", ".txt")
+
+def _gamma_snapshot(calls_all, puts_all, spot, ts):
+    """The gamma read (``gex.summary``: nearest live expiry, walls, support / resistance,
+    every strike) from this scan's own chain, saved in the archive as ``gamma`` so the
+    Telegram message, the gamma alert, the Game Plan and the app all show the same walls.
+    None when the chain has nothing usable. Never raises into the scan."""
+    try:
+        import gex
+        import volume_history
+        frame = volume_history.chain_frame(calls_all, puts_all)
+        if frame.empty or not spot:
+            return None
+        return gex.summary_to_json(gex.summary(frame, spot=float(spot), as_of=ts,
+                                               today=ts.date()))
+    except Exception as exc:
+        log.warning(f"gamma snapshot failed (scan continues): {exc}")
+        return None
+
 
 def _record_volume_history(fname_json, calls_all, puts_all, *, source_name, force=False):
     """Store every traded contract of this scan. Never raises into the scan."""

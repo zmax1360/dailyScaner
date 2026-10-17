@@ -649,7 +649,7 @@ def test_game_plan_section_takes_its_price_from_live_bars():
     src = (ROOT / "ui" / "pages" / "flow.py").read_text()
     block = src[src.index('if "game_plan" in sections:'):src.index('if "header" in sections:')]
     assert "live_session_snapshot(_cached_vwap_chart_df(ticker, \"5M\"))" in block
-    assert "spot=plan_price" in block and "gamma_summary_for(ticker, plan_price)" in block
+    assert "spot=plan_price" in block and "gamma=saved_gamma(curr)" in block
     assert 'live.get("high", day_high)' in block and 'live.get("low", day_low)' in block
 
 

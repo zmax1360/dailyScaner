@@ -24,7 +24,7 @@ them. Changes since then: `docs/changelog.md`.
    default), computes per-timeframe indicators (`analyze_tf`, incl. 15M EMA 9/21/50 and
    `htf_trend.describe` for 1H/4H), and writes:
    - `archive/{TICKER}_{YYYYMMDD}_{HHMMSS}.json`: spot, session, timeframes, raw option
-     volume (`volume.top_calls/top_puts`), and a Best Value snapshot (`best_value.rows`).
+     volume (`volume.top_calls/top_puts`), a Best Value snapshot (`best_value.rows`) and the gamma read (`gamma`).
    - SQLite attribution rows (`_log_scan_attribution` → `attribution.log_run`).
    - volume history (`volume_history.record_scan`, at most every 15 min).
 3. After a successful scan, `scheduler._notify_success` formats the archive
@@ -32,7 +32,7 @@ them. Changes since then: `docs/changelog.md`.
    via `plan_report`) and sends it to the ticker's chat (`ticker_chat_id`,
    `ticker_bot_token`: `TELEGRAM_*_<TICKER>` in `.env`, else the shared ones).
 4. Then `scheduler._gamma_shift_check` compares the nearest expiry's call / put wall
-   (`plan_report.gamma_summary_for`) with the last ones seen today
+   (the scan's saved `payload["gamma"]`, `plan_report.saved_gamma`) with the last ones seen today
    (`gamma_shift.update`, `data/gamma_walls.json`) and sends a short alert when one
    moved to another strike (`"gamma_alert": false` per ticker turns it off).
 

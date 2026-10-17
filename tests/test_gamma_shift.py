@@ -137,7 +137,7 @@ EVENT = [{"key": "call_wall", "label": "Call wall", "old": 345.0, "new": 342.5,
 def _check(events, *, send):
     summary = _s("10:30", 342.5, {342.5: 2e6, 345.0: 1e6})
     with patch("telegram_bot._load_latest", return_value=({"spot": 343.2}, None)), \
-         patch("plan_report.gamma_summary_for", return_value=summary), \
+         patch("plan_report.saved_gamma", return_value=summary), \
          patch("gamma_shift.update", return_value=events) as upd, \
          patch.object(sched, "_send_telegram", return_value=True) as send_tg:
         sched._gamma_shift_check("AAPL", ENV, send=send)

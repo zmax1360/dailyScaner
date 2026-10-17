@@ -13,7 +13,7 @@ from chart_indicators import add_indicators, last_session
 from pov_leakage import OVER_PARTICIPATION_THRESH, compute_pov_metrics
 from ui.common import ET
 from ui.context import ScanContext
-from ui.gamma_data import gamma_levels, gamma_summary_for
+from ui.gamma_data import gamma_levels, saved_gamma
 from ui.widgets import _choice_control
 from volume_analysis import CHART_TIMEFRAMES, fetch_intraday_vwap_df
 
@@ -224,7 +224,7 @@ def render(ctx: ScanContext) -> None:
         show_part = st.checkbox("Participation", value=True, key="chart_participation")
         show_gamma = st.checkbox("Gamma levels", value=True, key="chart_gamma",
                                  help="Lines at gamma support, call resistance and the put "
-                                      "wall for the nearest expiry (from the Gamma page).")
+                                      "wall for the nearest expiry, as saved by the scan.")
         show_move = st.checkbox("Expected move", value=True, key="chart_expected_move",
                                 help="The range option prices imply for the two nearest "
                                      "expiries: the at-the-money straddle, set at the "
@@ -234,7 +234,7 @@ def render(ctx: ScanContext) -> None:
     if df.empty:
         st.caption(f"{timeframe} chart unavailable right now.")
         return
-    levels = gamma_levels(gamma_summary_for(ticker, ctx.spot)) if show_gamma else []
+    levels = gamma_levels(saved_gamma(ctx.curr)) if show_gamma else []
     gamma_count = len(levels)
     moves = _cached_moves(ticker, _today().isoformat()) if show_move else []
     levels = levels + expected_move.chart_levels(moves)
