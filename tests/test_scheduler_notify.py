@@ -50,7 +50,7 @@ def test_scan_message_goes_to_the_tickers_chat(monkeypatch):
     import telegram_bot
     sent = []
     monkeypatch.setattr(scheduler, "_send_telegram",
-                        lambda token, chat, text: sent.append(chat) or tokens.append(token) or True)
+                        lambda token, chat, text, **k: sent.append(chat) or tokens.append(token) or True)
     tokens = []
     monkeypatch.setattr(telegram_bot, "_load_latest", lambda t: ({"spot": 1.0}, None))
     monkeypatch.setattr(telegram_bot, "_fmt_report", lambda *a, **k: "report")

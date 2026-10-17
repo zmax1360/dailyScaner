@@ -1,4 +1,5 @@
-"""Settings page — manual scan, flow filters and Telegram push."""
+"""Settings page, in three tabs: Settings (manual scan, filters), Telegram (routes, recent
+sends, manual push) and Scheduler (background jobs)."""
 
 from __future__ import annotations
 
@@ -6,7 +7,7 @@ from datetime import datetime
 import glob
 import json
 
-from ui import scheduler_panel, settings_store, shell
+from ui import scheduler_panel, settings_store, shell, telegram_panel
 from ui.archives import _latest_archive_stamp
 from ui.services import _discover_tickers
 from ui.services import _run_daily_scanner
@@ -25,55 +26,60 @@ def render(cfg: dict) -> None:
     """Settings page: manual scan, flow filters, Telegram push (formerly the sidebar)."""
     focus_ticker = cfg["ticker"]
     st.subheader("Settings")
+    tab_main, tab_tg, tab_sched = st.tabs(["⚙️ Settings", "📨 Telegram", "⏱️ Scheduler"])
 
-    # ── Manual scan for focus ticker ──────────────────────────────────
-    st.markdown(f"**Daily scan — {focus_ticker}**")
-    run_scan = st.button(
-        f"🚀 Run Scan for {focus_ticker}",
-        use_container_width=True,
-        type="primary",
-        help=f"Runs dailyScaner.py {focus_ticker} and saves a new archive JSON",
-    )
+    with tab_main:
 
-    if run_scan:
-        with st.spinner(f"Scanning {focus_ticker}… (may take a few minutes)"):
-            ok, output = _run_daily_scanner(focus_ticker)
-        if ok:
-            st.success(f"{focus_ticker} scan complete — archive updated.")
-            _scan_archive_metadata.clear()
-            stamp = _latest_archive_stamp(focus_ticker)
-            if stamp:
-                st.session_state[f"_last_seen_archive_{focus_ticker}"] = stamp
-            st.rerun()
-        else:
-            st.error(f"{focus_ticker} scanner returned an error.")
-        with st.expander("Scanner output", expanded=not ok):
-            st.code(output[-4000:], language="text")
+        # ── Manual scan for focus ticker ──────────────────────────────────
+        st.markdown(f"**Daily scan — {focus_ticker}**")
+        run_scan = st.button(
+            f"🚀 Run Scan for {focus_ticker}",
+            use_container_width=True,
+            type="primary",
+            help=f"Runs dailyScaner.py {focus_ticker} and saves a new archive JSON",
+        )
 
-    st.divider()
-    st.markdown("**Flow filters**")
-    top_n = shell.render_flow_filters(st, _choice_control)["top_n"]
+        if run_scan:
+            with st.spinner(f"Scanning {focus_ticker}… (may take a few minutes)"):
+                ok, output = _run_daily_scanner(focus_ticker)
+            if ok:
+                st.success(f"{focus_ticker} scan complete — archive updated.")
+                _scan_archive_metadata.clear()
+                stamp = _latest_archive_stamp(focus_ticker)
+                if stamp:
+                    st.session_state[f"_last_seen_archive_{focus_ticker}"] = stamp
+                st.rerun()
+            else:
+                st.error(f"{focus_ticker} scanner returned an error.")
+            with st.expander("Scanner output", expanded=not ok):
+                st.code(output[-4000:], language="text")
 
-    st.divider()
-    st.markdown("**Best Value**")
-    shell.render_best_value_settings(st)
+        st.divider()
+        st.markdown("**Flow filters**")
+        top_n = shell.render_flow_filters(st, _choice_control)["top_n"]
 
-    st.divider()
-    st.markdown("**Game plan**")
-    shell.render_game_plan_settings(st)
+        st.divider()
+        st.markdown("**Best Value**")
+        shell.render_best_value_settings(st)
 
-    shell.save_if_changed(st, settings_store.save)
-    st.caption("Settings are saved automatically and restored the next time the app starts.")
+        st.divider()
+        st.markdown("**Game plan**")
+        shell.render_game_plan_settings(st)
 
-    st.divider()
-    scheduler_panel.render()
+        shell.save_if_changed(st, settings_store.save)
+        st.caption("Settings are saved automatically and restored the next time the app starts.")
 
-    # ── Telegram push ─────────────────────────────────────────────────
-    with st.expander("📨 Telegram", expanded=False):
+    with tab_sched:
+        scheduler_panel.render(boxed=False)
+
+    with tab_tg:
+        telegram_panel.render_status()
+        st.divider()
+        st.markdown("**Send a scan now**")
         tg_token, tg_chat = _load_telegram_config()
         configured = bool(tg_token and tg_chat)
         if configured:
-            st.success("@zeuseaibot connected ✓", icon="✅")
+            st.success("Shared bot connected ✓", icon="✅")
         else:
             st.warning("Not configured — add keys to `.env`")
             st.code(
@@ -184,7 +190,8 @@ def render(cfg: dict) -> None:
                       if inc_plan else None),
             )
             own_token, own_chat = _load_telegram_config(tg_ticker)
-            ok, err = _send_telegram(own_token or tg_token, own_chat or tg_chat, msg)
+            ok, err = _send_telegram(own_token or tg_token, own_chat or tg_chat, msg,
+                                     ticker=tg_ticker)
             if ok:
                 st.success("Sent ✈️")
             else:

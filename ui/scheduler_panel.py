@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pandas as pd
 import streamlit as st
 
 import jobs_status as js
 
 
-def render() -> None:
-    with st.expander("⏱️ Scheduler & background jobs", expanded=False):
+def render(boxed: bool = True) -> None:
+    """``boxed`` puts it in a collapsed expander; Settings' Scheduler tab shows it open."""
+    box = (st.expander("⏱️ Scheduler & background jobs", expanded=False) if boxed
+           else contextlib.nullcontext())
+    with box:
         rows = js.jobs()
         sched = next((r for r in rows if r["label"] == js.SCHEDULER_LABEL), None)
         if sched and sched["running"]:

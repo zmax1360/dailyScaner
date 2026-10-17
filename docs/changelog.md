@@ -6,6 +6,14 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-16
 
+- **Settings in three tabs: Settings, Telegram, Scheduler** (`ui/telegram_panel.py`,
+  `telegram_log.py`). Every Telegram send (scan message, gamma alert, scanner-stopped
+  alert, the app's manual push) is recorded in `data/telegram_sent.jsonl`: when, ticker,
+  kind, sent / failed with Telegram's own reason ("chat not found"), bot id, chat (last
+  4 digits) and the start of the text; never the token. The Telegram tab shows each
+  ticker's route and last send, the last 30 sends with their text, a button that asks
+  Telegram which bot each ticker uses, and the manual push. The scheduler log now
+  carries Telegram's reason instead of a bare "400 Bad Request".
 - **Telegram: gamma-shift alert** (`gamma_shift.py`, `scheduler._gamma_shift_check`).
   After each scan, when the nearest expiry's call wall or put wall moves to another
   strike, a short message says from where to where, both strikes' gamma now, and the

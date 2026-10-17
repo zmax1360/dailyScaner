@@ -181,26 +181,52 @@ def _reset_refusal_streak(ticker: str) -> None:
     _refusal_alert_sent[ticker] = False
 
 
-def _send_telegram(token: str, chat_id: str, text: str) -> bool:
+def _send_telegram(token: str, chat_id: str, text: str, *, ticker: str = "",
+                   kind: str = "scan") -> bool:
+    """Send ``text`` (HTML); on HTTP 400 resend it as plain text. Every attempt is
+    recorded for Settings → Telegram (``telegram_log``), with Telegram's reason when
+    it fails. Returns True when Telegram accepted the message."""
     url  = f"https://api.telegram.org/bot{token}/sendMessage"
     body = urllib.parse.urlencode({
         "chat_id": chat_id, "text": text, "parse_mode": "HTML",
     }).encode()
+    ok, error, plain = False, "", False
     try:
         req = urllib.request.Request(url, data=body, method="POST")
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status == 200
+            ok = resp.status == 200
+            error = "" if ok else f"HTTP {resp.status}"
     except urllib.error.HTTPError as exc:
+        error = f"HTTP {exc.code}: {_http_reason(exc)}"
         if exc.code != 400:
-            log.warning(f"Telegram notify failed: {exc}")
-            return False
-        # 400 is almost always HTML Telegram cannot parse. Send the same text as plain
-        # text rather than losing the message.
-        log.warning(f"Telegram notify failed: {exc} — resending as plain text")
-        return _send_plain(url, chat_id, text)
+            log.warning(f"Telegram notify failed: {error}")
+        else:
+            # 400 is almost always HTML Telegram cannot parse. Send the same text as
+            # plain text rather than losing the message.
+            log.warning(f"Telegram notify failed: {error} — resending as plain text")
+            plain = True
+            ok, plain_error = _send_plain(url, chat_id, text)
+            error = f"{error} · plain-text resend: {plain_error}" if not ok else error
     except Exception as exc:
+        error = str(exc)
         log.warning(f"Telegram notify failed: {exc}")
-        return False
+    try:
+        import telegram_log
+        telegram_log.record(ticker=ticker, kind=kind, ok=ok, token=token,
+                            chat_id=chat_id, text=text, error=error,
+                            plain_fallback=plain and ok)
+    except Exception as exc:                       # the record must never stop a send
+        log.warning(f"telegram_log: {exc}")
+    return ok
+
+
+def _http_reason(exc: Exception) -> str:
+    """Telegram's reason from an HTTPError ('Bad Request: chat not found')."""
+    import telegram_log
+    try:
+        return telegram_log.telegram_reason(exc.read().decode(errors="replace"))
+    except Exception:
+        return str(exc)
 
 
 def plain_text(text: str) -> str:
@@ -210,15 +236,19 @@ def plain_text(text: str) -> str:
     return _html.unescape(re.sub(r"</?(?:b|i|u|s|code|pre)>", "", text))
 
 
-def _send_plain(url: str, chat_id: str, text: str) -> bool:
+def _send_plain(url: str, chat_id: str, text: str) -> tuple[bool, str]:
     body = urllib.parse.urlencode({"chat_id": chat_id, "text": plain_text(text)}).encode()
     try:
         req = urllib.request.Request(url, data=body, method="POST")
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status == 200
+            return resp.status == 200, ""
+    except urllib.error.HTTPError as exc:
+        reason = f"HTTP {exc.code}: {_http_reason(exc)}"
+        log.warning(f"Telegram plain-text resend failed: {reason}")
+        return False, reason
     except Exception as exc:
         log.warning(f"Telegram plain-text resend failed: {exc}")
-        return False
+        return False, str(exc)
 
 
 def ticker_chat_id(env: dict, ticker: str, cfg: dict | None = None) -> str:
@@ -286,7 +316,7 @@ def _notify_success(ticker: str, env: dict, elapsed: float) -> None:
         if not text or not text.strip():
             log.info(f"[{ticker}] notify skipped (empty report after gates)")
             return
-        ok = _send_telegram(token, chat_id, text)
+        ok = _send_telegram(token, chat_id, text, ticker=ticker, kind="scan")
         if ok:
             log.info(
                 f"[{ticker}] notify sent "
@@ -323,7 +353,8 @@ def _gamma_shift_check(ticker: str, env: dict, *, send: bool) -> None:
         chat_id = ticker_chat_id(env, ticker, load_config())
         if not send or not token or not chat_id:
             return
-        if _send_telegram(token, chat_id, gamma_shift.message(ticker, events, summary)):
+        if _send_telegram(token, chat_id, gamma_shift.message(ticker, events, summary),
+                          ticker=ticker, kind="gamma_shift"):
             log.info(f"[{ticker}] gamma shift alert sent")
         else:
             log.warning(f"[{ticker}] gamma shift alert failed")
@@ -348,7 +379,7 @@ def _notify_refusal_streak(ticker: str, reason: str | None, env: dict) -> None:
         f"No Best Value alerts until a scan succeeds.\n"
         f"<i>{now_et}</i>"
     )
-    if _send_telegram(token, chat_id, text):
+    if _send_telegram(token, chat_id, text, ticker=ticker, kind="refusal"):
         log.info(f"[{ticker}] refusal-streak notify sent (reason={why})")
     else:
         log.warning(f"[{ticker}] refusal-streak notify failed")

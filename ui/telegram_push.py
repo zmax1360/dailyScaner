@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import os
+import urllib.error
+import urllib.parse
 import urllib.request
 
 from ui.services import _SCANNER_DIR
@@ -43,12 +45,41 @@ def _load_telegram_config(ticker: str | None = None) -> tuple[str | None, str | 
             own or env.get("TELEGRAM_CHAT_ID") or None)
 
 
-def _send_telegram(token: str, chat_id: str, text: str) -> tuple[bool, str]:
+def _send_telegram(token: str, chat_id: str, text: str,
+                   ticker: str = "") -> tuple[bool, str]:
     """
     POST a message to Telegram via the Bot API.
     Uses only stdlib urllib — no extra dependencies.
-    Returns (success, error_message).
+    Returns (success, error_message). Recorded for Settings → Telegram.
     """
+    ok, err = _post(token, chat_id, text)
+    try:
+        import telegram_log
+        telegram_log.record(ticker=ticker, kind="manual", ok=ok, token=token,
+                            chat_id=chat_id, text=text, error=err, source="app")
+    except Exception:
+        pass
+    return ok, err
+
+
+def bot_username(token: str | None) -> tuple[bool, str]:
+    """(True, '@name') for the bot behind ``token`` (Telegram getMe), else (False, why)."""
+    if not token:
+        return False, "no token in .env"
+    import json
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getMe",
+                                    timeout=10) as resp:
+            data = json.load(resp)
+        return True, "@" + str((data.get("result") or {}).get("username") or "?")
+    except urllib.error.HTTPError as e:
+        import telegram_log
+        return False, f"HTTP {e.code}: {telegram_log.telegram_reason(e.read().decode(errors='replace'))}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _post(token: str, chat_id: str, text: str) -> tuple[bool, str]:
     url  = f"https://api.telegram.org/bot{token}/sendMessage"
     body = urllib.parse.urlencode({
         "chat_id":    chat_id,
@@ -60,7 +91,8 @@ def _send_telegram(token: str, chat_id: str, text: str) -> tuple[bool, str]:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200, ""
     except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")
+        import telegram_log
+        detail = telegram_log.telegram_reason(e.read().decode(errors="replace"))
         return False, f"HTTP {e.code}: {detail}"
     except Exception as exc:
         return False, str(exc)
