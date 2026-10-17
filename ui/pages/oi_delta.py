@@ -57,6 +57,11 @@ def profile_figure(prof: pd.DataFrame, *, spot: float | None):
     return fig
 
 
+def chart_rows(table: pd.DataFrame) -> pd.DataFrame:
+    """Rows the chart draws: everything except suspect (⚠) rows."""
+    return table[~table["suspect"].astype(bool)]
+
+
 def render(cfg: dict) -> None:
     ticker = str(cfg.get("ticker") or "").upper()
     spot = (cfg.get("latest_archive") or {}).get("spot")
@@ -84,16 +89,16 @@ def render(cfg: dict) -> None:
     shown = od.filtered(table, spot=spot, max_dte=max_dte, band_pct=band, min_change=min_change)
     h = od.headline(od.filtered(table, spot=spot, max_dte=max_dte, band_pct=band))
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Trading day", _fmt_day(meta["previous"]),
               help=f"OI reported on {_fmt_day(meta['session'])} counts positions after the "
                    f"{_fmt_day(meta['previous'])} session.")
     m2.metric("Call OI change", _num(h["call_change"]) or "—")
     m3.metric("Put OI change", _num(h["put_change"]) or "—")
-    tc, tp = h["top_call"], h["top_put"]
-    m4.metric("Largest adds", " · ".join(
-        f"{lbl} ${t['strike']:g} {_fmt_day(t['expiry'])} {t['oi_change']:+,.0f}"
-        for lbl, t in (("C", tc), ("P", tp)) if t) or "—")
+    for col, label, t in ((m4, "Largest call add", h["top_call"]),
+                          (m5, "Largest put add", h["top_put"])):
+        col.metric(label, f"${t['strike']:g} {t['oi_change']:+,.0f}" if t else "—",
+                   help=f"Expiry {_fmt_day(t['expiry'])}." if t else None)
     st.caption(f"{h['contracts']} contracts matched on both days within {max_dte} days and "
                f"{band}% of spot. A contract that did not trade on one of the two days was "
                "not recorded that day and is left out."
@@ -105,8 +110,10 @@ def render(cfg: dict) -> None:
         st.caption("No change at or above the size shown.")
         return
 
-    st.plotly_chart(profile_figure(od.by_strike(shown), spot=spot), use_container_width=True,
-                    config={"displayModeBar": False})
+    # Suspect rows (⚠) stay in the table but not in the chart: one impossible reading
+    # would set the scale for every real bar.
+    st.plotly_chart(profile_figure(od.by_strike(chart_rows(shown)), spot=spot),
+                    use_container_width=True, config={"displayModeBar": False})
 
     view = shown.head(40).copy()
     view["expiry"] = [_fmt_day(str(e)[:10]) for e in view["expiry"]]

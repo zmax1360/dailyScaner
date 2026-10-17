@@ -103,3 +103,12 @@ def test_by_strike_sums_sides_and_keeps_unknown_as_nan():
 def test_menu_has_the_page():
     from ui import shell
     assert {e.id: e.title for e in shell.entries()}["oi_delta"] == "OI Change"
+
+
+
+def test_page_chart_leaves_suspect_rows_out():
+    from ui.pages import oi_delta as page
+    t, _ = od.change_table(_daily())
+    rows = page.chart_rows(t)
+    assert not rows["suspect"].any() and len(rows) == len(t) - 1
+    assert 350.0 not in set(rows["strike"])          # the impossible -4000 is not drawn

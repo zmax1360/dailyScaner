@@ -6,6 +6,8 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- OI Change page: suspect (⚠) rows are left off the chart (kept in the table), and the
+  largest call and put adds get a card each.
 - **OI Change page** (`oi_delta.py`, `ui/pages/oi_delta.py`, menu Market → OI Change):
   day-over-day open interest change per contract from `volume_history.daily_summary`,
   labelled with the trading day that caused it; change ÷ that day's volume; a change
