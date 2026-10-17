@@ -648,3 +648,82 @@ def trade_lines(trade: TradePlan | None) -> list[str]:
         out.append(f"Reward to risk from here: <b>{trade.reward_to_risk:.1f}</b> "
                    f"(needs {trade.min_reward_to_risk:g})")
     return out
+
+
+# ── the plan the scan saved (archive ``game_plan``) ─────────────────────────────
+
+def _jsonable(v: Any) -> Any:
+    if isinstance(v, datetime):
+        return v.isoformat()
+    if hasattr(v, "item"):                       # numpy scalar
+        return v.item()
+    if isinstance(v, (pd.Timestamp,)):
+        return v.isoformat()
+    return str(v)
+
+
+def plan_to_json(plan: Plan) -> dict[str, Any]:
+    """``plan`` in a JSON-safe shape for the scan archive."""
+    import dataclasses
+    import json
+    return json.loads(json.dumps(dataclasses.asdict(plan), default=_jsonable))
+
+
+def _level(d: Any) -> Level | None:
+    return Level(**d) if isinstance(d, dict) else None
+
+
+def plan_from_json(d: Any) -> Plan | None:
+    """Back from ``plan_to_json``; None for a missing or unreadable block."""
+    if not isinstance(d, dict) or not d.get("side"):
+        return None
+    try:
+        t = d.get("trade")
+        trade = None
+        if isinstance(t, dict):
+            trade = TradePlan(**{**t, "better_entry": _level(t.get("better_entry")),
+                                 "targets": tuple(Target(**x) for x in t.get("targets") or []),
+                                 "notes": tuple(t.get("notes") or ()),
+                                 "cautions": tuple(t.get("cautions") or ())})
+        as_of = d.get("as_of")
+        return Plan(**{**d,
+                       "as_of": datetime.fromisoformat(as_of) if as_of else None,
+                       "levels": tuple(Level(**x) for x in d.get("levels") or []),
+                       "candidates": tuple(Candidate(**x) for x in d.get("candidates") or []),
+                       "expect": tuple(d.get("expect") or ()),
+                       "changes": tuple(d.get("changes") or ()),
+                       "missing": tuple(d.get("missing") or ()),
+                       "trade": trade})
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def live_lines(plan: Plan, price: Any, vwap: Any = None) -> list[str]:
+    """How the live price stands against the saved plan. Never changes the plan: it
+    says where price is now relative to the scan's entry limit, stop and VWAP."""
+    px = _f(price)
+    if px is None:
+        return []
+    out = []
+    if plan.spot is not None:
+        out.append(f"Price {_usd(px)} now, {_usd(plan.spot)} at the scan "
+                   f"({px - plan.spot:+.2f}).")
+    tr = plan.trade
+    calls = plan.side == CALLS
+    if not plan.hold and plan.side in (CALLS, PUTS) and tr is not None and tr.ready:
+        if tr.stop is not None and ((calls and px <= tr.stop) or (not calls and px >= tr.stop)):
+            out.append(f"Past the stop {_usd(tr.stop)}: this plan no longer holds; wait for "
+                       "the next scan.")
+        elif tr.entry_limit is not None:
+            inside = px <= tr.entry_limit if calls else px >= tr.entry_limit
+            word = "at or below" if calls else "at or above"
+            out.append(f"Inside the entry zone ({word} {_usd(tr.entry_limit)})." if inside
+                       else f"Outside the entry zone ({word} {_usd(tr.entry_limit)}): "
+                            "wait for price to come back.")
+    v = _f(vwap)
+    if v is not None and plan.side in (CALLS, PUTS) and not plan.hold:
+        if calls and px < v:
+            out.append(f"Below VWAP {_usd(v)} now: calls are not allowed until it reclaims.")
+        elif not calls and px > v:
+            out.append(f"Above VWAP {_usd(v)} now: puts are not allowed until it loses it.")
+    return out

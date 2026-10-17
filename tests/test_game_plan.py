@@ -509,16 +509,16 @@ def test_scan_message_carries_the_plan_first_when_asked():
     assert len(msg) < 4096
 
 
-def test_plan_for_message_builds_from_an_archive_without_vwap():
+def test_plan_for_message_reads_the_saved_plan():
     import json
 
     import ui.telegram_push as tg
 
     payload = json.loads((ROOT / "tests" / "golden" / "AAPL_20260728_095049.json").read_text())
-    plan = tg.plan_for_message(payload, None, "AAPL", gamma=GAMMA)
-    assert plan.ticker == "AAPL" and plan.spot == float(payload["spot"])
-    assert plan.regime == gp.POSITIVE and "VWAP" in plan.missing
-    assert plan.side in (gp.CALLS, gp.PUTS, gp.STAND_ASIDE, gp.UNKNOWN)
+    assert tg.plan_for_message(payload) is None                 # saved before 2026-10-17
+    payload["game_plan"] = gp.plan_to_json(_plan(trend=BULL))
+    plan = tg.plan_for_message(payload)
+    assert plan.ticker == "AAPL" and plan.side in (gp.CALLS, gp.PUTS, gp.STAND_ASIDE, gp.UNKNOWN)
 
 
 # ── view ────────────────────────────────────────────────────────────────────
@@ -645,12 +645,12 @@ def test_view_caption_says_where_the_price_came_from():
     assert any("Price from the Mon Oct 05 09:45 5-minute bar." in c.value for c in at.caption)
 
 
-def test_game_plan_section_takes_its_price_from_live_bars():
+def test_game_plan_section_shows_the_saved_plan_and_live_price_apart():
     src = (ROOT / "ui" / "pages" / "flow.py").read_text()
     block = src[src.index('if "game_plan" in sections:'):src.index('if "header" in sections:')]
+    assert "plan_report.saved_plan(curr)" in block and "build_plan(" not in block
     assert "live_session_snapshot(_cached_vwap_chart_df(ticker, \"5M\"))" in block
-    assert "spot=plan_price" in block and "gamma=saved_gamma(curr)" in block
-    assert 'live.get("high", day_high)' in block and 'live.get("low", day_low)' in block
+    assert 'game_plan.live_lines(saved, live["price"], vwap_px)' in block
 
 
 # ── scanner side, conflict and the entry window ─────────────────────────────

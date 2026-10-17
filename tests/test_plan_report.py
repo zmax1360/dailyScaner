@@ -74,6 +74,7 @@ def snapshot(tmp_path, monkeypatch, payload):
     payload["gamma"] = gex.summary_to_json(gex.summary(
         vh.latest_scan("AAPL", db_path=db), spot=333.5,
         as_of=datetime(2026, 10, 2, 16, 5, tzinfo=ET), today=NOW.date()))
+    payload["game_plan"] = plan_report.build_saved_plan(payload, "AAPL", now=NOW)
     return db
 
 
@@ -96,7 +97,7 @@ def test_plan_from_archive_uses_the_archive_only(payload, snapshot):
     assert plan.candidate_for("0DTE").pick["dte"] == 0
     assert "VWAP" in plan.missing                                     # not stored in archives
     assert plan.trade is not None and plan.trade.better_entry.name == "15-minute EMA 21"
-    assert plan.price_note == "Price is the one recorded by the scan."
+    assert plan.price_note == "Price, VWAP and gamma are the ones recorded by the scan."
 
 
 def test_saved_settings_are_read_and_validated(tmp_path):
@@ -258,6 +259,7 @@ def test_plan_from_archive_holds_on_conflict_and_outside_the_window(payload, sna
     assert plan.hold == gp.HOLD_CONFLICT and plan.trade is None
     late = plan_report.plan_from_archive(payload, "AAPL", now=NOW.replace(hour=15, minute=10))
     assert late.hold == gp.HOLD_WINDOW
+    payload["game_plan"] = plan_report.build_saved_plan(payload, "AAPL", now=NOW)
     lines, _ = plan_report.report_lines(payload, "AAPL", now=NOW)
     assert any(x.startswith("⛔ Conflict") for x in lines)
 
@@ -278,5 +280,70 @@ def test_no_reader_works_gamma_out_again():
                     and isinstance(node.func.value, ast.Name)
                     and node.func.value.id in {"gex", "vh", "volume_history"}
                     and node.func.attr in banned):
+                found.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+    assert found == []
+
+
+# ── the plan is built once, by the scan ─────────────────────────────────────
+
+def test_saved_plan_round_trips_exactly(payload, snapshot):
+    built = plan_report.plan_from_archive(payload, "AAPL", gamma=plan_report.saved_gamma(payload),
+                                          now=NOW)
+    back = gp.plan_from_json(json.loads(json.dumps(gp.plan_to_json(built))))
+    assert back == built
+    assert gp.plan_lines(back) == gp.plan_lines(built)
+
+
+def test_saved_plan_uses_the_scans_vwap(payload, snapshot):
+    payload["vwap"] = {"VWAP": 334.0, "VWAP_State": "TRENDING BELOW", "VWAP_warning": None}
+    plan = plan_report.plan_from_archive(payload, "AAPL", gamma=plan_report.saved_gamma(payload),
+                                         now=NOW)
+    assert plan.hold == gp.HOLD_VWAP and "VWAP" not in plan.missing      # 333.5 < VWAP: no calls
+
+
+def test_readers_show_the_saved_plan_and_never_build_one(payload, snapshot, monkeypatch):
+    import ui.telegram_push as tp
+    monkeypatch.setattr(gp, "build_plan", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("a reader built a plan")))
+    lines, _ = plan_report.report_lines(payload, "AAPL", now=NOW)
+    assert lines[0] == "🎯 <b>GAME PLAN · AAPL</b>"
+    assert tp.plan_for_message(payload).side == gp.CALLS
+    assert plan_report.saved_plan({}) is None and tp.plan_for_message({}) is None
+    old = {k: v for k, v in payload.items() if k != "game_plan"}
+    assert plan_report.report_lines(old, "AAPL", gamma=False, now=NOW)[0] == [
+        plan_report.NO_PLAN_LINE]
+
+
+def test_saved_plan_is_marked_stale_when_read_late(payload, snapshot):
+    assert not plan_report.saved_plan(payload, now=NOW).stale
+    assert plan_report.saved_plan(payload, now=NOW.replace(day=5, hour=12)).stale
+
+
+def test_live_lines_compare_price_with_the_saved_plan(payload, snapshot):
+    plan = plan_report.saved_plan(payload, now=NOW)
+    tr = plan.trade
+    inside = gp.live_lines(plan, tr.entry_limit - 0.01)
+    assert any("Inside the entry zone" in x for x in inside)
+    assert any("Outside the entry zone" in x for x in gp.live_lines(plan, tr.entry_limit + 0.5))
+    assert any("Past the stop" in x for x in gp.live_lines(plan, tr.stop - 0.01))
+    assert any("Below VWAP" in x for x in gp.live_lines(plan, 333.0, vwap=333.2))
+    assert gp.live_lines(plan, None) == []
+
+
+def test_no_reader_builds_a_plan():
+    """Only the scan builds the Game Plan (dailyScaner._plan_snapshot →
+    plan_report.build_saved_plan). Readers call saved_plan."""
+    import ast
+    readers = [ROOT / "telegram_bot.py", ROOT / "scheduler.py",
+               *sorted((ROOT / "ui").rglob("*.py"))]
+    banned = {"build_plan", "plan_from_archive", "build_saved_plan", "build_trade_plan"}
+    found = []
+    for path in readers:
+        for node in ast.walk(ast.parse(path.read_text())):
+            name = (node.func.attr if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute) else
+                    node.func.id if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name) else None)
+            if name in banned:
                 found.append(f"{path.relative_to(ROOT)}:{node.lineno}")
     assert found == []

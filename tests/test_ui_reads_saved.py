@@ -105,7 +105,14 @@ def test_settings_send_shows_the_saved_top_pick(no_scoring):
 
 def test_settings_plan_candidates_are_the_saved_rows(no_scoring):
     import ui.telegram_push as tg
-    plan = tg.plan_for_message(_payload(), None, "AAPL")
+    import plan_report
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    p = _payload()
+    assert tg.plan_for_message(p) is None                      # no plan saved
+    p["game_plan"] = plan_report.build_saved_plan(
+        p, "AAPL", now=datetime(2026, 10, 16, 11, 0, tzinfo=ZoneInfo("America/New_York")))
+    plan = tg.plan_for_message(p)
     assert plan is not None
 
 

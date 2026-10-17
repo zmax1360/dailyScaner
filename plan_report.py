@@ -146,8 +146,9 @@ def plan_from_archive(payload: dict, ticker: str, *, gamma: dict | None = None,
                       now: datetime | None = None,
                       settings: dict[str, float] | None = None,
                       archive_dir: str | None = None) -> game_plan.Plan:
-    """The Game Plan for one scan archive. VWAP is not stored in the archive, so it is
-    left out; candidates come from the ranking the scan itself saved."""
+    """Build the Game Plan for one scan. Only the scan calls this (``build_saved_plan``);
+    readers use ``saved_plan``. Everything comes from the scan's own payload: price,
+    the saved ranking, gamma (``payload["gamma"]``) and VWAP (``payload["vwap"]``)."""
     from strategy_engine import ticker_expected_range
 
     spot = float(payload.get("spot") or 0)
@@ -158,15 +159,40 @@ def plan_from_archive(payload: dict, ticker: str, *, gamma: dict | None = None,
         flow=scanner_flow(payload, ticker, archive_dir), now=now,
         ticker=ticker, spot=spot,
         trend=ema_stack.banner_for_archive(payload, now=now),
-        gamma=gamma, vwap=None,
+        gamma=gamma, vwap=(payload.get("vwap") or {}).get("VWAP"),
+        vwap_warning=(payload.get("vwap") or {}).get("VWAP_warning"),
         expected=ticker_expected_range(spot, payload.get("volume") or {}),
         picks=picks_from_archive(payload),
         session_high=session.get("day_high"), session_low=session.get("day_low"),
         stop_buffer_pct=s["stop_buffer_pct"], min_reward_to_risk=s["min_reward_to_risk"],
         emas=((payload.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
-        price_note="Price is the one recorded by the scan.",
+        price_note="Price, VWAP and gamma are the ones recorded by the scan.",
         htf=htf_trend.from_archive(payload),
     )
+
+
+def build_saved_plan(payload: dict, ticker: str, *, now: datetime,
+                     settings: dict[str, float] | None = None,
+                     archive_dir: str | None = None) -> dict | None:
+    """The Game Plan the scan saves (``payload["game_plan"]``). Called by the scan only,
+    after ``payload`` has its timeframes, ranking, gamma and VWAP."""
+    plan = plan_from_archive(payload, ticker, gamma=saved_gamma(payload), now=now,
+                             settings=settings, archive_dir=archive_dir)
+    return game_plan.plan_to_json(plan)
+
+
+def saved_plan(payload: dict | None, now: datetime | None = None) -> game_plan.Plan | None:
+    """The plan the scan saved, or None for a scan saved before 2026-10-17. Only the
+    "stale" flag is set here, from how old the scan is ``now``; the plan is as saved."""
+    import dataclasses
+    plan = game_plan.plan_from_json((payload or {}).get("game_plan"))
+    if plan is None:
+        return None
+    banner = ema_stack.banner_for_archive(payload, now=now or datetime.now(ET))
+    return dataclasses.replace(plan, stale=bool(banner.get("stale")))
+
+
+NO_PLAN_LINE = "🎯 <b>GAME PLAN</b> — not saved in this scan"
 
 
 def report_lines(payload: dict, ticker: str, *, plan: bool = True, gamma: bool = True,
@@ -174,8 +200,8 @@ def report_lines(payload: dict, ticker: str, *, plan: bool = True, gamma: bool =
                  compact: bool = False) -> tuple[list[str], list[str]]:
     """(game plan lines, gamma lines) for a scan message. Either list is empty when it was
     not asked for or could not be built; the reason is not hidden: the caller logs it."""
-    summary = saved_gamma(payload) if (plan or gamma) else None
-    plan_out = (game_plan.plan_lines(plan_from_archive(payload, ticker, gamma=summary, now=now),
-                                     compact=compact)
+    summary = saved_gamma(payload) if gamma else None
+    saved = saved_plan(payload, now) if plan else None
+    plan_out = ((game_plan.plan_lines(saved, compact=compact) if saved else [NO_PLAN_LINE])
                 if plan else [])
     return plan_out, (gamma_lines(summary) if gamma else [])

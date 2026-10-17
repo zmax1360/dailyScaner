@@ -984,6 +984,10 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
     for tf, d in tf_data.items():
         payload["timeframes"][tf] = {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in d.items()}
 
+    # Built last: the plan reads the timeframes, ranking, gamma and VWAP above.
+    payload["vwap"] = _vwap_snapshot()
+    payload["game_plan"] = _plan_snapshot(payload, ts_aware)
+
     with open(fname, "w") as f:
         json.dump(payload, f, indent=2)
 
@@ -1004,6 +1008,32 @@ def _gamma_snapshot(calls_all, puts_all, spot, ts):
                                                today=ts.date()))
     except Exception as exc:
         log.warning(f"gamma snapshot failed (scan continues): {exc}")
+        return None
+
+
+def _vwap_snapshot():
+    """Intraday VWAP state (``volume_analysis.get_intraday_vwap_state``: 5-minute bars,
+    09:30-16:00 ET) at scan time, saved as ``vwap`` so the plan's VWAP rule is the same
+    in Telegram and the app. None when it cannot be read. Never raises."""
+    try:
+        from volume_analysis import get_intraday_vwap_state
+        state = get_intraday_vwap_state(TICKER)
+        if not state or state.get("VWAP") is None:
+            return None
+        return json.loads(json.dumps(state, default=str))
+    except Exception as exc:
+        log.warning(f"VWAP snapshot failed (scan continues): {exc}")
+        return None
+
+
+def _plan_snapshot(payload, ts):
+    """The Game Plan built once from this scan (``plan_report.build_saved_plan``) and
+    saved as ``game_plan``; Telegram and the app show it as saved. Never raises."""
+    try:
+        import plan_report
+        return plan_report.build_saved_plan(payload, TICKER, now=ts)
+    except Exception as exc:
+        log.warning(f"Game Plan snapshot failed (scan continues): {exc}")
         return None
 
 

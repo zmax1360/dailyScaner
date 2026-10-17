@@ -6,6 +6,17 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- **Game Plan built once per scan and saved** (`dailyScaner._plan_snapshot`,
+  `payload["game_plan"]`, `plan_report.saved_plan`). The scan also saves VWAP
+  (`payload["vwap"]`), so the VWAP rule (no calls below VWAP, no puts above) now holds
+  in Telegram too; before, Telegram plans had no VWAP and only the app applied it.
+  Telegram (scheduled, bot, Settings push) and the app show the saved plan; none builds
+  one (`tests/test_plan_report.py::test_no_reader_builds_a_plan`). The app adds a
+  separate **Live now** line from the latest 5-minute bar: price against the scan's
+  entry limit, stop and VWAP; it never changes the plan. Before, the app rebuilt the
+  plan from the live price and current app settings, so it could disagree with the
+  Telegram message for the same scan. Scans saved before this show "not saved in this
+  scan". (Step 2 of 2.)
 - **Gamma worked out once per scan and saved** (`dailyScaner._gamma_snapshot`,
   `payload["gamma"]`, `plan_report.saved_gamma`). The scan computes the gamma read
   (nearest live expiry: net, walls, support / resistance, every strike) from its own
@@ -15,7 +26,7 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
   read the newest database snapshot, saved only every 15 min, so a 5-minute scan's
   message carried gamma up to 10 min older than the scan, and an old scan showed
   today's walls. Scans saved before this show "not saved in this scan". The Gamma page
-  heatmap still reads the 15-minute history. (Step 1 of 2: the Game Plan is next.)
+  heatmap still reads the 15-minute history. (Step 1 of 2.)
 
 ## 2026-10-16
 

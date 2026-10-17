@@ -40,13 +40,10 @@ from ui.market import _market_is_closed
 from ui.market import _rsi_plain
 from ui.market import live_session_snapshot
 from volume_analysis import fetch_intraday_vwap_df
-import ema_stack
-import htf_trend
 import game_plan
-from plan_report import picks_from_archive, scanner_flow
+import plan_report
 import bv_saved
 from ui import game_plan_view, shell
-from ui.gamma_data import saved_gamma
 from ui.components import price_chart
 from ui.context import ScanContext
 from volume_analysis import get_stock_volume_analysis
@@ -2101,32 +2098,20 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
         st.caption(f"Last run: **{ts_et.strftime('%Y-%m-%d %H:%M ET')}**")
 
     if "game_plan" in sections:
-        # The scan's saved ranking: the same rows Telegram and the Best Value page show.
-        picks = picks_from_archive(curr)
-        # The plan's price, session high and session low come from the latest 5-minute
-        # bars, not from the scan: a scan can be many minutes (or a weekend) old, and a
-        # stale price next to a live VWAP puts the stop and targets in the wrong place.
-        live = live_session_snapshot(_cached_vwap_chart_df(ticker, "5M"))
-        if live:
-            plan_price = live["price"]
-            price_note = f"Price from the {live['at']:%a %b %d %H:%M} 5-minute bar."
+        # The plan the scan built and saved: the same one Telegram sent. The live 5-minute
+        # price is shown next to it, never mixed into it.
+        saved = plan_report.saved_plan(curr)
+        if saved is None:
+            st.info("🎯 Game plan: not saved in this scan (scans from 2026-10-17 on carry "
+                    "one). Run a scan from Settings to get one now.")
         else:
-            plan_price = spot
-            price_note = "No live bars: price is the one recorded by the scan."
-        game_plan_view.render(game_plan.build_plan(
-            ticker=ticker, spot=plan_price,
-            trend=ema_stack.banner_for_archive(curr, now=datetime.now(ET)),
-            gamma=saved_gamma(curr),
-            vwap=vwap_px, expected=em_range, picks=picks,
-            session_high=live.get("high", day_high), session_low=live.get("low", day_low),
-            stop_buffer_pct=float(shell.setting(st, "stop_buffer_pct")),
-            min_reward_to_risk=float(shell.setting(st, "min_reward_to_risk")),
-            price_note=price_note,
-            emas=((curr.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
-            flow=scanner_flow(curr, ticker), now=_plan_now(),
-            vwap_warning=vwap_info.get("VWAP_warning"),
-            htf=htf_trend.from_archive(curr),
-        ))
+            game_plan_view.render(saved)
+            live = live_session_snapshot(_cached_vwap_chart_df(ticker, "5M"))
+            if live:
+                lines = game_plan.live_lines(saved, live["price"], vwap_px)
+                if lines:
+                    st.info(f"**Live now** ({live['at']:%a %H:%M} 5-minute bar, not part of "
+                            "the plan): " + " ".join(lines))
 
     if "header" in sections:
         # ══════════════════════════════════════════════════════════════════════════

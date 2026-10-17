@@ -150,8 +150,8 @@ def _format_scan_message(
 
     # ── Session summary ───────────────────────────────────────────────────────
     # ── Game plan (first, because it is the summary) ─────────────────────────
-    if include.get("game_plan") and plan is not None:
-        L.extend(game_plan.plan_lines(plan))
+    if include.get("game_plan"):
+        L.extend(game_plan.plan_lines(plan) if plan is not None else [plan_report.NO_PLAN_LINE])
         L.append("")
 
     if include.get("session", True):
@@ -392,26 +392,6 @@ def format_gamma_lines(summary: dict | None) -> list[str]:
     return plan_report.gamma_lines(summary)
 
 
-def plan_for_message(payload: dict, prev_payload: dict | None, ticker: str,
-                     gamma: dict | None = None,
-                     stop_buffer_pct: float = game_plan.STOP_BUFFER_PCT,
-                     min_reward_to_risk: float = game_plan.MIN_REWARD_TO_RISK):
-    """Game plan from one archive, for the Telegram push. VWAP is not in the archive, so
-    it is left out; the candidate uses the same basic ranking as the message's Best Value
-    section."""
-    from strategy_engine import ticker_expected_range
-
-    spot = float(payload.get("spot") or 0)
-    vol = payload.get("volume") or {}
-    return game_plan.build_plan(
-        ticker=ticker, spot=spot,
-        trend=ema_stack.banner_for_archive(payload, now=datetime.now(ET)),
-        gamma=gamma, vwap=None, expected=ticker_expected_range(spot, vol),
-        picks=plan_report.picks_from_archive(payload),
-        session_high=(payload.get("session") or {}).get("day_high"),
-        session_low=(payload.get("session") or {}).get("day_low"),
-        stop_buffer_pct=stop_buffer_pct,
-        min_reward_to_risk=min_reward_to_risk,
-        emas=((payload.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
-        htf=htf_trend.from_archive(payload),
-    )
+def plan_for_message(payload: dict):
+    """The Game Plan the scan saved, for the Telegram push (None for an older scan)."""
+    return plan_report.saved_plan(payload)

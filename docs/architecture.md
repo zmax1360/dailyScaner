@@ -24,7 +24,9 @@ them. Changes since then: `docs/changelog.md`.
    default), computes per-timeframe indicators (`analyze_tf`, incl. 15M EMA 9/21/50 and
    `htf_trend.describe` for 1H/4H), and writes:
    - `archive/{TICKER}_{YYYYMMDD}_{HHMMSS}.json`: spot, session, timeframes, raw option
-     volume (`volume.top_calls/top_puts`), a Best Value snapshot (`best_value.rows`) and the gamma read (`gamma`).
+     volume (`volume.top_calls/top_puts`), a Best Value snapshot (`best_value.rows`), the gamma read (`gamma`), VWAP
+     (`vwap`) and the Game Plan built from all of them (`game_plan`). Readers show these
+     as saved and never work them out again.
    - SQLite attribution rows (`_log_scan_attribution` → `attribution.log_run`).
    - volume history (`volume_history.record_scan`, at most every 15 min).
 3. After a successful scan, `scheduler._notify_success` formats the archive

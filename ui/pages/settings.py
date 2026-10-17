@@ -162,8 +162,7 @@ def render(cfg: dict) -> None:
             key="tg_send_btn",
         )
         if send_tg and configured and tg_payload:
-            tg_gamma = (saved_gamma(tg_payload)
-                        if (inc_gamma or inc_plan) else None)
+            tg_gamma = saved_gamma(tg_payload) if inc_gamma else None
             msg = _format_scan_message(
                 payload=tg_payload,
                 prev_payload=tg_prev,
@@ -182,12 +181,7 @@ def render(cfg: dict) -> None:
                 },
                 expiry_drill=selected_expiries or None,
                 gamma=tg_gamma if inc_gamma else None,
-                plan=(plan_for_message(tg_payload, tg_prev, tg_ticker, gamma=tg_gamma,
-                                       stop_buffer_pct=float(
-                                           shell.setting(st, "stop_buffer_pct")),
-                                       min_reward_to_risk=float(
-                                           shell.setting(st, "min_reward_to_risk")))
-                      if inc_plan else None),
+                plan=plan_for_message(tg_payload) if inc_plan else None,
             )
             own_token, own_chat = _load_telegram_config(tg_ticker)
             ok, err = _send_telegram(own_token or tg_token, own_chat or tg_chat, msg,
