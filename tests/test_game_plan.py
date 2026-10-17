@@ -805,3 +805,34 @@ def test_entry_zone_still_shown_when_it_exists():
                                 session_high=334.54, expected=EXPECTED)
     assert trade.ready and trade.entry_limit is not None
     assert trade.entry_limit > trade.better_entry.price
+
+
+# ── type of day: the gamma flip ─────────────────────────────────────────────
+
+def test_type_of_day_reads_every_strike_when_the_snapshot_has_it():
+    plan = _plan(gamma={**GAMMA, "net": 1.0e6, "net_all_strikes": -2.0e6})
+    assert plan.regime == gp.NEGATIVE and plan.net_gex == pytest.approx(-2.0e6)
+
+
+def test_type_of_day_is_unsettled_within_the_buffer_of_the_nearest_flip():
+    spot = 333.44
+    near = {**GAMMA, "gamma_flip_nearest": spot * (1 - 0.001)}      # 0.10% away
+    regime, note, net = gp.regime_from_gamma(near, spot)
+    assert regime == gp.UNSETTLED and "gamma flip" in note and net == pytest.approx(34.21e6)
+    far = {**GAMMA, "gamma_flip_nearest": spot * (1 - 0.005)}       # 0.50% away
+    assert gp.regime_from_gamma(far, spot)[0] == gp.POSITIVE
+    assert gp.regime_from_gamma(near, None)[0] == gp.POSITIVE        # no price: no buffer test
+    assert gp.REGIME_LABEL[gp.UNSETTLED]
+
+
+def test_unsettled_plan_says_so_and_says_what_settles_it():
+    plan = _plan(gamma={**GAMMA, "gamma_flip_nearest": 333.30})       # spot 333.69: 0.12%
+    assert plan.regime == gp.UNSETTLED
+    assert any("gamma flip" in line for line in plan.expect)
+    assert any("gamma flip" in line and "settles" in line for line in plan.changes)
+
+
+def test_positive_day_names_the_flip_as_what_changes_it():
+    plan = _plan(gamma={**GAMMA, "gamma_flip_nearest": 320.0})
+    assert plan.regime == gp.POSITIVE
+    assert any("gamma flip at $320" in line for line in plan.changes)

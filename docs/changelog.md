@@ -6,6 +6,30 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- Gamma page shows the first shown expiry's own gamma flip (the one the Game Plan reads)
+  beside the all-expiries flip, and its regime line leads with "unsettled" when spot is
+  within the Game Plan's 0.15% band of it, so the two pages no longer disagree.
+- **Chart style switch: TradingView** (`ui/components/tv_chart.py`; Chart → Indicators →
+  Chart style). TradingView Lightweight Charts 4.2.0 (Apache-2.0, loaded from unpkg)
+  draws the app's own bars: candles, volume, EMA 9/21/50, VWAP and the level lines,
+  in New York time. Plotly stays the default and keeps the stochastic / ATR /
+  participation panels. The chart's gamma levels now include the nearest expiry's
+  gamma flip (`ui/gamma_data.gamma_levels`). Display only.
+- **Game Plan type of day reads the gamma flip** (`game_plan.regime_from_gamma`). The
+  sign now comes from the nearest expiry's net over every strike (`net_all_strikes`;
+  older snapshots fall back to `net`), and the day is **UNSETTLED** when price is within
+  0.15% of that expiry's gamma flip (`gamma_flip_nearest`). "What changes it" names the
+  flip. Display only: the allowed side and the trade plan are unchanged.
+- Gamma page heat map: colour scale tops out at the 90th percentile of non-zero |GEX|
+  (`gex_page.color_scale_max`) instead of the largest cell, so one outlier near the
+  money no longer washes out the rest. Display only.
+- **Gamma flip and full-chain net** (`gex.full_chain_net`, `gex.net_gex_curve`,
+  `gex.gamma_flip`). The flip re-prices every usable contract's gamma at spots within
+  ±5% and interpolates the sign change nearest spot. `gex.summary` adds
+  `net_all_strikes`, `net_full_chain`, `gamma_flip`, `gamma_flip_nearest`; `net` (the
+  16-strike window that the Game Plan reads) is unchanged. Gamma page: a second metric row
+  (all strikes, all expiries, gamma flip), the regime line reads spot vs the flip, and
+  the Profile view draws the flip line. Display only; no scoring change.
 - **Game Plan built once per scan and saved** (`dailyScaner._plan_snapshot`,
   `payload["game_plan"]`, `plan_report.saved_plan`). The scan also saves VWAP
   (`payload["vwap"]`), so the VWAP rule (no calls below VWAP, no puts above) now holds

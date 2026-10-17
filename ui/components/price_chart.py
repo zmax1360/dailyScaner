@@ -26,6 +26,9 @@ UP, DOWN = "#00C853", "#FF1744"
 EMA_COLORS = {"EMA9": "#7CFC00", "EMA21": "#2196F3", "EMA50": "#F44336"}
 VWAP_COLOR = "#00E5FF"
 GRID = "rgba(255,255,255,0.06)"
+STYLE_TV, STYLE_PLOTLY = "TradingView", "Plotly"
+STYLES = (STYLE_PLOTLY, STYLE_TV)
+TV_HEIGHT = 560
 LEVEL_REACH = 0.35        # a level within this share of the candle range gets a line
 EDGE_LABEL_ROW = 0.05     # share of the price range kept free for each edge label
 
@@ -219,6 +222,11 @@ def render(ctx: ScanContext) -> None:
             help="10M/15M/45M are built from 5-minute bars; 4H from 1-hour bars.",
         )
     with right.popover("Indicators", use_container_width=True):
+        style = st.radio("Chart style", list(STYLES), horizontal=True, key="chart_style",
+                         help="TradingView: TradingView's Lightweight Charts drawing these "
+                              "bars and levels (smooth zoom and scroll; candles, volume, "
+                              "EMAs, VWAP and levels only). Plotly: adds the stochastic, "
+                              "ATR and participation panels.")
         show_stoch = st.checkbox("Stochastic (14, 3)", value=True, key="chart_stoch")
         show_atr = st.checkbox("ATR (14)", value=False, key="chart_atr")
         show_part = st.checkbox("Participation", value=True, key="chart_participation")
@@ -238,9 +246,16 @@ def render(ctx: ScanContext) -> None:
     gamma_count = len(levels)
     moves = _cached_moves(ticker, _today().isoformat()) if show_move else []
     levels = levels + expected_move.chart_levels(moves)
-    fig = build_figure(df, ticker=ticker, timeframe=timeframe, show_stoch=show_stoch,
-                       show_atr=show_atr, show_participation=show_part, levels=levels)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    if style == STYLE_TV:
+        import streamlit.components.v1 as components
+
+        from ui.components import tv_chart
+        components.html(tv_chart.html(tv_chart.payload(df, levels=levels), height=TV_HEIGHT),
+                        height=TV_HEIGHT + 10)
+    else:
+        fig = build_figure(df, ticker=ticker, timeframe=timeframe, show_stoch=show_stoch,
+                           show_atr=show_atr, show_participation=show_part, levels=levels)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
     last = df.iloc[-1]
     parts = [f"{name.replace('EMA', 'EMA ')} {last[name]:.2f}"

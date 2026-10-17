@@ -802,3 +802,133 @@ def test_lag_note_appears_only_when_quotes_sit_away_from_spot():
     assert gex_page.lag_note({"2026-10-09": 335.00}, "2026-10-09", 335.12) == ""   # 0.04%
     assert gex_page.lag_note({}, "2026-10-09", 335.12) == ""
     assert gex_page.lag_note({"2026-10-09": 334.19}, "2026-10-12", 335.12) == ""
+
+
+# ── full-chain net and the gamma flip ────────────────────────────────────────
+
+def _two_sided():
+    # puts dominate below spot, calls above: the net must change sign between them
+    return [_c("PUT", 325.0, MONDAY, 20000), _c("PUT", 327.5, MONDAY, 10000),
+            _c("CALL", 340.0, MONDAY, 10000), _c("CALL", 342.5, MONDAY, 20000)]
+
+
+def test_full_chain_net_sums_every_strike_not_the_window():
+    table = _table(_chain())
+    assert gex.full_chain_net(table) == pytest.approx(table["gex"].sum())   # NaN skipped
+    window = gex.gex_matrix(table, spot=SPOT, expiries=[NEXT_FRI], n_strikes=1)
+    assert gex.full_chain_net(table, [NEXT_FRI]) != pytest.approx(window[NEXT_FRI].sum())
+    assert gex.full_chain_net(table, [NEXT_FRI]) == pytest.approx(
+        table.loc[table["expiry"] == NEXT_FRI, "gex"].sum())
+    assert gex.full_chain_net(pd.DataFrame()) is None
+    assert gex.full_chain_net(_table([_c("CALL", 336.0, MONDAY, None)])) is None
+
+
+@pytest.mark.parametrize("unit", gex.UNITS)
+def test_curve_at_spot_equals_the_table(unit):
+    table = _table(_chain(), unit=unit)
+    curve = gex.net_gex_curve(table, as_of=AS_OF, spots=[SPOT], unit=unit)
+    assert curve[0] == pytest.approx(table["gex"].sum(), rel=1e-9)
+
+
+def test_curve_reprices_gamma_with_bs_gamma():
+    table = _table([_c("CALL", 335.0, MONDAY, 1000)])
+    t = gex.years_to_expiry(MONDAY, AS_OF)
+    r = float(SCORING.get("risk_free_rate", 0.045))
+    got = gex.net_gex_curve(table, as_of=AS_OF, spots=[320.0, 350.0], unit=gex.UNIT_SHARES)
+    for s, g in zip([320.0, 350.0], got):
+        assert g == pytest.approx(bs_gamma(s, 335.0, 0.30, t_years=t, r=r) * 1000 * 100)
+
+
+def test_gamma_flip_sits_between_put_and_call_strikes():
+    table = _table(_two_sided())
+    f = gex.gamma_flip(table, spot=SPOT, as_of=AS_OF)
+    assert f is not None and 327.5 < f["flip"] < 340.0
+    below, above = gex.net_gex_curve(table, as_of=AS_OF, spots=[f["flip"] - 1, f["flip"] + 1])
+    assert below < 0 < above
+    assert f["net_at_spot"] == pytest.approx(table["gex"].sum())
+    assert len(f["spots"]) == len(f["net"]) == gex.FLIP_STEPS
+
+
+def test_gamma_flip_does_not_depend_on_the_unit():
+    flips = {u: gex.gamma_flip(_table(_two_sided(), unit=u), spot=SPOT, as_of=AS_OF)["flip"]
+             for u in gex.UNITS}
+    assert len({round(v, 6) for v in flips.values()}) == 1
+
+
+def test_gamma_flip_is_none_when_the_net_keeps_one_sign():
+    f = gex.gamma_flip(_table([_c("CALL", 335.0, MONDAY, 5000)]), spot=SPOT, as_of=AS_OF)
+    assert f["flip"] is None and f["crossings"] == [] and f["net_at_spot"] > 0
+    assert gex.gamma_flip(pd.DataFrame(), spot=SPOT, as_of=AS_OF) is None
+    assert gex.gamma_flip(_table(_two_sided()), spot=None, as_of=AS_OF) is None
+
+
+def test_gamma_flip_can_be_limited_to_expiries():
+    rows = _two_sided() + [_c("CALL", 330.0, NEXT_FRI, 500000)]   # swamps the book
+    table = _table(rows)
+    assert gex.gamma_flip(table, spot=SPOT, as_of=AS_OF)["flip"] is None
+    near = gex.gamma_flip(table, spot=SPOT, as_of=AS_OF, expiries=[MONDAY])["flip"]
+    assert 327.5 < near < 340.0
+
+
+def test_summary_carries_full_chain_net_and_flip_through_json():
+    s = gex.summary(_latest(_two_sided() + [_c("CALL", 335.0, NEXT_FRI, 100)]),
+                    spot=SPOT, as_of=AS_OF, n_strikes=2)
+    table = gex.gex_table(_latest(_two_sided() + [_c("CALL", 335.0, NEXT_FRI, 100)]),
+                          spot=SPOT, as_of=AS_OF)
+    assert s["net_all_strikes"] == pytest.approx(
+        table.loc[table["expiry"] == MONDAY, "gex"].sum())
+    assert s["net_full_chain"] == pytest.approx(table["gex"].sum())
+    assert s["net"] != pytest.approx(s["net_all_strikes"])          # 2-strike window
+    assert 327.5 < s["gamma_flip_nearest"] < 340.0 and s["gamma_flip"] is not None
+    back = gex.summary_from_json(gex.summary_to_json(s))
+    for k in ("net_all_strikes", "net_full_chain", "gamma_flip", "gamma_flip_nearest"):
+        assert back[k] == pytest.approx(s[k])
+
+
+def test_build_view_reports_full_chain_and_flip():
+    v = gex_page.build_view(_latest(_two_sided()), spot=SPOT, as_of=AS_OF,
+                            today=date(2026, 10, 2), strikes="8")
+    assert v["net_full_chain"] == pytest.approx(v["table"]["gex"].sum())
+    assert 327.5 < v["flip"] < 340.0
+
+
+def test_regime_line_reads_the_flip_then_the_net():
+    assert "above the gamma flip" in gex_page.regime_line(spot=335.0, flip=333.0, net=-1.0)
+    assert "dampen" in gex_page.regime_line(spot=335.0, flip=333.0, net=-1.0)
+    assert "amplify" in gex_page.regime_line(spot=331.0, flip=333.0, net=1.0)
+    assert "no flip" in gex_page.regime_line(spot=331.0, flip=None, net=1.0)
+    assert gex_page.regime_line(spot=331.0, flip=None, net=None) == ""
+
+
+def test_profile_figure_draws_the_flip_line():
+    m = gex.gex_matrix(_table(_two_sided()), spot=SPOT)
+    with_flip = gex_page.profile_figure(m, spot=SPOT, flip=332.0)
+    without = gex_page.profile_figure(m, spot=SPOT)
+    assert len(with_flip.layout.shapes) == len(without.layout.shapes) + 1
+
+
+def test_color_scale_tops_out_at_the_90th_percentile_not_the_outlier():
+    m = pd.DataFrame({MONDAY: [1e6, -2e6, 3e6, -4e6, 5e6, -6e6, 7e6, -8e6, 9e6, 1e8, 0.0,
+                               float("nan")]})
+    vmax = gex_page.color_scale_max(m)
+    nonzero = [1e6, 2e6, 3e6, 4e6, 5e6, 6e6, 7e6, 8e6, 9e6, 1e8]
+    assert vmax == pytest.approx(pd.Series(nonzero).quantile(0.90))
+    assert vmax < 1e8                                  # the outlier does not set the scale
+    assert gex_page._cell_css(2e8, vmax) == gex_page._cell_css(vmax, vmax)   # capped
+    assert gex_page.color_scale_max(pd.DataFrame()) == 0.0
+    assert gex_page.color_scale_max(pd.DataFrame({MONDAY: [0.0, float("nan")]})) == 0.0
+
+
+def test_regime_line_leads_with_an_unsettled_nearest_expiry():
+    line = gex_page.regime_line(spot=343.46, flip=None, net=2.5e8, flip_nearest=343.38,
+                                nearest_label="Oct 19")
+    assert line.startswith("Spot is within 0.15% of the Oct 19 gamma flip")
+    assert "unsettled" in line and "dampen" in line          # then the all-expiries read
+    far = gex_page.regime_line(spot=343.46, flip=None, net=2.5e8, flip_nearest=330.0)
+    assert not far.startswith("Spot is within")
+
+
+def test_build_view_reports_the_first_expirys_flip():
+    v = gex_page.build_view(_latest(_two_sided()), spot=SPOT, as_of=AS_OF,
+                            today=date(2026, 10, 2), strikes="8")
+    assert 327.5 < v["flip_nearest"] < 340.0

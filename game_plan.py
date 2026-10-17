@@ -4,7 +4,10 @@ Pure: no network, no Streamlit, no writes, no AI. Same inputs, same plan. Displa
 nothing here feeds scoring.
 
     allowed side   <- the 15-minute EMA 9/21/50 trend rule (ema_stack)
-    type of day    <- the sign of net gamma exposure for the nearest expiry (gex.summary)
+    type of day    <- the sign of net gamma exposure for the nearest expiry (gex.summary,
+                      every strike), or UNSETTLED when price sits within 0.15% of that
+                      expiry's gamma flip: a small move changes the sign, so the map
+                      gives no read on the day
     levels         <- gamma support / resistance / put wall, VWAP, 1SD expected range
     scanner side   <- the side of the scan's top-ranked 1DTE+ pick over the last six
                       scans. The trend rule alone was right about the next hour 47% of
@@ -39,11 +42,13 @@ from scoring_pool import POOL_0DTE, POOL_1DTE
 from time_stop import TIME_STOP_CAP, window_minutes_for_dte
 
 CALLS, PUTS, STAND_ASIDE, UNKNOWN = "CALLS", "PUTS", "STAND_ASIDE", "UNKNOWN"
-POSITIVE, NEGATIVE = "POSITIVE", "NEGATIVE"
+POSITIVE, NEGATIVE, UNSETTLED = "POSITIVE", "NEGATIVE", "UNSETTLED"
 
 SIDE_LABEL = {CALLS: "Calls only", PUTS: "Puts only", STAND_ASIDE: "Stand aside",
               UNKNOWN: "Unknown"}
-REGIME_LABEL = {POSITIVE: "Positive gamma", NEGATIVE: "Negative gamma", UNKNOWN: "Unknown"}
+REGIME_LABEL = {POSITIVE: "Positive gamma", NEGATIVE: "Negative gamma",
+                UNSETTLED: "Unsettled (at the flip)", UNKNOWN: "Unknown"}
+UNSETTLED_PCT = 0.15                    # within this % of the nearest-expiry flip: unsettled
 _OPTION_SIDE = {CALLS: "CALL", PUTS: "PUT"}
 POOLS = (POOL_1DTE, POOL_0DTE)          # shown in this order
 
@@ -222,10 +227,25 @@ def vwap_hold(side: str, spot: Any, vwap: Any) -> tuple[str, str, str]:
     return side, "", ""
 
 
-def regime_from_gamma(gamma: dict | None) -> tuple[str, str, float | None]:
-    net = _f((gamma or {}).get("net"))
+def regime_from_gamma(gamma: dict | None, spot: Any = None,
+                      unsettled_pct: float = UNSETTLED_PCT) -> tuple[str, str, float | None]:
+    """Type of day from the nearest expiry's net gamma over every strike
+    (``net_all_strikes``; snapshots saved before it existed fall back to ``net``, the
+    16-strike window). UNSETTLED when price is within ``unsettled_pct`` percent of that
+    expiry's gamma flip (``gamma_flip_nearest``): the sign then rests on cents."""
+    g = gamma or {}
+    net = _f(g.get("net_all_strikes"))
+    if net is None:
+        net = _f(g.get("net"))
     if net is None:
         return UNKNOWN, "No usable gamma snapshot.", None
+    flip, px = _f(g.get("gamma_flip_nearest")), _f(spot)
+    if flip is not None and px is not None and px > 0 \
+            and abs(px - flip) / px * 100.0 <= unsettled_pct:
+        return (UNSETTLED, f"Price {_usd(round(px, 2))} is within {unsettled_pct:g}% of the "
+                           f"gamma flip at {_usd(round(flip, 2))}: a small move changes the "
+                           "sign, so the map gives no read on whether moves will be "
+                           "contained or amplified.", net)
     if net >= 0:
         return (POSITIVE, "Dealer hedging tends to dampen moves: expect a contained range "
                           "and modest targets.", net)
@@ -320,6 +340,11 @@ def _expect(side: str, regime: str, gamma: dict | None,
     elif regime == NEGATIVE:
         out.append(f"The trend rule allows {word} only, on a day when moves tend to be amplified.")
         out.append("Trends can extend past the usual levels, and swings are wider both ways.")
+    elif regime == UNSETTLED:
+        flip = _f(g.get("gamma_flip_nearest"))
+        out.append(f"The trend rule allows {word} only. Price is sitting on the gamma flip"
+                   + (f" at {_usd(round(flip, 2))}" if flip is not None else "")
+                   + ", so the map says nothing about whether moves will be contained.")
     else:
         out.append(f"The trend rule allows {word} only. The type of day is unknown "
                    "(no gamma snapshot).")
@@ -345,12 +370,22 @@ def _changes(side: str, regime: str, gamma: dict | None, stale: bool,
     elif side == STAND_ASIDE:
         out.append("The 15-minute EMAs line up 9 above 21 above 50, or the reverse: a side "
                    "becomes allowed.")
-    flip = _f((gamma or {}).get("first_negative_below_spot"))
-    if regime == POSITIVE and flip is not None:
+    g = gamma or {}
+    gflip = _f(g.get("gamma_flip_nearest"))
+    flip = _f(g.get("first_negative_below_spot"))
+    if regime == UNSETTLED and gflip is not None:
+        out.append(f"Price moves more than {UNSETTLED_PCT:g}% away from the gamma flip at "
+                   f"{_usd(round(gflip, 2))}: the type of day settles on that side.")
+    elif regime == POSITIVE and gflip is not None:
+        out.append(f"Price crosses the gamma flip at {_usd(round(gflip, 2))}: net gamma "
+                   "changes sign there.")
+    elif regime == POSITIVE and flip is not None:
         out.append(f"Price falls to {_usd(flip)} or below: the map turns negative there and "
                    "moves can speed up.")
     if regime == NEGATIVE:
-        out.append("Net gamma turns positive: moves tend to be contained again.")
+        out.append(f"Price crosses the gamma flip at {_usd(round(gflip, 2))}: moves tend to "
+                   "be contained again." if gflip is not None else
+                   "Net gamma turns positive: moves tend to be contained again.")
     if stale:
         out.append("This scan is over 30 minutes old. Re-check after the next scan.")
     return tuple(out)
@@ -549,7 +584,7 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
     side, hold, hold_note = resolve_side(trend_side, flow, now)
     if not hold:
         side, hold, hold_note = vwap_hold(side, spot, vwap)
-    regime, regime_note, net = regime_from_gamma(gamma)
+    regime, regime_note, net = regime_from_gamma(gamma, spot)
     candidates = []
     for pool in POOLS:
         pick = pick_candidate(picks, side, pool)
