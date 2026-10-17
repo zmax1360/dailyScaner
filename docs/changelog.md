@@ -6,6 +6,12 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- **Chart style switch: TradingView** (`ui/components/tv_chart.py`; Chart → Indicators →
+  Chart style). TradingView Lightweight Charts 4.2.0 (Apache-2.0, loaded from unpkg)
+  draws the app's own bars: candles, volume, EMA 9/21/50, VWAP and the level lines,
+  in New York time. Plotly stays the default and keeps the stochastic / ATR /
+  participation panels. The chart's gamma levels now include the nearest expiry's
+  gamma flip (`ui/gamma_data.gamma_levels`). Display only.
 - **Game Plan type of day reads the gamma flip** (`game_plan.regime_from_gamma`). The
   sign now comes from the nearest expiry's net over every strike (`net_all_strikes`;
   older snapshots fall back to `net`), and the day is **UNSETTLED** when price is within
