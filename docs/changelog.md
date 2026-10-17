@@ -6,6 +6,10 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- **OI Change page** (`oi_delta.py`, `ui/pages/oi_delta.py`, menu Market → OI Change):
+  day-over-day open interest change per contract from `volume_history.daily_summary`,
+  labelled with the trading day that caused it; change ÷ that day's volume; a change
+  larger than that day's volume is flagged ⚠ and left out of the totals. Display only.
 - **Game Plan built once per scan and saved** (`dailyScaner._plan_snapshot`,
   `payload["game_plan"]`, `plan_report.saved_plan`). The scan also saves VWAP
   (`payload["vwap"]`), so the VWAP rule (no calls below VWAP, no puts above) now holds
