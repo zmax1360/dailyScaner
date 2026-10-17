@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -45,13 +46,31 @@ def _cell_css(v, vmax: float) -> str:
     return f"background-color: rgba({r},{g},{b},{alpha:.2f}); color: #fff;"
 
 
+COLOR_SCALE_PCTL = 90         # the colour scale tops out here, not at the largest cell
+
+
+def color_scale_max(matrix: pd.DataFrame) -> float:
+    """Top of the colour scale: the 90th percentile of the non-zero |values|.
+
+    GEX usually has one cell near the money an order of magnitude above its
+    neighbours; scaling to that one cell paints every other cell the same faint
+    shade. Cells above this value get the full colour. 0.0 for an empty map."""
+    if matrix is None or matrix.empty:
+        return 0.0
+    vals = matrix.abs().to_numpy(dtype=float).ravel()
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size == 0:
+        return 0.0
+    return float(np.percentile(vals, COLOR_SCALE_PCTL))
+
+
 def style_matrix(matrix: pd.DataFrame, wall_map: dict, *, spot_strike: float | None = None,
                  net_label: str = NET_LABEL):
     """Colour by sign and size, mark each expiry's walls, append a NET row.
 
     Returns a Styler whose row labels are the strikes (the one nearest spot is marked).
     """
-    vmax = float(matrix.abs().max().max()) if not matrix.empty else 0.0
+    vmax = color_scale_max(matrix)
     labels = [f"{k:g}  ◀ spot" if k == spot_strike else f"{k:g}" for k in matrix.index]
     shown = matrix.copy()
     shown.index = labels

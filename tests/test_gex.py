@@ -905,3 +905,15 @@ def test_profile_figure_draws_the_flip_line():
     with_flip = gex_page.profile_figure(m, spot=SPOT, flip=332.0)
     without = gex_page.profile_figure(m, spot=SPOT)
     assert len(with_flip.layout.shapes) == len(without.layout.shapes) + 1
+
+
+def test_color_scale_tops_out_at_the_90th_percentile_not_the_outlier():
+    m = pd.DataFrame({MONDAY: [1e6, -2e6, 3e6, -4e6, 5e6, -6e6, 7e6, -8e6, 9e6, 1e8, 0.0,
+                               float("nan")]})
+    vmax = gex_page.color_scale_max(m)
+    nonzero = [1e6, 2e6, 3e6, 4e6, 5e6, 6e6, 7e6, 8e6, 9e6, 1e8]
+    assert vmax == pytest.approx(pd.Series(nonzero).quantile(0.90))
+    assert vmax < 1e8                                  # the outlier does not set the scale
+    assert gex_page._cell_css(2e8, vmax) == gex_page._cell_css(vmax, vmax)   # capped
+    assert gex_page.color_scale_max(pd.DataFrame()) == 0.0
+    assert gex_page.color_scale_max(pd.DataFrame({MONDAY: [0.0, float("nan")]})) == 0.0

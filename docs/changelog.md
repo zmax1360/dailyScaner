@@ -6,6 +6,9 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- Gamma page heat map: colour scale tops out at the 90th percentile of non-zero |GEX|
+  (`gex_page.color_scale_max`) instead of the largest cell, so one outlier near the
+  money no longer washes out the rest. Display only.
 - **Gamma flip and full-chain net** (`gex.full_chain_net`, `gex.net_gex_curve`,
   `gex.gamma_flip`). The flip re-prices every usable contract's gamma at spots within
   ±5% and interpolates the sign change nearest spot. `gex.summary` adds
