@@ -917,3 +917,18 @@ def test_color_scale_tops_out_at_the_90th_percentile_not_the_outlier():
     assert gex_page._cell_css(2e8, vmax) == gex_page._cell_css(vmax, vmax)   # capped
     assert gex_page.color_scale_max(pd.DataFrame()) == 0.0
     assert gex_page.color_scale_max(pd.DataFrame({MONDAY: [0.0, float("nan")]})) == 0.0
+
+
+def test_regime_line_leads_with_an_unsettled_nearest_expiry():
+    line = gex_page.regime_line(spot=343.46, flip=None, net=2.5e8, flip_nearest=343.38,
+                                nearest_label="Oct 19")
+    assert line.startswith("Spot is within 0.15% of the Oct 19 gamma flip")
+    assert "unsettled" in line and "dampen" in line          # then the all-expiries read
+    far = gex_page.regime_line(spot=343.46, flip=None, net=2.5e8, flip_nearest=330.0)
+    assert not far.startswith("Spot is within")
+
+
+def test_build_view_reports_the_first_expirys_flip():
+    v = gex_page.build_view(_latest(_two_sided()), spot=SPOT, as_of=AS_OF,
+                            today=date(2026, 10, 2), strikes="8")
+    assert 327.5 < v["flip_nearest"] < 340.0

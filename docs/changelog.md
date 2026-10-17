@@ -6,6 +6,9 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- Gamma page shows the first shown expiry's own gamma flip (the one the Game Plan reads)
+  beside the all-expiries flip, and its regime line leads with "unsettled" when spot is
+  within the Game Plan's 0.15% band of it, so the two pages no longer disagree.
 - **Chart style switch: TradingView** (`ui/components/tv_chart.py`; Chart → Indicators →
   Chart style). TradingView Lightweight Charts 4.2.0 (Apache-2.0, loaded from unpkg)
   draws the app's own bars: candles, volume, EMA 9/21/50, VWAP and the level lines,

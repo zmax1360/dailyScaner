@@ -191,9 +191,23 @@ def profile_figure(matrix: pd.DataFrame, *, spot: float, title: str = "",
     return fig
 
 
-def regime_line(*, spot: float, flip: float | None, net: float | None) -> str:
-    """One line on the regime, from where spot sits against the gamma flip (all expiries),
-    or from the sign of the full-chain net when there is no flip within the sweep."""
+def regime_line(*, spot: float, flip: float | None, net: float | None,
+                flip_nearest: float | None = None, nearest_label: str = "") -> str:
+    """One line on the regime. First the nearest expiry: when spot is within the Game
+    Plan's unsettled band of that expiry's flip, say so (the same rule the Game Plan uses).
+    Then all expiries: where spot sits against their flip, or the sign of their net when
+    there is no flip within the sweep."""
+    from game_plan import UNSETTLED_PCT
+
+    lead = ""
+    if flip_nearest is not None and spot and \
+            abs(spot - flip_nearest) / spot * 100.0 <= UNSETTLED_PCT:
+        lead = (f"Spot is within {UNSETTLED_PCT:g}% of the {nearest_label or 'nearest'} gamma "
+                f"flip (\\${flip_nearest:,.2f}): unsettled, no regime read for that expiry. ")
+    return lead + _all_expiries_line(spot=spot, flip=flip, net=net)
+
+
+def _all_expiries_line(*, spot: float, flip: float | None, net: float | None) -> str:
     if flip is not None:
         side = "above" if spot >= flip else "below"
         effect = "dampen" if spot >= flip else "amplify"
@@ -243,7 +257,10 @@ def build_view(latest: pd.DataFrame, *, spot: float, as_of: datetime, today: dat
             "net_all_strikes": gex.full_chain_net(table, first) if first else None,
             "net_full_chain": gex.full_chain_net(table),
             "flip": (gex.gamma_flip(table, spot=spot, as_of=as_of) or {}).get("flip")
-            if available else None}
+            if available else None,
+            # the first shown expiry's own flip: the one the Game Plan reads
+            "flip_nearest": (gex.gamma_flip(table, spot=spot, as_of=as_of, expiries=first)
+                             or {}).get("flip") if first else None}
 
 
 def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None = None) -> None:
@@ -307,26 +324,32 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Spot", f"${spot:,.2f}")
-    m2.metric(f"Net GEX · {_fmt_exp(first)} · shown strikes", gex.fmt_money(net) or "—",
-              help="Sum of the strikes in the table only. Changing the strike count can "
-                   "change its sign; the row below sums every strike.")
+    m2.metric("Net · shown", gex.fmt_money(net) or "—",
+              help=f"Net GEX of the {_fmt_exp(first)} strikes in the table only. Changing the strike count "
+                   "can change its sign; the row below sums every strike.")
     m3.metric("Gamma support", _px(sr.get("support")),
               help="Largest positive strike at or below spot. Dips toward it tend to be bought.")
     m4.metric("Call resistance", _px(sr.get("resistance")),
               help="Largest positive strike above spot. Rallies toward it tend to stall.")
     m5.metric("Put wall", _px(w.get("put_wall")),
               help="Most negative strike. Moves can speed up around and below it.")
-    flip, full_net = view["flip"], view["net_full_chain"]
-    n1, n2, n3, _n4, _n5 = st.columns(5)
-    n1.metric(f"Net GEX · {_fmt_exp(first)} · all strikes",
-              gex.fmt_money(view["net_all_strikes"]) or "—")
-    n2.metric("Net GEX · all expiries", gex.fmt_money(full_net) or "—",
+    flip, full_net, flip_near = view["flip"], view["net_full_chain"], view["flip_nearest"]
+    n1, n2, n3, n4, _n5 = st.columns(5)
+    n1.metric(f"Net · {_fmt_exp(first)}",
+              gex.fmt_money(view["net_all_strikes"]) or "—",
+              help="Net GEX of every usable strike of this expiry, not only the shown ones.")
+    n2.metric(f"Flip · {_fmt_exp(first)}",
+              _px(None if flip_near is None else round(flip_near, 2)),
+              help="The price where this expiry's net GEX changes sign (every contract's "
+                   "gamma re-priced within 5% of spot). The Game Plan reads this one. "
+                   "'—' means no sign change within 5%.")
+    n3.metric("Net · all exp.", gex.fmt_money(full_net) or "—",
               help="Every usable strike of every live expiry in the snapshot.")
-    n3.metric("Gamma flip", _px(None if flip is None else round(flip, 2)),
-              help="The price where net GEX across all expiries changes sign, found by "
-                   "re-pricing every contract's gamma at prices within 5% of spot. "
-                   "'—' means the net keeps one sign across that whole range.")
-    st.caption(regime_line(spot=spot, flip=flip, net=full_net))
+    n4.metric("Flip · all exp.", _px(None if flip is None else round(flip, 2)),
+              help="The same, for every live expiry together. '—' means the net keeps one "
+                   "sign across the whole ±5% range.")
+    st.caption(regime_line(spot=spot, flip=flip, net=full_net, flip_nearest=flip_near,
+                           nearest_label=_fmt_exp(first)))
 
     # ── panel 2: the map ─────────────────────────────────────────────────────
     if layout == LAYOUT_PROFILE:
