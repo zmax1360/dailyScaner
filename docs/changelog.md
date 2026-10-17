@@ -30,6 +30,12 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
   16-strike window that the Game Plan reads) is unchanged. Gamma page: a second metric row
   (all strikes, all expiries, gamma flip), the regime line reads spot vs the flip, and
   the Profile view draws the flip line. Display only; no scoring change.
+- OI Change page: suspect (⚠) rows are left off the chart (kept in the table), and the
+  largest call and put adds get a card each.
+- **OI Change page** (`oi_delta.py`, `ui/pages/oi_delta.py`, menu Market → OI Change):
+  day-over-day open interest change per contract from `volume_history.daily_summary`,
+  labelled with the trading day that caused it; change ÷ that day's volume; a change
+  larger than that day's volume is flagged ⚠ and left out of the totals. Display only.
 - **Game Plan built once per scan and saved** (`dailyScaner._plan_snapshot`,
   `payload["game_plan"]`, `plan_report.saved_plan`). The scan also saves VWAP
   (`payload["vwap"]`), so the VWAP rule (no calls below VWAP, no puts above) now holds
