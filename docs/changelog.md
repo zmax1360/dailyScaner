@@ -6,6 +6,13 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- **Gamma flip and full-chain net** (`gex.full_chain_net`, `gex.net_gex_curve`,
+  `gex.gamma_flip`). The flip re-prices every usable contract's gamma at spots within
+  ±5% and interpolates the sign change nearest spot. `gex.summary` adds
+  `net_all_strikes`, `net_full_chain`, `gamma_flip`, `gamma_flip_nearest`; `net` (the
+  16-strike window that the Game Plan reads) is unchanged. Gamma page: a second metric row
+  (all strikes, all expiries, gamma flip), the regime line reads spot vs the flip, and
+  the Profile view draws the flip line. Display only; no scoring change.
 - **Game Plan built once per scan and saved** (`dailyScaner._plan_snapshot`,
   `payload["game_plan"]`, `plan_report.saved_plan`). The scan also saves VWAP
   (`payload["vwap"]`), so the VWAP rule (no calls below VWAP, no puts above) now holds

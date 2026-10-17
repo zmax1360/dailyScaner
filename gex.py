@@ -339,6 +339,11 @@ def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
     Net, the call and put walls, the largest positive strikes, the highest negative
     strike below spot, and every strike's net GEX (``by_strike``). None when nothing
     usable is in the snapshot.
+
+    ``net`` and the walls use the ``n_strikes`` window nearest spot. ``net_all_strikes``
+    (nearest expiry) and ``net_full_chain`` (every live expiry) sum every usable strike;
+    ``gamma_flip`` (every live expiry) and ``gamma_flip_nearest`` are the prices where
+    the net changes sign (``gamma_flip``), None when it keeps one sign within +/- 5%.
     """
     table = gex_table(latest, spot=spot, as_of=as_of, today=today)
     expiries = available_expiries(table)
@@ -352,6 +357,8 @@ def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
     w = walls(matrix)[exp]
     below = col[(col.index < float(spot)) & (col < 0)]
     sr = support_resistance(matrix, float(spot))[exp]
+    flip_all = gamma_flip(table, spot=float(spot), as_of=as_of)
+    flip_near = gamma_flip(table, spot=float(spot), as_of=as_of, expiries=[exp])
     return {
         "expiry": exp,
         "spot": float(spot),
@@ -368,6 +375,11 @@ def summary(latest: pd.DataFrame, *, spot: float | None, as_of: datetime,
                 for k, v in col[col > 0].sort_values(ascending=False).head(top).items()],
         "first_negative_below_spot": None if below.empty else float(below.index.max()),
         "by_strike": {float(k): float(v) for k, v in col.items()},
+        # every strike, not just the window above: the nearest expiry, and all expiries
+        "net_all_strikes": full_chain_net(table, [exp]),
+        "net_full_chain": full_chain_net(table),
+        "gamma_flip": (flip_all or {}).get("flip"),
+        "gamma_flip_nearest": (flip_near or {}).get("flip"),
         "as_of": as_of,
         "coverage": coverage(table),
     }
@@ -418,3 +430,103 @@ def fmt_money(v: Any) -> str:
     if a < 0.5:
         return "0"
     return f"{x:,.0f}"
+
+
+# ── full-chain net and the gamma flip ─────────────────────────────────────────
+#
+# The matrix keeps the N strikes nearest spot, and its NET row sums only those. Net GEX is
+# a small difference between two large sums, so where the window is cut can decide the sign.
+# The two functions below look at every usable strike instead, and find the price at which
+# the whole book's net changes sign by re-pricing each contract's gamma at hypothetical
+# spots (IV, time and open interest held as they are in the snapshot).
+
+FLIP_BAND_PCT = 0.05          # sweep spot +/- 5%
+FLIP_STEPS = 201              # odd, so the middle point is spot itself
+
+
+def full_chain_net(table: pd.DataFrame, expiries: list[str] | None = None) -> float | None:
+    """Net GEX over every usable strike (no strike window), in the table's unit.
+
+    ``expiries`` None = every live expiry in the table. None when nothing is usable."""
+    if table is None or table.empty:
+        return None
+    t = table[table["gex"].notna()]
+    if expiries is not None:
+        t = t[t["expiry"].isin(set(expiries))]
+    return None if t.empty else float(t["gex"].sum())
+
+
+def net_gex_curve(table: pd.DataFrame, *, as_of: datetime, spots, unit: str = UNIT_DOLLAR,
+                  expiries: list[str] | None = None):
+    """Net GEX of the usable contracts if the stock were at each price in ``spots``.
+
+    Uses each contract's IV, time to expiry and open interest as in the snapshot; only the
+    stock price moves. At the snapshot's own spot this equals ``full_chain_net``. Returns a
+    numpy array, all NaN when nothing is usable."""
+    import numpy as np
+
+    if unit not in UNITS:
+        raise ValueError(f"unknown unit {unit!r}")
+    S = np.asarray(spots, dtype=float)
+    if table is None or table.empty:
+        return np.full(S.shape, np.nan)
+    t = table[table["gex"].notna()]
+    if expiries is not None:
+        t = t[t["expiry"].isin(set(expiries))]
+    if t.empty:
+        return np.full(S.shape, np.nan)
+    years = {e: years_to_expiry(e, as_of) for e in t["expiry"].unique()}
+    tt = t["expiry"].map(years).astype(float).to_numpy()
+    K = t["strike"].astype(float).to_numpy()
+    iv = t["iv"].astype(float).to_numpy()
+    oi = t["open_interest"].astype(float).to_numpy()
+    sign = np.where(t["side"].to_numpy() == "CALL", 1.0, -1.0)
+    r = float(SCORING.get("risk_free_rate", 0.045))
+
+    Sx = S[:, None]
+    sq = np.sqrt(tt)
+    d1 = (np.log(Sx / K) + (r + 0.5 * iv * iv) * tt) / (iv * sq)
+    gamma = np.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi) / (Sx * iv * sq)
+    shares = (sign * gamma * oi * CONTRACT_MULTIPLIER).sum(axis=1)
+    scale = {UNIT_DOLLAR: S, UNIT_PCT: S * S * MOVE_PCT, UNIT_SHARES: np.ones_like(S)}[unit]
+    return shares * scale
+
+
+def gamma_flip(table: pd.DataFrame, *, spot: float, as_of: datetime,
+               expiries: list[str] | None = None, band: float = FLIP_BAND_PCT,
+               steps: int = FLIP_STEPS) -> dict | None:
+    """The stock price where the book's net GEX changes sign, nearest to spot.
+
+    Sweeps spot +/- ``band`` and interpolates between the two grid points either side of
+    each sign change. Returns ``{"flip", "crossings", "net_at_spot", "spots", "net"}``
+    (``net`` in dollars per $1 move); ``flip`` is None when the net keeps one sign across
+    the whole band, and the result is None when nothing is usable. The flip itself does
+    not depend on the unit: every unit is the share count times a positive factor.
+    """
+    import numpy as np
+
+    s = _f(spot)
+    if s is None or s <= 0:
+        return None
+    steps = max(int(steps) | 1, 3)
+    grid = np.linspace(s * (1.0 - band), s * (1.0 + band), steps)
+    curve = net_gex_curve(table, as_of=as_of, spots=grid, unit=UNIT_DOLLAR, expiries=expiries)
+    if not np.isfinite(curve).all():
+        return None
+    crossings = []
+    for i in range(len(grid) - 1):
+        a, b = curve[i], curve[i + 1]
+        if a == 0.0:
+            crossings.append(float(grid[i]))
+        elif a * b < 0.0:
+            crossings.append(float(grid[i] + (grid[i + 1] - grid[i]) * a / (a - b)))
+    if curve[-1] == 0.0:
+        crossings.append(float(grid[-1]))
+    crossings = sorted(set(crossings))
+    return {
+        "flip": min(crossings, key=lambda x: abs(x - s)) if crossings else None,
+        "crossings": crossings,
+        "net_at_spot": float(curve[len(grid) // 2]),
+        "spots": [float(x) for x in grid],
+        "net": [float(x) for x in curve],
+    }

@@ -125,7 +125,8 @@ def profile_series(matrix: pd.DataFrame) -> pd.Series:
     return matrix.sum(axis=1, min_count=1).dropna().sort_index(ascending=False)
 
 
-def profile_figure(matrix: pd.DataFrame, *, spot: float, title: str = ""):
+def profile_figure(matrix: pd.DataFrame, *, spot: float, title: str = "",
+                   flip: float | None = None):
     """Horizontal bars of net GEX by strike on a price axis: positive to the right,
     negative to the left, the largest of each highlighted, and a line at spot."""
     import plotly.graph_objects as go
@@ -156,6 +157,11 @@ def profile_figure(matrix: pd.DataFrame, *, spot: float, title: str = ""):
     fig.add_hline(y=float(spot), line=dict(color="rgb(103, 232, 249)", width=1.5, dash="dot"),
                   annotation_text=f"spot {float(spot):,.2f}", annotation_position="top left",
                   annotation_font=dict(color="rgb(103, 232, 249)", size=11))
+    if flip is not None:
+        fig.add_hline(y=float(flip), line=dict(color="rgb(251, 146, 60)", width=1.5, dash="dash"),
+                      annotation_text=f"gamma flip {float(flip):,.2f}",
+                      annotation_position="bottom left",
+                      annotation_font=dict(color="rgb(251, 146, 60)", size=11))
     fig.add_vline(x=0, line=dict(color="rgba(255,255,255,0.35)", width=1))
     span = float(net.abs().max())
     fig.update_xaxes(range=[-span * 1.25, span * 1.25], showgrid=False, zeroline=False,
@@ -164,6 +170,22 @@ def profile_figure(matrix: pd.DataFrame, *, spot: float, title: str = ""):
                      ticktext=[f"{k:g}" for k in net.index], showgrid=False,
                      range=[float(net.index.min()) - step, float(net.index.max()) + step])
     return fig
+
+
+def regime_line(*, spot: float, flip: float | None, net: float | None) -> str:
+    """One line on the regime, from where spot sits against the gamma flip (all expiries),
+    or from the sign of the full-chain net when there is no flip within the sweep."""
+    if flip is not None:
+        side = "above" if spot >= flip else "below"
+        effect = "dampen" if spot >= flip else "amplify"
+        return (f"Spot is {side} the gamma flip (\\${flip:,.2f}, {abs(spot - flip) / spot:.1%} "
+                f"away): dealer hedging tends to {effect} moves.")
+    if net is None:
+        return ""
+    return ("Net positive across all expiries, no flip within 5%: dealer hedging tends to "
+            "dampen moves." if net >= 0 else
+            "Net negative across all expiries, no flip within 5%: dealer hedging tends to "
+            "amplify moves.")
 
 
 LAG_NOTE_MIN_PCT = 0.10          # say so when quotes sit this far (percent) from spot
@@ -194,9 +216,15 @@ def build_view(latest: pd.DataFrame, *, spot: float, as_of: datetime, today: dat
         matrix = gex.gex_matrix(table, spot=spot,
                                 expiries=pick_expiries(mode, available, picked),
                                 n_strikes=None if strikes == "All" else int(strikes))
+    first = [str(matrix.columns[0])] if not matrix.empty else []
     return {"table": table, "available": available, "matrix": matrix,
             "walls": gex.walls(matrix) if not matrix.empty else {},
-            "coverage": gex.coverage(table)}
+            "coverage": gex.coverage(table),
+            # every usable strike, not only the window: the first shown expiry, all expiries
+            "net_all_strikes": gex.full_chain_net(table, first) if first else None,
+            "net_full_chain": gex.full_chain_net(table),
+            "flip": (gex.gamma_flip(table, spot=spot, as_of=as_of) or {}).get("flip")
+            if available else None}
 
 
 def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None = None) -> None:
@@ -260,23 +288,34 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Spot", f"${spot:,.2f}")
-    m2.metric(f"Net GEX · {_fmt_exp(first)}", gex.fmt_money(net) or "—")
+    m2.metric(f"Net GEX · {_fmt_exp(first)} · shown strikes", gex.fmt_money(net) or "—",
+              help="Sum of the strikes in the table only. Changing the strike count can "
+                   "change its sign; the row below sums every strike.")
     m3.metric("Gamma support", _px(sr.get("support")),
               help="Largest positive strike at or below spot. Dips toward it tend to be bought.")
     m4.metric("Call resistance", _px(sr.get("resistance")),
               help="Largest positive strike above spot. Rallies toward it tend to stall.")
     m5.metric("Put wall", _px(w.get("put_wall")),
               help="Most negative strike. Moves can speed up around and below it.")
-    if net is not None:
-        st.caption("Net positive: dealer hedging tends to dampen moves." if net >= 0
-                   else "Net negative: dealer hedging tends to amplify moves.")
+    flip, full_net = view["flip"], view["net_full_chain"]
+    n1, n2, n3, _n4, _n5 = st.columns(5)
+    n1.metric(f"Net GEX · {_fmt_exp(first)} · all strikes",
+              gex.fmt_money(view["net_all_strikes"]) or "—")
+    n2.metric("Net GEX · all expiries", gex.fmt_money(full_net) or "—",
+              help="Every usable strike of every live expiry in the snapshot.")
+    n3.metric("Gamma flip", _px(None if flip is None else round(flip, 2)),
+              help="The price where net GEX across all expiries changes sign, found by "
+                   "re-pricing every contract's gamma at prices within 5% of spot. "
+                   "'—' means the net keeps one sign across that whole range.")
+    st.caption(regime_line(spot=spot, flip=flip, net=full_net))
 
     # ── panel 2: the map ─────────────────────────────────────────────────────
     if layout == LAYOUT_PROFILE:
         shown = ", ".join(_fmt_exp(e) for e in matrix.columns)
         total = gex.fmt_money(profile_series(matrix).sum())
         st.plotly_chart(
-            profile_figure(matrix, spot=spot, title=f"Net GEX · {shown} · net {total}"),
+            profile_figure(matrix, spot=spot, title=f"Net GEX · {shown} · net {total}",
+                           flip=flip),
             use_container_width=True, config={"displayModeBar": False},
         )
     else:
@@ -306,6 +345,11 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
             "- **Gamma support** is the largest positive strike at or below spot and "
             "**Call resistance** the largest above it. The call wall is one of the two; "
             "which side of spot it sits on says how it is likely to act.\n"
+            "- **Gamma flip** is where net GEX across all expiries changes sign. Above "
+            "it, dealer hedging tends to dampen moves; below it, to amplify them. It "
+            "holds IV, time and open interest fixed and moves only the price.\n"
+            "- **Net GEX · shown strikes** sums the table only, so it depends on the "
+            "strike count; the **all strikes** and **all expiries** figures do not.\n"
             "- Large positive strikes tend to act as walls and magnets. "
             "Negative strikes are where moves can speed up.\n"
             "- The sign assumes dealers are long calls and short puts. That is a "
