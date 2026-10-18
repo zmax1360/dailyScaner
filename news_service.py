@@ -263,6 +263,43 @@ def _fetch_yfinance_articles(ticker: str) -> list[dict[str, Any]]:
     return out
 
 
+def fetch_news_range(ticker: str, start: Any, end: Any) -> list[dict[str, Any]]:
+    """Finnhub company news published between two dates (inclusive, ``date`` or
+    YYYY-MM-DD), normalised, oldest first. [] when there is no key or on any failure.
+    Fetched a week at a time, because one call returns a capped number of articles."""
+    from datetime import date as _date
+
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    ticker = (ticker or "").strip().upper()
+    if not api_key or not ticker:
+        return []
+    try:
+        import finnhub
+        client = finnhub.Client(api_key=api_key)
+    except Exception:
+        return []
+    d0 = start if isinstance(start, _date) else _date.fromisoformat(str(start)[:10])
+    d1 = end if isinstance(end, _date) else _date.fromisoformat(str(end)[:10])
+    out: dict[tuple, dict[str, Any]] = {}
+    day = d0
+    while day <= d1:
+        chunk_end = min(day + timedelta(days=6), d1)
+        try:
+            articles = client.company_news(ticker, _from=day.isoformat(), to=chunk_end.isoformat())
+        except Exception:
+            articles = []
+        for a in articles if isinstance(articles, list) else []:
+            item = _normalize_article(
+                headline=a.get("headline") or "", source=a.get("source") or "",
+                url=a.get("url") or "", dt=int(a.get("datetime") or 0),
+                summary=a.get("summary") or "",
+            )
+            if item and item["datetime"]:
+                out[(item["datetime"], item["headline"])] = item
+        day = chunk_end + timedelta(days=1)
+    return sorted(out.values(), key=lambda a: a["datetime"])
+
+
 def fetch_headlines(
     ticker: str,
     lookback_hours: int = 24,
@@ -281,6 +318,11 @@ def fetch_headlines(
     articles = _fetch_finnhub_articles(ticker, lookback_hours)
     if not articles:
         articles = _fetch_yfinance_articles(ticker)
+    try:                                   # keep a history for the News & Moves page
+        import news_history
+        news_history.store(ticker, articles)
+    except Exception:
+        pass
 
     # Drop internal summary from public headline objects when returning
     trimmed = []

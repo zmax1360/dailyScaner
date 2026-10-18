@@ -313,6 +313,20 @@ class YahooSource:
             )
         )
 
+    def fetch_extended_history(
+        self, ticker: str, *, interval: str = "5m", period: str = "5d"
+    ) -> pd.DataFrame:
+        """Intraday bars INCLUDING pre-market (04:00-09:30) and after-hours (16:00-20:00),
+        New York wall-clock index. Yahoo only. Kept apart from ``fetch_history`` on
+        purpose: extended-hours bars must never feed the session EMAs or VWAP."""
+        t = yf.Ticker(ticker)
+        return _clean_history(
+            _yf_retry(
+                lambda: t.history(period=period, interval=interval, prepost=True),
+                label=f"{interval} extended history",
+            )
+        )
+
     def fetch_spot(self, ticker: str) -> float | None:
         try:
             hist = self.fetch_history(ticker, interval="1d", period="5d")

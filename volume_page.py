@@ -51,7 +51,11 @@ def render_volume_page(
     )
 
     today = today or datetime.now(tz).date()
-    table = vh.explorer_table(vh.latest_scan(ticker), vh.daily_summary(ticker), today=today)
+    latest = vh.latest_scan(ticker)
+    from ui.components import volume_by_strike
+    volume_by_strike.render(latest, spot=spot, today=today)
+    st.divider()
+    table = vh.explorer_table(latest, vh.daily_summary(ticker), today=today)
     table = table[table["dte"] >= 1].reset_index(drop=True)          # no 0DTE on this page
     if table.empty:
         st.caption("No contracts expiring after today in the latest scan.")

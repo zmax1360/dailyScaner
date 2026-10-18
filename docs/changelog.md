@@ -4,8 +4,33 @@ One line per change that alters what the system does or shows, newest first, in 
 same commit as the change. Scoring-math changes also go in `CHANGES.md` with the new
 `config_hash` (see `AGENTS.md`). Commit ids are from `main`.
 
+## 2026-10-18
+
+- **Gamma page Profile: net-GEX curve** (`gex_page.profile_curve`): the shown expiries'
+  net GEX if the stock were at each price within ±4% of spot, on its own top scale; it
+  crosses zero at their flip. Display only.
+- **Volume page: volume and open interest by strike** (`positioning.py`,
+  `ui/components/volume_by_strike.py`) for one expiry (0DTE included), calls and puts,
+  with strikes where today's volume ≥ open interest listed as likely new positions.
+- **Contract page: what-if P&L** (`contract_view.pnl_curves`, `breakevens`): P&L per
+  contract against the stock price now, after a chosen hold, at today's close and at
+  expiry, IV held; break-even after the hold.
+- **News & Moves page** (`news_moves.py`, `ui/pages/news_moves.py`, menu Market → News &
+  Moves): 5-minute bars with pre-market and after-hours (`YahooSource.fetch_extended_history`;
+  never fed to the session EMAs or VWAP), unusual moves (bar |return| ≥ k × the recent
+  typical one), the headlines from 30 min before each, and how often moves faded (gave back
+  half within 60 min / by the close), split by up/down and with/without news. Headlines are
+  now kept in `data/news_history.db` (`news_history.py`): every `news_service` fetch is
+  stored, and "Fetch past headlines" fills 30 days from Finnhub (`fetch_news_range`).
+  Display only.
+
 ## 2026-10-17
 
+- **Contract page** (`contract_view.py`, `ui/pages/contract.py`, menu Market → Contract):
+  one recorded option over time — price (mid, or last flagged), stock, delta, gamma,
+  IV (solved from the price at each scan's spot, vendor IV flagged) — and "where the
+  price went" between any two snapshots, split into delta, gamma, theta, vega and
+  residual by re-pricing one input at a time. Display only.
 - Gamma page shows the first shown expiry's own gamma flip (the one the Game Plan reads)
   beside the all-expiries flip, and its regime line leads with "unsettled" when spot is
   within the Game Plan's 0.15% band of it, so the two pages no longer disagree.
