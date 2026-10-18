@@ -195,3 +195,44 @@ def attribution(hist: pd.DataFrame, *, side: str, strike: float,
     return {"start_ts": first["ts"], "end_ts": last["ts"], "start_price": first["price"],
             "end_price": last["price"], "change": last["price"] - first["price"],
             "steps": len(rows) - 1, **terms}
+
+
+# ── what-if P&L ──────────────────────────────────────────────────────────────
+
+def _value_at(side: str, strike: float, expiry: str, price: float, iv: float,
+              when: datetime, r: float) -> float | None:
+    """Option value per share if the stock were at ``price`` at ``when`` (IV held).
+    At or after expiry it is the intrinsic value."""
+    t = gex.years_to_expiry(expiry, when)
+    if t is None:
+        return max(price - strike, 0.0) if side.upper() == "CALL" else max(strike - price, 0.0)
+    return bs_price(side, price, strike, t * YEAR_DAYS, iv, r=r)
+
+
+def pnl_curves(side: str, strike: float, expiry: str, *, iv: float, entry: float,
+               horizons: list[tuple[str, datetime]], prices) -> pd.DataFrame:
+    """P&L per contract ($, 100 shares) for each horizon across ``prices``, IV held at
+    ``iv``. One column per horizon label; index = stock price."""
+    r = float(SCORING.get("risk_free_rate", 0.045))
+    out = {}
+    for label, when in horizons:
+        vals = []
+        for p in prices:
+            v = _value_at(side, strike, expiry, float(p), iv, when, r)
+            vals.append(float("nan") if v is None else (v - entry) * 100.0)
+        out[label] = vals
+    return pd.DataFrame(out, index=pd.Index([float(p) for p in prices], name="price"))
+
+
+def breakevens(curve: pd.Series) -> list[float]:
+    """Stock prices where a P&L curve crosses zero (linear between grid points)."""
+    s = curve.dropna()
+    xs, ys = list(s.index), list(s.values)
+    out = []
+    for i in range(len(xs) - 1):
+        a, b = ys[i], ys[i + 1]
+        if a == 0:
+            out.append(xs[i])
+        elif a * b < 0:
+            out.append(xs[i] + (xs[i + 1] - xs[i]) * a / (a - b))
+    return out

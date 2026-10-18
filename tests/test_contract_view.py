@@ -137,3 +137,43 @@ def test_page_draws_one_chart_per_series():
         "Option price", "Stock price", "Delta", "Gamma", "Implied volatility"]
     assert all(len(f.data) == 1 for f in figs)
     assert list(figs[4].data[0].y) == pytest.approx([25.0, 26.0], abs=0.01)   # IV in %
+
+
+# ── what-if P&L ──────────────────────────────────────────────────────────────
+
+def test_pnl_curves_now_matches_bs_and_expiry_is_intrinsic():
+    import numpy as np
+    prices = np.array([340.0, 345.0, 350.0])
+    entry = _px(345.0, 0.25, T0)
+    exp_close = datetime(2026, 10, 23, 16, 0, tzinfo=ET)
+    c = cv.pnl_curves("CALL", K, EXP, iv=0.25, entry=entry,
+                      horizons=[("Now", T0), ("At expiry", exp_close)], prices=prices)
+    assert c.loc[345.0, "Now"] == pytest.approx(0.0, abs=1e-6)
+    assert list(c["At expiry"]) == pytest.approx(
+        [(max(p - K, 0) - entry) * 100 for p in prices])
+
+
+def test_time_costs_money_when_the_stock_does_not_move():
+    import numpy as np
+    entry = _px(345.0, 0.25, T0)
+    c = cv.pnl_curves("CALL", K, EXP, iv=0.25, entry=entry,
+                      horizons=[("Now", T0), ("Later", T0 + timedelta(hours=24))],
+                      prices=np.array([345.0]))
+    assert c.loc[345.0, "Later"] < c.loc[345.0, "Now"]
+
+
+def test_breakevens_interpolate_zero_crossings():
+    s = pd.Series([-10.0, -2.0, 6.0, 10.0], index=[1.0, 2.0, 3.0, 4.0])
+    assert cv.breakevens(s) == [pytest.approx(2.25)]
+    assert cv.breakevens(pd.Series([1.0, 2.0], index=[1.0, 2.0])) == []
+
+
+def test_what_if_horizons_skip_a_close_already_passed_and_stop_at_expiry():
+    from ui.pages import contract as page
+    morning = datetime(2026, 10, 19, 10, 0, tzinfo=ET)
+    labels = [h[0] for h in page.what_if_horizons(morning, EXP, 60)]
+    assert labels == ["Now", "In 60 min", "Today's close", "At expiry"]
+    expiry_day = datetime(2026, 10, 23, 15, 30, tzinfo=ET)
+    hz = page.what_if_horizons(expiry_day, EXP, 120)
+    assert [h[0] for h in hz] == ["Now", "In 120 min", "At expiry"]
+    assert hz[1][1] == datetime(2026, 10, 23, 16, 0, tzinfo=ET)      # capped at expiry

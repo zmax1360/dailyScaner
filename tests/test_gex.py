@@ -6,6 +6,7 @@ import math
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -932,3 +933,17 @@ def test_build_view_reports_the_first_expirys_flip():
     v = gex_page.build_view(_latest(_two_sided()), spot=SPOT, as_of=AS_OF,
                             today=date(2026, 10, 2), strikes="8")
     assert 327.5 < v["flip_nearest"] < 340.0
+
+
+def test_profile_curve_crosses_zero_at_the_shown_expiries_flip():
+    v = gex_page.build_view(_latest(_two_sided()), spot=SPOT, as_of=AS_OF,
+                            today=date(2026, 10, 2), strikes="All")
+    prices, net = v["curve"]
+    assert len(prices) == gex_page.CURVE_POINTS
+    assert net[0] < 0 < net[-1]                        # puts below, calls above
+    fig = gex_page.profile_figure(v["matrix"], spot=SPOT, curve=v["curve"])
+    assert any(getattr(t, "xaxis", None) == "x2" for t in fig.data)
+    reach = float(np.nanmax(np.abs(net)))
+    assert fig.layout.xaxis2.range[1] >= reach         # the whole curve fits its own axis
+    assert fig.layout.xaxis.range[1] < reach * 10
+    assert gex_page.profile_curve(None, pd.DataFrame(), as_of=AS_OF) is None

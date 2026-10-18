@@ -144,10 +144,16 @@ def profile_series(matrix: pd.DataFrame) -> pd.Series:
     return matrix.sum(axis=1, min_count=1).dropna().sort_index(ascending=False)
 
 
+PROFILE_CURVE = "rgb(250, 250, 210)"
+
+
 def profile_figure(matrix: pd.DataFrame, *, spot: float, title: str = "",
-                   flip: float | None = None):
+                   flip: float | None = None, curve: tuple | None = None):
     """Horizontal bars of net GEX by strike on a price axis: positive to the right,
-    negative to the left, the largest of each highlighted, and a line at spot."""
+    negative to the left, the largest of each highlighted, and a line at spot.
+
+    ``curve`` = (prices, net): the book's total net GEX if the stock were at each price,
+    drawn as a line on its own scale (top axis). Where it crosses zero is the flip."""
     import plotly.graph_objects as go
 
     net = profile_series(matrix)
@@ -182,9 +188,20 @@ def profile_figure(matrix: pd.DataFrame, *, spot: float, title: str = "",
                       annotation_position="bottom left",
                       annotation_font=dict(color="rgb(251, 146, 60)", size=11))
     fig.add_vline(x=0, line=dict(color="rgba(255,255,255,0.35)", width=1))
+    if curve is not None and len(curve[0]) and np.isfinite(np.asarray(curve[1], float)).any():
+        prices, total = np.asarray(curve[0], float), np.asarray(curve[1], float)
+        reach = float(np.nanmax(np.abs(total))) or 1.0
+        fig.add_trace(go.Scatter(
+            x=total, y=prices, mode="lines", name="Net GEX if price were here",
+            line=dict(color=PROFILE_CURVE, width=2), xaxis="x2",
+            hovertemplate="if at $%{y:.2f}: %{x:,.0f}<extra>whole book</extra>"))
+        fig.update_layout(xaxis2=dict(overlaying="x", side="top", showgrid=False,
+                                      zeroline=False, range=[-reach * 1.25, reach * 1.25],
+                                      showticklabels=False))
     span = float(net.abs().max())
-    fig.update_xaxes(range=[-span * 1.25, span * 1.25], showgrid=False, zeroline=False,
-                     showticklabels=False)
+    # the bars' axis only: update_xaxes would also rescale the curve's own axis (x2)
+    fig.layout.xaxis.update(range=[-span * 1.25, span * 1.25], showgrid=False, zeroline=False,
+                            showticklabels=False)
     fig.update_yaxes(tickmode="array", tickvals=list(net.index),
                      ticktext=[f"{k:g}" for k in net.index], showgrid=False,
                      range=[float(net.index.min()) - step, float(net.index.max()) + step])
@@ -235,6 +252,28 @@ def lag_note(quote_prices: dict, expiry: str, spot: float) -> str:
             "strikes nearest the price are the least certain.")
 
 
+CURVE_POINTS = 121
+CURVE_BAND_PCT = 0.04          # the curve is drawn within this share of spot
+
+
+def profile_curve(table: pd.DataFrame, matrix: pd.DataFrame, *, as_of: datetime,
+                  unit: str = gex.UNIT_DOLLAR, spot: float | None = None) -> tuple | None:
+    """(prices, net) for the shown expiries over the shown strikes, kept within
+    +/- CURVE_BAND_PCT of spot (far from spot the numbers swamp the part that matters)."""
+    if matrix is None or matrix.empty:
+        return None
+    lo, hi = float(matrix.index.min()), float(matrix.index.max())
+    if spot:
+        lo = max(lo, float(spot) * (1 - CURVE_BAND_PCT))
+        hi = min(hi, float(spot) * (1 + CURVE_BAND_PCT))
+    if hi <= lo:
+        return None
+    prices = np.linspace(lo, hi, CURVE_POINTS)
+    net = gex.net_gex_curve(table, as_of=as_of, spots=prices, unit=unit,
+                            expiries=[str(e) for e in matrix.columns])
+    return (prices, net)
+
+
 def build_view(latest: pd.DataFrame, *, spot: float, as_of: datetime, today: date,
                unit: str = gex.UNIT_DOLLAR, iv_source: str = gex.IV_QUOTE,
                mode: str = EXP_WEEK, picked: list[str] | None = None,
@@ -258,6 +297,8 @@ def build_view(latest: pd.DataFrame, *, spot: float, as_of: datetime, today: dat
             "net_full_chain": gex.full_chain_net(table),
             "flip": (gex.gamma_flip(table, spot=spot, as_of=as_of) or {}).get("flip")
             if available else None,
+            # net GEX of the shown expiries as price moves across the shown strikes
+            "curve": profile_curve(table, matrix, as_of=as_of, unit=unit, spot=spot),
             # the first shown expiry's own flip: the one the Game Plan reads
             "flip_nearest": (gex.gamma_flip(table, spot=spot, as_of=as_of, expiries=first)
                              or {}).get("flip") if first else None}
@@ -357,7 +398,7 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
         total = gex.fmt_money(profile_series(matrix).sum())
         st.plotly_chart(
             profile_figure(matrix, spot=spot, title=f"Net GEX · {shown} · net {total}",
-                           flip=flip),
+                           flip=flip, curve=view.get("curve")),
             use_container_width=True, config={"displayModeBar": False},
         )
     else:
@@ -392,6 +433,9 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
             "holds IV, time and open interest fixed and moves only the price.\n"
             "- **Net GEX · shown strikes** sums the table only, so it depends on the "
             "strike count; the **all strikes** and **all expiries** figures do not.\n"
+            "- In **Profile**, the pale line is the whole book's net GEX if the stock were at "
+            "each price (top scale; shown expiries only). Where it crosses zero is those "
+            "expiries' flip; a steep line means behaviour changes quickly around it.\n"
             "- Large positive strikes tend to act as walls and magnets. "
             "Negative strikes are where moves can speed up.\n"
             "- The sign assumes dealers are long calls and short puts. That is a "

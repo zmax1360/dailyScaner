@@ -6,6 +6,15 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-18
 
+- **Gamma page Profile: net-GEX curve** (`gex_page.profile_curve`): the shown expiries'
+  net GEX if the stock were at each price within ±4% of spot, on its own top scale; it
+  crosses zero at their flip. Display only.
+- **Volume page: volume and open interest by strike** (`positioning.py`,
+  `ui/components/volume_by_strike.py`) for one expiry (0DTE included), calls and puts,
+  with strikes where today's volume ≥ open interest listed as likely new positions.
+- **Contract page: what-if P&L** (`contract_view.pnl_curves`, `breakevens`): P&L per
+  contract against the stock price now, after a chosen hold, at today's close and at
+  expiry, IV held; break-even after the hold.
 - **News & Moves page** (`news_moves.py`, `ui/pages/news_moves.py`, menu Market → News &
   Moves): 5-minute bars with pre-market and after-hours (`YahooSource.fetch_extended_history`;
   never fed to the session EMAs or VWAP), unusual moves (bar |return| ≥ k × the recent

@@ -152,6 +152,8 @@ def render(cfg: dict) -> None:
         for col, fig in zip(cols, figs[i:i + 2]):
             col.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
+    _render_what_if(h, side=side, strike=float(strike), expiry=expiry, spot=spot)
+
     usable = h.dropna(subset=["spot", "price", "iv"])
     if len(usable) < 2:
         st.caption("Fewer than two usable snapshots, so there is nothing to attribute yet.")
@@ -189,3 +191,86 @@ def render(cfg: dict) -> None:
             "therefore jumps around on fast days, and over a short window part of a move "
             "can land in vega instead of delta/gamma. The total is always exact."
         )
+
+
+HOLD_CHOICES = {"15 min": 15, "30 min": 30, "1 hour": 60, "2 hours": 120, "4 hours": 240}
+PNL_COLORS = ["#67E8F9", "#C084FC", "#FACC15", "#9CA3AF"]
+
+
+def what_if_horizons(now, expiry: str, hold_min: int):
+    """(label, time) pairs: now, after the hold, today's close (if still ahead), expiry."""
+    from datetime import datetime as _dt, time as _time, timedelta as _td
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    now = now.astimezone(et)
+    close = _dt.combine(now.date(), _time(16, 0), tzinfo=et)
+    exp_close = _dt.combine(date.fromisoformat(str(expiry)[:10]), _time(16, 0), tzinfo=et)
+    out = [("Now", now), (f"In {hold_min} min", min(now + _td(minutes=hold_min), exp_close))]
+    if now < close < exp_close and close > out[1][1]:
+        out.append(("Today's close", close))
+    out.append(("At expiry", exp_close))
+    return out
+
+
+def what_if_figure(curves: pd.DataFrame, *, spot: float | None):
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                      plot_bgcolor="rgba(0,0,0,0)", height=380, hovermode="x unified",
+                      margin=dict(l=10, r=10, t=10, b=10),
+                      legend=dict(orientation="h", y=1.08, x=0),
+                      xaxis_title="stock price", yaxis_title="P&L per contract ($)")
+    for col, color in zip(curves.columns, PNL_COLORS):
+        fig.add_trace(go.Scatter(x=curves.index, y=curves[col], name=col, mode="lines",
+                                 line=dict(color=color, width=2,
+                                           dash="dot" if col == "At expiry" else "solid"),
+                                 hovertemplate="%{y:+,.0f} $<extra>" + col + "</extra>"))
+    fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.4)", width=1))
+    if spot:
+        fig.add_vline(x=float(spot), line=dict(color="rgb(250,204,21)", width=1, dash="dot"),
+                      annotation_text=f"stock {float(spot):,.2f}",
+                      annotation_font=dict(color="rgb(250,204,21)", size=11))
+    return fig
+
+
+def _render_what_if(h: pd.DataFrame, *, side: str, strike: float, expiry: str,
+                    spot: float | None) -> None:
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    import numpy as np
+
+    ok = h.dropna(subset=["iv", "spot", "price"])
+    if ok.empty:
+        return
+    last = ok.iloc[-1]
+    s0 = float(spot or last["spot"])
+    st.markdown("**What-if P&L (per contract)**")
+    c1, c2, c3 = st.columns(3)
+    entry = c1.number_input("Entry price", min_value=0.01, value=round(float(last["price"]), 2),
+                            step=0.05, key=f"wi_entry_{expiry}_{side}_{strike}")
+    hold = c2.select_slider("Hold for", list(HOLD_CHOICES), value="1 hour",
+                            key=f"wi_hold_{expiry}_{side}_{strike}")
+    width = c3.select_slider("Price range", ["±1%", "±2%", "±3%", "±5%"], value="±2%",
+                             key=f"wi_range_{expiry}_{side}_{strike}")
+    pct = float(width.strip("±%")) / 100.0
+    now = _dt.now(ZoneInfo("America/New_York"))
+    if cv.gex.years_to_expiry(expiry, now) is None:
+        st.caption("This contract has expired, so there is nothing to project.")
+        return
+    prices = np.linspace(s0 * (1 - pct), s0 * (1 + pct), 81)
+    curves = cv.pnl_curves(side, strike, expiry, iv=float(last["iv"]), entry=float(entry),
+                           horizons=what_if_horizons(now, expiry, HOLD_CHOICES[hold]),
+                           prices=prices)
+    st.plotly_chart(what_if_figure(curves, spot=s0), use_container_width=True,
+                    config={"displayModeBar": False})
+    hold_col = curves.columns[1]
+    be = cv.breakevens(curves[hold_col])
+    flat = curves[hold_col].iloc[int(np.argmin(np.abs(curves.index - s0)))]
+    st.caption(
+        f"IV held at {float(last['iv']) * 100:.1f}%. If the stock does not move, after "
+        f"{hold.lower()} this is {flat:+,.0f} \\$ per contract (time decay). "
+        + (f"Break-even then: \\${', '.join(f'{b:,.2f}' for b in be)}." if be
+           else "No break-even inside this price range.")
+        + " Each line is the same option at a later time: the gap between them is theta, "
+          "the bend is gamma.")
