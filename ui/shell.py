@@ -47,6 +47,7 @@ MENU: list[tuple[str, list[Entry]]] = [
         Entry("contract", "Contract", "query_stats", "🔎"),
         Entry("volume", "Volume", "bar_chart", "📊"),
         Entry("news", "Market News", "newspaper", "📰"),
+        Entry("news_moves", "News & Moves", "bolt", "⚡"),
     ]),
     ("Review", [
         Entry("report", "Report", "summarize", "🧾"),

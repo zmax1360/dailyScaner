@@ -4,6 +4,17 @@ One line per change that alters what the system does or shows, newest first, in 
 same commit as the change. Scoring-math changes also go in `CHANGES.md` with the new
 `config_hash` (see `AGENTS.md`). Commit ids are from `main`.
 
+## 2026-10-18
+
+- **News & Moves page** (`news_moves.py`, `ui/pages/news_moves.py`, menu Market → News &
+  Moves): 5-minute bars with pre-market and after-hours (`YahooSource.fetch_extended_history`;
+  never fed to the session EMAs or VWAP), unusual moves (bar |return| ≥ k × the recent
+  typical one), the headlines from 30 min before each, and how often moves faded (gave back
+  half within 60 min / by the close), split by up/down and with/without news. Headlines are
+  now kept in `data/news_history.db` (`news_history.py`): every `news_service` fetch is
+  stored, and "Fetch past headlines" fills 30 days from Finnhub (`fetch_news_range`).
+  Display only.
+
 ## 2026-10-17
 
 - **Contract page** (`contract_view.py`, `ui/pages/contract.py`, menu Market → Contract):
