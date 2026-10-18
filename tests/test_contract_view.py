@@ -127,3 +127,13 @@ def test_page_default_strike_and_menu():
     assert page.default_strike([340.0, 342.5, 345.0], 343.46) == 342.5
     assert page.default_strike([], 343.0) is None
     assert {e.id: e.title for e in shell.entries()}["contract"] == "Contract"
+
+
+def test_page_draws_one_chart_per_series():
+    from ui.pages import contract as page
+    h = _hist([(T0, 343.0, 0.25), (T0 + timedelta(minutes=15), 344.0, 0.26)])
+    figs = page.charts(h)
+    assert [f.layout.title.text for f in figs] == [
+        "Option price", "Stock price", "Delta", "Gamma", "Implied volatility"]
+    assert all(len(f.data) == 1 for f in figs)
+    assert list(figs[4].data[0].y) == pytest.approx([25.0, 26.0], abs=0.01)   # IV in %

@@ -44,42 +44,43 @@ def default_strike(strikes: list[float], spot: float | None) -> float | None:
     return min(strikes, key=lambda k: (abs(k - float(spot)), k))
 
 
-def figures(h: pd.DataFrame):
-    """(price & spot, delta & gamma, IV) — three small charts on one time axis."""
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
+CHARTS = [  # (column, title, colour, y-axis label, scale)
+    ("price", "Option price", PRICE, "$ per share", 1.0),
+    ("spot", "Stock price", SPOT, "$", 1.0),
+    ("delta", "Delta", DELTA, "delta", 1.0),
+    ("gamma", "Gamma", GAMMA, "gamma", 1.0),
+    ("iv", "Implied volatility", IV, "IV %", 100.0),
+]
 
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                        row_heights=[0.45, 0.30, 0.25],
-                        specs=[[{"secondary_y": True}], [{"secondary_y": True}],
-                               [{"secondary_y": False}]])
-    fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-                      plot_bgcolor="rgba(0,0,0,0)", height=720, hovermode="x unified",
-                      margin=dict(l=10, r=10, t=30, b=10),
-                      legend=dict(orientation="h", y=1.04, x=0))
-    # New York wall-clock time, so the night/weekend gaps below line up with the session
-    x = pd.to_datetime(h["ts"], utc=True).dt.tz_convert("America/New_York").dt.tz_localize(None)
-    fig.add_trace(go.Scatter(x=x, y=h["price"], name="Option price", mode="lines+markers",
-                             line=dict(color=PRICE, width=2), marker=dict(size=4),
-                             connectgaps=False), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x, y=h["spot"], name="Stock", mode="lines",
-                             line=dict(color=SPOT, width=1, dash="dot")),
-                  row=1, col=1, secondary_y=True)
-    fig.add_trace(go.Scatter(x=x, y=h["delta"], name="Delta", mode="lines",
-                             line=dict(color=DELTA, width=2)), row=2, col=1)
-    fig.add_trace(go.Scatter(x=x, y=h["gamma"], name="Gamma", mode="lines",
-                             line=dict(color=GAMMA, width=2)), row=2, col=1, secondary_y=True)
-    fig.add_trace(go.Scatter(x=x, y=h["iv"] * 100, name="IV %", mode="lines",
-                             line=dict(color=IV, width=2)), row=3, col=1)
-    fig.update_yaxes(title_text="$ option", row=1, col=1)
-    fig.update_yaxes(title_text="$ stock", row=1, col=1, secondary_y=True, showgrid=False)
-    fig.update_yaxes(title_text="delta", row=2, col=1)
-    fig.update_yaxes(title_text="gamma", row=2, col=1, secondary_y=True, showgrid=False)
-    fig.update_yaxes(title_text="IV %", row=3, col=1)
-    # no x gaps for nights and weekends
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]),
+
+def _wall_clock(ts: pd.Series) -> pd.Series:
+    """New York wall-clock time, so the night/weekend gaps line up with the session."""
+    return pd.to_datetime(ts, utc=True).dt.tz_convert("America/New_York").dt.tz_localize(None)
+
+
+def chart(h: pd.DataFrame, column: str, title: str, color: str, ylabel: str,
+          scale: float = 1.0, *, height: int = 260):
+    """One small line chart of one series over time (a gap where the value is missing)."""
+    import plotly.graph_objects as go
+
+    fig = go.Figure(go.Scatter(
+        x=_wall_clock(h["ts"]), y=h[column] * scale, mode="lines+markers", name=title,
+        line=dict(color=color, width=2), marker=dict(size=3), connectgaps=False,
+        hovertemplate="%{x|%a %b %d %H:%M}<br>%{y:.4g}<extra></extra>"))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=height, margin=dict(l=10, r=10, t=34, b=10), showlegend=False,
+        title=dict(text=title, font=dict(size=14, color="#e0e0e0"), x=0.01))
+    fig.update_yaxes(title_text=ylabel, gridcolor="rgba(255,255,255,0.06)")
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.06)",
+                     rangebreaks=[dict(bounds=["sat", "mon"]),
                                   dict(bounds=[16.5, 9.5], pattern="hour")])
     return fig
+
+
+def charts(h: pd.DataFrame) -> list:
+    """The five charts, in display order."""
+    return [chart(h, *spec) for spec in CHARTS]
 
 
 def waterfall(a: dict):
@@ -145,7 +146,11 @@ def render(cfg: dict) -> None:
                      + (" (vendor IV: the price did not solve)." if last["iv_from"] == "vendor"
                         else "."))
 
-    st.plotly_chart(figures(h), use_container_width=True, config={"displayModeBar": False})
+    figs = charts(h)
+    for i in range(0, len(figs), 2):
+        cols = st.columns(2)
+        for col, fig in zip(cols, figs[i:i + 2]):
+            col.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
     usable = h.dropna(subset=["spot", "price", "iv"])
     if len(usable) < 2:
