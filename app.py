@@ -33,6 +33,7 @@ from ui.pages import flow as flow_page
 from ui.pages import journal as journal_page
 from ui.pages import report as report_page
 from ui.pages import oi_delta as oi_delta_page
+from ui.pages import contract as contract_page
 from ui.pages import scorecard as scorecard_page
 from ui.pages import settings as settings_page
 from ui.pages import news as news_page
@@ -355,7 +356,7 @@ def main():
                    "spread_gate": spread_gate_page.render}
     plain = {"news": news_page.render, "scorecard": scorecard_page.render,
              "report": report_page.render, "settings": settings_page.render,
-             "oi_delta": oi_delta_page.render}
+             "oi_delta": oi_delta_page.render, "contract": contract_page.render}
     if page in with_banner:
         render_market_banner()
         with_banner[page](cfg)

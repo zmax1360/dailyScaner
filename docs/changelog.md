@@ -6,6 +6,11 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
 
 ## 2026-10-17
 
+- **Contract page** (`contract_view.py`, `ui/pages/contract.py`, menu Market → Contract):
+  one recorded option over time — price (mid, or last flagged), stock, delta, gamma,
+  IV (solved from the price at each scan's spot, vendor IV flagged) — and "where the
+  price went" between any two snapshots, split into delta, gamma, theta, vega and
+  residual by re-pricing one input at a time. Display only.
 - Gamma page shows the first shown expiry's own gamma flip (the one the Game Plan reads)
   beside the all-expiries flip, and its regime line leads with "unsettled" when spot is
   within the Game Plan's 0.15% band of it, so the two pages no longer disagree.
