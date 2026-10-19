@@ -987,6 +987,8 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
     # Built last: the plan reads the timeframes, ranking, gamma and VWAP above.
     payload["vwap"] = _vwap_snapshot()
     payload["game_plan"] = _plan_snapshot(payload, ts_aware)
+    if not is_eod:
+        payload["setup_1100"] = _setup_snapshot(payload, calls_all, puts_all, ts_aware)
 
     with open(fname, "w") as f:
         json.dump(payload, f, indent=2)
@@ -1034,6 +1036,21 @@ def _plan_snapshot(payload, ts):
         return plan_report.build_saved_plan(payload, TICKER, now=ts)
     except Exception as exc:
         log.warning(f"Game Plan snapshot failed (scan continues): {exc}")
+        return None
+
+
+def _setup_snapshot(payload, calls_all, puts_all, ts):
+    """The 11:00 setup (``setup_1100``, paper only): decided at the first scan between
+    11:00 and 11:10 ET, then resolved from the same contract's bid at later scans. Saved
+    as ``setup_1100``; the scheduler sends its Telegram line. Never raises."""
+    try:
+        import setup_1100
+        import volume_history
+        ev = setup_1100.on_scan(payload, volume_history.chain_frame(calls_all, puts_all),
+                                ticker=TICKER, now=ts)
+        return None if ev is None else json.loads(json.dumps(ev, default=str))
+    except Exception as exc:
+        log.warning(f"11:00 setup failed (scan continues): {exc}")
         return None
 
 

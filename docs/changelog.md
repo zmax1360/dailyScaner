@@ -4,6 +4,21 @@ One line per change that alters what the system does or shows, newest first, in 
 same commit as the change. Scoring-math changes also go in `CHANGES.md` with the new
 `config_hash` (see `AGENTS.md`). Commit ids are from `main`.
 
+## 2026-10-19
+
+- **11:00 setup, paper only** (`setup_1100.py`, `ui/pages/setup_1100.py`, menu Trade →
+  11:00 Setup). At the first scan between 11:00 and 11:10 ET (AAPL), it records one
+  decision: buy 1 at-the-money option of the nearest expiry at the ask only when the
+  15-minute EMAs are stacked and price is on the same side of the first scan at or after
+  09:45; otherwise no trade (spread > $0.06 or ask < $0.15 also mean no trade). Later
+  scans resolve it from the same contract's bid: +$0.15 target (recorded at the target),
+  −$0.10 stop (recorded at the bid that hit it) or 30 minutes. Stored in
+  `data/setup_1100.db`, saved in the scan as `payload["setup_1100"]`, and the scheduler
+  sends the decision and the exit to Telegram (`setup_alert: false` turns it off per
+  ticker). From a replay of recorded quotes over 59 sessions (Jul 27 – Oct 16): 23 trades,
+  74% winners, +$6 per trade with stops slipped. Places no order; scoring, ranking and the
+  Game Plan are unchanged.
+
 ## 2026-10-18
 
 - **Gamma page Profile: net-GEX curve** (`gex_page.profile_curve`): the shown expiries'

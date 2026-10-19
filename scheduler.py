@@ -362,6 +362,35 @@ def _gamma_shift_check(ticker: str, env: dict, *, send: bool) -> None:
         log.warning(f"[{ticker}] gamma shift check error: {exc}")
 
 
+def ticker_setup_alert(cfg: dict, ticker: str) -> bool:
+    """11:00 setup alert for ``ticker``: on unless ``"setup_alert": false``."""
+    own = ((cfg or {}).get("tickers") or {}).get(ticker, {})
+    return own.get("setup_alert", True) is not False
+
+
+def _setup_alert(ticker: str, env: dict, *, send: bool) -> None:
+    """After a successful scan: the 11:00 setup's decision or exit, when this scan made
+    one (``payload["setup_1100"]``). Paper only. Never raises."""
+    try:
+        import setup_1100
+        from telegram_bot import _load_latest
+        payload, _ = _load_latest(ticker)
+        text = setup_1100.message((payload or {}).get("setup_1100"))
+        if not text:
+            return
+        log.info(f"[{ticker}] 11:00 setup: {setup_1100.html.unescape(text).splitlines()[1]}")
+        token = ticker_bot_token(env, ticker)
+        chat_id = ticker_chat_id(env, ticker, load_config())
+        if not send or not token or not chat_id:
+            return
+        if _send_telegram(token, chat_id, text, ticker=ticker, kind="setup_1100"):
+            log.info(f"[{ticker}] 11:00 setup alert sent")
+        else:
+            log.warning(f"[{ticker}] 11:00 setup alert failed")
+    except Exception as exc:
+        log.warning(f"[{ticker}] 11:00 setup alert error: {exc}")
+
+
 def _notify_refusal_streak(ticker: str, reason: str | None, env: dict) -> None:
     """One alert when consecutive refusals hit 3 — then silent until success."""
     from notify_delivery import REFUSAL_STREAK_ALERT_AT
@@ -409,6 +438,7 @@ def handle_scan_result(
         if notify:
             _notify_success(ticker, env, elapsed)
         _gamma_shift_check(ticker, env, send=notify and ticker_gamma_alert(load_config(), ticker))
+        _setup_alert(ticker, env, send=notify and ticker_setup_alert(load_config(), ticker))
         return
 
     if exit_code == 3:

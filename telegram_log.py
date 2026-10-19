@@ -27,7 +27,8 @@ TRIM_AT = 1000        # trim once the file has this many lines
 PREVIEW = 600         # characters of message text kept
 
 KIND_LABELS = {"scan": "Scan message", "gamma_shift": "Gamma shift alert",
-               "refusal": "Scanner stopped alert", "manual": "Sent from the app"}
+               "refusal": "Scanner stopped alert", "manual": "Sent from the app",
+               "setup_1100": "11:00 setup alert"}
 
 
 def bot_id(token: str | None) -> str:
