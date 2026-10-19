@@ -72,26 +72,30 @@ def render(cfg: dict) -> None:
     st.caption("Recorded by the scanner; nothing is bought or sold. Compare its results "
                "with the replay before trading it with money.")
     if ticker not in su.TICKERS:
-        st.info(f"The 11:00 setup runs for {', '.join(sorted(su.TICKERS))} only: the replay "
-                "behind it used that ticker's quotes.")
+        st.info(f"The 11:00 setup runs for {', '.join(sorted(su.TICKERS))} only.")
         return
+    rp = su.REPLAY.get(ticker)
+    if rp is None:
+        st.warning(f"No replay behind {ticker}: too few recorded sessions. This record is "
+                   "the test; judge it after 15 to 20 sessions.")
 
     hist = su.history(ticker)
     today = datetime.now(ET).date().isoformat()
     _today(next((r for r in hist.to_dict("records") if r["day"] == today), None))
 
     s = su.stats(hist)
-    rp = su.REPLAY
     c = st.columns(4)
     c[0].metric("Trades closed", s["closed"],
                 help=f"Sessions recorded: {s['sessions']} · no trade: {s['no_trade']} · "
-                     f"missed: {s['missed']}. Replay: {rp['trades']} trades in "
-                     f"{rp['sessions']} sessions.")
+                     f"missed: {s['missed']}."
+                     + (f" Replay: {rp['trades']} trades in {rp['sessions']} sessions."
+                        if rp else ""))
     c[1].metric("Winners", "—" if s["win_pct"] is None else f"{s['win_pct']}%",
-                help=f"Replay: {rp['win_pct']}%")
+                help=f"Replay: {rp['win_pct']}%" if rp else "No replay")
     c[2].metric("Total (USD)", f"{s['total']:+.0f}")
     c[3].metric("Average per trade", "—" if s["avg"] is None else f"{s['avg']:+.2f}",
-                help=f"Replay: +{rp['avg_usd']:.2f} per trade, with stops slipped")
+                help=(f"Replay: +{rp['avg_usd']:.2f} per trade, with stops slipped"
+                      if rp else "No replay"))
 
     with st.expander("The rule"):
         st.markdown(
@@ -99,7 +103,8 @@ def render(cfg: dict) -> None:
             f"{su.DECIDE_UNTIL:%H:%M} ET. One decision a day.\n"
             "- **Side:** only when both agree: the 15-minute EMAs are stacked (9 > 21 > 50 "
             "calls, 9 < 21 < 50 puts) and price is on the same side of the morning "
-            f"reference (the first scan at or after {su.MORNING_REF:%H:%M}). Otherwise no trade.\n"
+            f"reference (the first scan between {su.MORNING_REF:%H:%M} and "
+            f"{su.MORNING_LATEST:%H:%M}). Otherwise no trade.\n"
             "- **Contract:** 1 at-the-money option of that side, nearest expiry, at the ask; "
             f"no trade if the spread is over ${su.MAX_SPREAD:.2f} or the ask under "
             f"${su.MIN_ASK:.2f}.\n"

@@ -143,9 +143,24 @@ def test_on_scan_records_a_missed_day(tmp_path):
     assert su.stats(su.history("AAPL", db_path=db))["missed"] == 1
 
 
+def test_morning_reference_must_be_between_0945_and_1000(tmp_path):
+    arc = _archive(tmp_path, "094100", 341.0)
+    _archive(tmp_path, "102800", 343.0)
+    assert su.morning_spot("AAPL", DAY, archive_dir=arc) is None
+    _archive(tmp_path, "095200", 342.0)
+    assert su.morning_spot("AAPL", DAY, archive_dir=arc) == 342.0
+
+
+def test_spy_is_recorded_without_a_replay(tmp_path):
+    assert "SPY" in su.TICKERS and su.REPLAY["SPY"] is None
+    ev = su.on_scan(payload(), chain(), ticker="SPY", now=at("11:02"),
+                    db_path=str(tmp_path / "s.db"), archive_dir=str(tmp_path))
+    assert ev["event"] == "decided" and ev["trade"]["ticker"] == "SPY"
+
+
 def test_on_scan_ignores_other_tickers_and_naive_times(tmp_path):
     db = str(tmp_path / "s.db")
-    assert su.on_scan(payload(), chain(), ticker="SPY", now=at("11:02"), db_path=db) is None
+    assert su.on_scan(payload(), chain(), ticker="NVDA", now=at("11:02"), db_path=db) is None
     assert su.on_scan(payload(), chain(), ticker="AAPL", now=at("11:02").replace(tzinfo=None),
                       db_path=db) is None
 

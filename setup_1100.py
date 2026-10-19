@@ -5,8 +5,8 @@ Rule (from the 2026-10-19 replay of recorded quotes, 59 sessions Jul 27 - Oct 16
 
     At the first scan between 11:00 and 11:10 ET, trade only when both agree:
       * the 15-minute EMAs are stacked (``ema_stack``: 9 > 21 > 50 calls, 9 < 21 < 50 puts)
-      * price is on the same side of the day's morning reference (the first scan at or
-        after 09:45): above it for calls, below it for puts.
+      * price is on the same side of the day's morning reference (the first scan between
+        09:45 and 10:00): above it for calls, below it for puts.
     Then buy 1 at-the-money option of that side, nearest expiry, at the ask.
     No trade when the spread is wider than $0.06 or the ask is under $0.15.
     Exit on the bid: +$0.15 (target, filled at the target as a limit order would be),
@@ -14,7 +14,8 @@ Rule (from the 2026-10-19 replay of recorded quotes, 59 sessions Jul 27 - Oct 16
     entry at the bid.
 
 One decision per session. Later scans resolve the open paper trade from the bid of the
-same contract. The replay: 23 trades, 74% winners, +$6 per trade with stops slipped.
+same contract. The AAPL replay: 23 trades, 74% winners, +$6 per trade with stops
+slipped. SPY is recorded with the same rule but has no replay behind it.
 """
 
 from __future__ import annotations
@@ -37,10 +38,11 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_BASE, "data", "setup_1100.db")
 ARCHIVE_DIR = os.path.join(_BASE, "archive")
 
-TICKERS = frozenset({"AAPL"})          # the replay covered AAPL only
+TICKERS = frozenset({"AAPL", "SPY"})   # SPY: recorded with no replay behind it yet
 DECIDE_FROM = time(11, 0)
 DECIDE_UNTIL = time(11, 10)
 MORNING_REF = time(9, 45)
+MORNING_LATEST = time(10, 0)
 TARGET = 0.15
 STOP = 0.10
 HOLD_MIN = 30
@@ -51,7 +53,9 @@ TRADE, NO_TRADE, MISSED = "TRADE", "NO_TRADE", "MISSED"
 OPEN, WIN, LOSS_STOP, TIME_EXIT, NO_QUOTE = "OPEN", "WIN", "STOP", "TIME", "NO_QUOTE"
 CLOSED = (WIN, LOSS_STOP, TIME_EXIT, NO_QUOTE)
 
-REPLAY = {"trades": 23, "sessions": 59, "win_pct": 74, "avg_usd": 6.1}
+# Replay baseline per ticker; None = no replay (too few recorded sessions).
+REPLAY = {"AAPL": {"trades": 23, "sessions": 59, "win_pct": 74, "avg_usd": 6.1},
+          "SPY": None}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS setup_trades (
@@ -146,14 +150,15 @@ def _num(v: Any) -> float | None:
 
 
 def morning_spot(ticker: str, day: str, *, archive_dir: str | None = None) -> float | None:
-    """Spot of the day's first scan at or after 09:45 (the earliest scan when none is)."""
+    """Spot of the day's first scan between 09:45 and 10:00. None when there is none:
+    a later scan is not the same reference, so the day gets no trade."""
     d = archive_dir or ARCHIVE_DIR
     stamp = day.replace("-", "")
+    lo, hi = MORNING_REF.strftime("%H%M%S"), MORNING_LATEST.strftime("%H%M%S")
     files = sorted(glob.glob(os.path.join(d, f"{ticker.upper()}_{stamp}_*.json")))
-    if not files:
-        return None
-    later = [f for f in files if os.path.basename(f)[-11:-5] >= MORNING_REF.strftime("%H%M%S")]
-    for f in (later or files):
+    for f in files:
+        if not lo <= os.path.basename(f)[-11:-5] < hi:
+            continue
         try:
             with open(f) as fh:
                 spot = _num(json.load(fh).get("spot"))
@@ -198,7 +203,7 @@ def decide(payload: dict, chain: pd.DataFrame, *, ticker: str, now: datetime,
     if state not in (ema_stack.BULL, ema_stack.BEAR):
         return no(f"EMAs not stacked. {trend.get('reason') or ''}".strip())
     if spot is None or morning is None:
-        return no("No price or no morning reference (first scan at or after 09:45).")
+        return no("No price, or no scan between 09:45 and 10:00 for the morning reference.")
     side = "CALL" if state == ema_stack.BULL else "PUT"
     if spot == morning or (side == "CALL") != (spot > morning):
         where = "above" if spot > morning else "below" if spot < morning else "at"
