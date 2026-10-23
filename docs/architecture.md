@@ -66,6 +66,14 @@ scorer.
 - App: live price and VWAP from 5-minute bars (`volume_analysis`, 09:30–16:00 ET bars).
   Telegram: the scan's own numbers; VWAP is not in the archive, so no VWAP hold there.
 
+### Read-only MCP server (`scanner_mcp.py`, added 2026-10-22)
+
+Another reader of the scan archive, for Claude Desktop (stdio, `python scanner_mcp.py`,
+extra `mcp`). It reads the newest two `archive/{TICKER}_*.json` and returns what they
+saved: Game Plan (`plan_report.saved_plan`), gamma (`plan_report.saved_gamma`), magnets
+and top contracts (`volume`, `signal_magnets`), scan age. `daily_guard` reads the newest
+`data/broker/*.csv` through `trade_history`. It never scores, fetches or writes.
+
 ### Background jobs (launchd, `plist/`)
 
 `com.optiontrading.scheduler` (always on), `mark-runner` (every 15 min),

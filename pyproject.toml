@@ -29,6 +29,9 @@ dev = [
 schwab = [
     "cryptography",            # schwab.py local OAuth callback cert (not in the adapter path yet)
 ]
+mcp = [
+    "mcp>=1.2,<2",             # scanner_mcp.py read-only MCP server (2.x renamed FastMCP)
+]
 
 [tool.setuptools]
 # Flat layout, run from the checkout: install dependencies only, no packages.

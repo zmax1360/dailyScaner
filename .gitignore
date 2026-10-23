@@ -41,3 +41,6 @@ script/
 
 # Full-chain volume history (local data, can be large)
 data/volume_history.db*
+
+# uv environment (scanner_mcp launch)
+.venv/

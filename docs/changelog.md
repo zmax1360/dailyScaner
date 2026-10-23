@@ -4,6 +4,17 @@ One line per change that alters what the system does or shows, newest first, in 
 same commit as the change. Scoring-math changes also go in `CHANGES.md` with the new
 `config_hash` (see `AGENTS.md`). Commit ids are from `main`.
 
+## 2026-10-22
+
+- **Read-only MCP server** (`scanner_mcp.py`, `tests/test_scanner_mcp.py`, optional extra
+  `mcp` in `pyproject.toml`). Tools for Claude Desktop: `list_tickers`, `scan_status`,
+  `game_plan`, `gamma`, `magnets`, `daily_guard`, `summary`. Reads the newest
+  `archive/{TICKER}_*.json` as saved (`plan_report.saved_plan` / `saved_gamma`, never
+  re-scored) and the newest `data/broker/*.csv` export for the daily guard: entries
+  (max 4), realized P&L (done at +$20 / -$20), contracts per buy (max 2), no entries
+  before 10:00, no adding to a loser, no entry after the day's limit, and the streak of
+  rule-following days. No network, no writes; missing data comes back as null with a reason.
+
 ## 2026-10-19
 
 - **11:00 setup, paper only** (`setup_1100.py`, `ui/pages/setup_1100.py`, menu Trade →
