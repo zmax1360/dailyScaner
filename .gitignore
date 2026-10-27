@@ -54,11 +54,6 @@ data/volume_history.db*
 /fix_tree.sh
 /uv.lock
 /docs/Untitled
-/lotto_randomness.py
-/match.py
-/rebuild_journal.py
-/reconcile.py
-/time_of_day.py
-/verify_attribution.py
 data/
 .worktrees/
+/_to_delete/
