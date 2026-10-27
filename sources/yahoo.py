@@ -332,8 +332,11 @@ class YahooSource:
             hist = self.fetch_history(ticker, interval="1d", period="5d")
             if hist is None or hist.empty or "Close" not in hist.columns:
                 return None
-            spot = float(hist["Close"].iloc[-1])
-            return spot if spot == spot and spot > 0 else None
+            closes = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+            closes = closes[closes > 0]
+            if closes.empty:
+                return None
+            return float(closes.iloc[-1])
         except Exception:
             return None
 

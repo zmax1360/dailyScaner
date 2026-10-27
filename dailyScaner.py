@@ -12,6 +12,7 @@ import numpy as np
 from datetime import datetime, time as dtime
 import sys
 import json
+import math
 import os
 import time
 import warnings
@@ -537,13 +538,9 @@ def fetch_data(source=None):
         "5M": df5m, "10M": df10m, "15M": df15m, "45M": df45m,
         "1H": df1h, "4H": df4h, "1D": dfd,
     }
-    spot = source.fetch_spot(TICKER)
-    if spot is None or spot <= 0:
-        if dfd.empty or "Close" not in dfd.columns:
-            raise ValueError(f"{TICKER} returned no usable spot price.")
-        spot = round(float(dfd["Close"].iloc[-1]), 2)
-    else:
-        spot = round(float(spot), 2)
+    spot = _usable_spot(source.fetch_spot(TICKER), dfd)
+    if spot is None:
+        raise ValueError(f"{TICKER} returned no usable spot price.")
 
     # Wide max_dte preserves prior "ALL expiries" behaviour until Step 6 caps.
     chain = source.fetch_chain(TICKER, max_dte=3650)
@@ -607,6 +604,26 @@ def direction_score(tf_data, pc_ratio):
     if bull_v > bear_v: return "BULLISH", bull_v, bear_v
     if bear_v > bull_v: return "BEARISH", bull_v, bear_v
     return "NEUTRAL", bull_v, bear_v
+
+def _usable_spot(live, daily):
+    """The scan's spot: the live price when it is a finite positive number, else the
+    last finite positive daily close. After hours Yahoo can return NaN for both the
+    live price and today's daily row; NaN slips past ``spot <= 0`` (NaN compares
+    False), was saved as the scan's spot and left the scan with no gamma read.
+    None when neither gives a usable price."""
+    try:
+        if live is not None and math.isfinite(float(live)) and float(live) > 0:
+            return round(float(live), 2)
+    except (TypeError, ValueError):
+        pass
+    if daily is None or daily.empty or "Close" not in daily.columns:
+        return None
+    closes = pd.to_numeric(daily["Close"], errors="coerce")
+    closes = closes[np.isfinite(closes) & (closes > 0)]
+    if closes.empty:
+        return None
+    return round(float(closes.iloc[-1]), 2)
+
 
 def proximity_filter(options_df, spot):
     """
@@ -1004,7 +1021,7 @@ def _gamma_snapshot(calls_all, puts_all, spot, ts):
         import gex
         import volume_history
         frame = volume_history.chain_frame(calls_all, puts_all)
-        if frame.empty or not spot:
+        if frame.empty or spot is None or not math.isfinite(float(spot)) or float(spot) <= 0:
             return None
         return gex.summary_to_json(gex.summary(frame, spot=float(spot), as_of=ts,
                                                today=ts.date()))
