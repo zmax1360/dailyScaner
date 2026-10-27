@@ -23,6 +23,8 @@ from ui.archives import (
     _latest_archive,
     _latest_archive_stamp,
     _latest_weekly_archive,
+    latest_usable_spot,
+    usable_spot,
 )
 from ui.market import _cached_vwap_state, render_market_banner
 from ui.widgets import _streamlit_ge
@@ -373,7 +375,10 @@ def main():
             scan_ts=latest.get("timestamp"), greeks_fn=_bs_greeks,
         )
     elif page == "gamma":
-        gex_page.render_gex_page(cfg["ticker"], tz=ET, spot=latest.get("spot"))
+        spot, spot_from = usable_spot(latest.get("spot")), None
+        if spot is None:
+            spot, spot_from = latest_usable_spot(cfg["ticker"])
+        gex_page.render_gex_page(cfg["ticker"], tz=ET, spot=spot, spot_from=spot_from)
     elif page == "journal":
         journal_page.render()
     elif page == "pretrade":

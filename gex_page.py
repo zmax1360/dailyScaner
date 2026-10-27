@@ -6,6 +6,7 @@ no scoring, no network, no writes.
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime
 
 import numpy as np
@@ -304,7 +305,8 @@ def build_view(latest: pd.DataFrame, *, spot: float, as_of: datetime, today: dat
                              or {}).get("flip") if first else None}
 
 
-def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None = None) -> None:
+def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None = None,
+                    spot_from: str | None = None) -> None:
     ticker = str(ticker or "").upper()
     head, settings = st.columns([4, 1])
     head.subheader(f"{ticker} gamma exposure")
@@ -313,10 +315,16 @@ def render_gex_page(ticker: str, *, tz, spot: float | None, today: date | None =
     if latest.empty:
         st.info(f"No chain snapshot for {ticker} yet. It is recorded with the next scanner run.")
         return
-    if not spot or spot <= 0:
-        st.info("No spot price in the latest scan archive, so gamma cannot be computed.")
+    try:
+        spot = float(spot) if spot is not None else None
+    except (TypeError, ValueError):
+        spot = None
+    if spot is None or not math.isfinite(spot) or spot <= 0:
+        st.info("No spot price in the scan archives, so gamma cannot be computed.")
         return
-    spot = float(spot)
+    if spot_from:
+        st.caption(f"The latest scan saved no spot price (after hours); using ${spot:,.2f} "
+                   f"from {spot_from}.")
     today = today or datetime.now(tz).date()
     as_of = datetime.fromisoformat(str(latest["ts_et"].iloc[0]))
 

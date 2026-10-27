@@ -947,3 +947,14 @@ def test_profile_curve_crosses_zero_at_the_shown_expiries_flip():
     assert fig.layout.xaxis2.range[1] >= reach         # the whole curve fits its own axis
     assert fig.layout.xaxis.range[1] < reach * 10
     assert gex_page.profile_curve(None, pd.DataFrame(), as_of=AS_OF) is None
+
+
+def test_page_nan_spot_shows_a_message_not_an_empty_map(seeded):
+    """A NaN spot (after-hours scan, 2026-10-26 20:02) used to slip past the spot check
+    and left the page with 'No live expiry has usable open interest and IV'."""
+    class _NaN:                     # _SCRIPT writes repr(spot) into the page script
+        def __repr__(self):
+            return 'float("nan")'
+    at = _run(spot=_NaN())
+    assert any("No spot price" in i.value for i in at.info)
+    assert not any("No live expiry" in c.value for c in at.caption)
