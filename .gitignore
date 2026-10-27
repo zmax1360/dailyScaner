@@ -44,3 +44,16 @@ data/volume_history.db*
 
 # uv environment (scanner_mcp launch)
 .venv/
+
+# Local scratch files, scripts and data not yet in the repo (ignored for now; review later)
+/0
+/*.csv
+/vwap.json
+/tickers_excluded.json
+/finding_cc.md
+/fix_tree.sh
+/uv.lock
+/docs/Untitled
+data/
+.worktrees/
+/_to_delete/
