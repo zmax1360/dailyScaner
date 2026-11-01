@@ -107,7 +107,7 @@ def _page(db):
 
 def test_page_hides_0dte(seeded):
     at = _page(seeded)
-    shown = at.dataframe[0].value
+    shown = _main_table(at)
     assert "2026-09-30" not in set(shown["expiry"])                 # today's expiry never listed
     assert (shown["dte"] >= 1).all()
     assert set(shown["expiry"]) == {"2026-10-02", "2027-01-15"}
@@ -117,7 +117,7 @@ def test_page_filters_by_volume(seeded):
     at = _page(seeded)
     at.number_input(key="vol_min").set_value(2000).run()             # search by volume
     assert not at.exception
-    assert list(at.dataframe[0].value["strike"]) == [340.0]
+    assert list(_main_table(at)["strike"]) == [340.0]
 
 
 def test_page_filters_by_expiry_date_range(seeded):
@@ -126,10 +126,10 @@ def test_page_filters_by_expiry_date_range(seeded):
     assert tuple(di.value) == (date(2026, 10, 2), date(2027, 1, 15))  # defaults: all non-0DTE
     di.set_value((date(2026, 11, 1), date(2027, 1, 31))).run()
     assert not at.exception
-    assert list(at.dataframe[0].value["expiry"]) == ["2027-01-15"]
+    assert list(_main_table(at)["expiry"]) == ["2027-01-15"]
     at.date_input(key="vol_expiry").set_value((date(2026, 10, 2),)).run()   # mid-selection: one date
     assert not at.exception
-    assert list(at.dataframe[0].value["expiry"]) == ["2026-10-02"]
+    assert list(_main_table(at)["expiry"]) == ["2026-10-02"]
 
 
 def test_contract_history_and_pretrade_handoff(seeded):
@@ -168,3 +168,8 @@ volume_page._render_contract(row, ticker="AAPL", tz=ZoneInfo("America/New_York")
     at = AppTest.from_string(_SCRIPT.format(db=seeded, body=body)).run()
     assert not at.exception
     assert at.button(key="vol_check_AAPL").disabled                # no spot → no greeks → refuse
+
+
+def _main_table(at):
+    """The contract explorer table (the page also shows the volume-jumps table first)."""
+    return next(d.value for d in at.dataframe if "oi_up_days" in d.value.columns)

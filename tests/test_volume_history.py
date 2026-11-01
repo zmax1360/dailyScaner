@@ -178,3 +178,37 @@ def test_scanner_helper_applies_throttle_and_eod_force(tmp_path, monkeypatch):
     with sqlite3.connect(db) as con:
         scans = [r[0] for r in con.execute("SELECT DISTINCT scan_id FROM contract_scans ORDER BY 1")]
     assert scans == ["AAPL_20260928_100000", "AAPL_20260928_100600"]
+
+
+def _rec(db, scan_id, ts, rows):
+    calls = _leg([r[1:] for r in rows if r[0] == "C"])
+    puts = _leg([r[1:] for r in rows if r[0] == "P"]) if any(r[0] == "P" for r in rows) else None
+    vh.record_scan(calls, puts, ticker="AAPL", scan_id=scan_id, ts=ts, db_path=db)
+
+
+def test_volume_bursts_ranks_jumps_and_drops_carryover_and_stale(tmp_path):
+    db = str(tmp_path / "vh.db")
+    exp = "2026-11-04"
+    # previous session closes at 10,000 on the 362.5C
+    _rec(db, "AAPL_20261029_160000", _ts("2026-10-29", "16:00"),
+         [("C", 362.5, 1.6, 10000, 100, 0.4, 1.55, 1.65, exp, 6)])
+    # 09:30 opening scan (ignored): carry-over and a stale pre-open quote
+    _rec(db, "AAPL_20261030_093000", _ts("2026-10-30", "09:30"),
+         [("C", 362.5, 1.6, 10000, 10100, 0.4, 0.05, 3.30, exp, 5),
+          ("C", 355.0, 3.6, 4000, 8000, 0.4, 1.69, 5.60, exp, 5)])
+    # 09:45 first real scan: 362.5C still the previous close (carry-over), 355C 4,000
+    _rec(db, "AAPL_20261030_094500", _ts("2026-10-30", "09:45"),
+         [("C", 362.5, 1.6, 10000, 10100, 0.4, 1.55, 1.65, exp, 5),
+          ("C", 355.0, 3.6, 4000, 8000, 0.4, 3.55, 3.65, exp, 5),
+          ("C", 300.0, 45.0, 900, 100, 0.4, 44.9, 45.1, exp, 5)])
+    # 11:00: 355C +6,000, 362.5C +100
+    _rec(db, "AAPL_20261030_110000", _ts("2026-10-30", "11:00"),
+         [("C", 362.5, 1.4, 10100, 10100, 0.4, 1.35, 1.45, exp, 5),
+          ("C", 355.0, 4.0, 10000, 8000, 0.4, 3.95, 4.05, exp, 5),
+          ("C", 300.0, 45.0, 900, 100, 0.4, 44.9, 45.1, exp, 5)])
+    b = vh.volume_bursts("AAPL", db_path=db, spot=345.0)
+    assert list(zip(b["strike"], b["added"])) == [(355.0, 6000.0), (355.0, 4000.0), (362.5, 100.0)]
+    assert b["premium"].iloc[0] == pytest.approx(6000 * 4.0 * 100)
+    # deep in-the-money 300C (900 x $45) shows only when the filter is off
+    assert 300.0 in vh.volume_bursts("AAPL", db_path=db, spot=345.0, itm_limit=None)["strike"].tolist()
+    assert vh.volume_bursts("AAPL", db_path=db, sort_by="added", top=1)["strike"].tolist() == [355.0]
