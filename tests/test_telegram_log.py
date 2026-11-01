@@ -145,7 +145,7 @@ def test_bot_username(monkeypatch):
 
 # ── Settings in three tabs ─────────────────────────────────────────────────
 
-def test_settings_has_three_tabs_and_shows_recent_sends(tmp_path, monkeypatch):
+def test_settings_has_four_tabs_and_shows_recent_sends(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
     import ui.settings_store as settings_store
     import ui.telegram_push as tg
@@ -163,7 +163,7 @@ def test_settings_has_three_tabs_and_shows_recent_sends(tmp_path, monkeypatch):
         "from ui.pages import settings\n"
         f"settings.render({cfg!r})\n", default_timeout=60).run()
     assert not at.exception, at.exception
-    assert [t.label for t in at.tabs] == ["⚙️ Settings", "📨 Telegram", "⏱️ Scheduler"]
+    assert [t.label for t in at.tabs] == ["⚙️ Settings", "📐 Rules", "📨 Telegram", "⏱️ Scheduler"]
     assert any("Check which bot" in b.label for b in at.button)
     assert any("SPY gamma shift" in c.value for c in at.code)
     assert not any("Scheduler & background jobs" in e.label for e in at.expander)

@@ -1006,6 +1006,7 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
     payload["game_plan"] = _plan_snapshot(payload, ts_aware)
     if not is_eod:
         payload["setup_1100"] = _setup_snapshot(payload, calls_all, puts_all, ts_aware)
+        payload["ticker_rules"] = _rules_snapshot(payload, calls_all, puts_all, ts_aware)
 
     with open(fname, "w") as f:
         json.dump(payload, f, indent=2)
@@ -1068,6 +1069,24 @@ def _setup_snapshot(payload, calls_all, puts_all, ts):
         return None if ev is None else json.loads(json.dumps(ev, default=str))
     except Exception as exc:
         log.warning(f"11:00 setup failed (scan continues): {exc}")
+        return None
+
+
+def _rules_snapshot(payload, calls_all, puts_all, ts):
+    """Per-ticker paper rules (``ticker_rules``, paper only): opens or resolves today's
+    paper debit spread from this scan's chain. Saved as ``ticker_rules``; the scheduler
+    sends its Telegram line. Never raises."""
+    try:
+        import volume_history
+        from ticker_rules import recorder, store
+        store.seed_if_empty()
+        spot = payload.get("spot")
+        spot = float(spot) if isinstance(spot, (int, float)) and math.isfinite(spot) else None
+        ev = recorder.on_scan(volume_history.chain_frame(calls_all, puts_all),
+                              ticker=TICKER, now=ts, spot=spot)
+        return None if ev is None else json.loads(json.dumps(ev, default=str))
+    except Exception as exc:
+        log.warning(f"ticker rules failed (scan continues): {exc}")
         return None
 
 

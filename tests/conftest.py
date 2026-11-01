@@ -29,3 +29,5 @@ def _no_real_send_records(tmp_path, monkeypatch):
     monkeypatch.setattr(telegram_log, "PATH", str(tmp_path / "telegram_sent.jsonl"))
     monkeypatch.setattr(gamma_shift, "STATE_PATH", str(tmp_path / "gamma_walls.json"))
     monkeypatch.setattr(setup_1100, "DB_PATH", str(tmp_path / "setup_1100.db"))
+    from ticker_rules import store as rules_store
+    monkeypatch.setattr(rules_store, "DB_PATH", str(tmp_path / "ticker_rules.db"))
