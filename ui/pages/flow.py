@@ -2100,6 +2100,12 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
     if "game_plan" in sections:
         # The plan the scan built and saved: the same one Telegram sent. The live 5-minute
         # price is shown next to it, never mixed into it.
+        try:
+            from ui import strategy_panel
+            strategy_panel.render(ticker, (curr or {}).get("ticker_rules"))
+        except Exception as exc:          # the strategy card never breaks the Game Plan
+            st.caption(f"Strategy card unavailable: {exc}")
+        st.divider()
         saved = plan_report.saved_plan(curr)
         if saved is None:
             st.info("🎯 Game plan: not saved in this scan (scans from 2026-10-17 on carry "

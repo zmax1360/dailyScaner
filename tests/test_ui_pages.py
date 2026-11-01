@@ -210,7 +210,7 @@ def test_settings_page_shows_scan_filters_and_telegram(tmp_path, monkeypatch):
     monkeypatch.setattr(settings_store, "PATH", str(tmp_path / "ui_settings.json"))
     at = _run(_SETTINGS.format(cfg=cfg))
     assert any("Run Scan for AAPL" in b.label for b in at.button)
-    assert {n.key for n in at.number_input} == {"w_min_dte", "w_top_n", "w_stop_buffer_pct",
+    assert {n.key for n in at.number_input if not str(n.key).startswith("rules_")} == {"w_min_dte", "w_top_n", "w_stop_buffer_pct",
                                                 "w_min_reward_to_risk"}
     assert any("Not configured" in w.value for w in at.warning)
     assert any("Gamma exposure" in c.label for c in at.checkbox)

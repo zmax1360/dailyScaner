@@ -391,6 +391,35 @@ def _setup_alert(ticker: str, env: dict, *, send: bool) -> None:
         log.warning(f"[{ticker}] 11:00 setup alert error: {exc}")
 
 
+def ticker_rules_alert(cfg: dict, ticker: str) -> bool:
+    """Paper-rule alert for ``ticker``: on unless ``"rules_alert": false``."""
+    own = ((cfg or {}).get("tickers") or {}).get(ticker, {})
+    return own.get("rules_alert", True) is not False
+
+
+def _rules_alert(ticker: str, env: dict, *, send: bool) -> None:
+    """After a successful scan: the paper rule's entry or exit, when this scan made one
+    (``payload["ticker_rules"]``). Paper only. Never raises."""
+    try:
+        from telegram_bot import _load_latest
+        from ticker_rules import recorder
+        payload, _ = _load_latest(ticker)
+        text = recorder.message((payload or {}).get("ticker_rules"))
+        if not text:
+            return
+        log.info(f"[{ticker}] paper rule: {recorder.html.unescape(text).splitlines()[1]}")
+        token = ticker_bot_token(env, ticker)
+        chat_id = ticker_chat_id(env, ticker, load_config())
+        if not send or not token or not chat_id:
+            return
+        if _send_telegram(token, chat_id, text, ticker=ticker, kind="ticker_rules"):
+            log.info(f"[{ticker}] paper rule alert sent")
+        else:
+            log.warning(f"[{ticker}] paper rule alert failed")
+    except Exception as exc:
+        log.warning(f"[{ticker}] paper rule alert error: {exc}")
+
+
 def _notify_refusal_streak(ticker: str, reason: str | None, env: dict) -> None:
     """One alert when consecutive refusals hit 3 — then silent until success."""
     from notify_delivery import REFUSAL_STREAK_ALERT_AT
@@ -439,6 +468,7 @@ def handle_scan_result(
             _notify_success(ticker, env, elapsed)
         _gamma_shift_check(ticker, env, send=notify and ticker_gamma_alert(load_config(), ticker))
         _setup_alert(ticker, env, send=notify and ticker_setup_alert(load_config(), ticker))
+        _rules_alert(ticker, env, send=notify and ticker_rules_alert(load_config(), ticker))
         return
 
     if exit_code == 3:

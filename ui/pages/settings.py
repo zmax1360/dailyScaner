@@ -1,5 +1,5 @@
-"""Settings page, in three tabs: Settings (manual scan, filters), Telegram (routes, recent
-sends, manual push) and Scheduler (background jobs)."""
+"""Settings page, in four tabs: Settings (manual scan, filters), Rules (per-ticker paper
+rules), Telegram (routes, recent sends, manual push) and Scheduler (background jobs)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from datetime import datetime
 import glob
 import json
 
-from ui import scheduler_panel, settings_store, shell, telegram_panel
+from ui import rules_panel, scheduler_panel, settings_store, shell, telegram_panel
 from ui.archives import _latest_archive_stamp
 from ui.services import _discover_tickers
 from ui.services import _run_daily_scanner
@@ -26,7 +26,11 @@ def render(cfg: dict) -> None:
     """Settings page: manual scan, flow filters, Telegram push (formerly the sidebar)."""
     focus_ticker = cfg["ticker"]
     st.subheader("Settings")
-    tab_main, tab_tg, tab_sched = st.tabs(["⚙️ Settings", "📨 Telegram", "⏱️ Scheduler"])
+    tab_main, tab_rules, tab_tg, tab_sched = st.tabs(
+        ["⚙️ Settings", "📐 Rules", "📨 Telegram", "⏱️ Scheduler"])
+
+    with tab_rules:
+        rules_panel.render(focus_ticker)
 
     with tab_main:
 
