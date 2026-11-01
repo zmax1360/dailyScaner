@@ -1073,18 +1073,27 @@ def _setup_snapshot(payload, calls_all, puts_all, ts):
 
 
 def _rules_snapshot(payload, calls_all, puts_all, ts):
-    """Per-ticker paper rules (``ticker_rules``, paper only): opens or resolves today's
-    paper debit spread from this scan's chain. Saved as ``ticker_rules``; the scheduler
-    sends its Telegram line. Never raises."""
+    """Per-ticker strategy (``ticker_rules``): the Game Plan's strategy card for this scan
+    (``plan``) and today's paper trade entry or exit (``event``). Paper only. Saved as
+    ``ticker_rules``; the scheduler sends the event's Telegram line. Never raises."""
     try:
         import volume_history
-        from ticker_rules import recorder, store
+        from ticker_rules import market, plan, recorder, store
         store.seed_if_empty()
         spot = payload.get("spot")
         spot = float(spot) if isinstance(spot, (int, float)) and math.isfinite(spot) else None
-        ev = recorder.on_scan(volume_history.chain_frame(calls_all, puts_all),
-                              ticker=TICKER, now=ts, spot=spot)
-        return None if ev is None else json.loads(json.dumps(ev, default=str))
+        chain = volume_history.chain_frame(calls_all, puts_all)
+        if not store.current(TICKER):
+            return None
+        try:
+            ctx = market.fetch(TICKER, ts)
+        except Exception as exc:
+            log.warning(f"ticker rules: no 5-minute bars ({exc})")
+            ctx = None
+        ev = recorder.on_scan(chain, ticker=TICKER, now=ts, spot=spot, ctx=ctx) \
+            if ctx is not None else None
+        card = plan.build(TICKER, ctx, chain, spot, ts)
+        return json.loads(json.dumps({"event": ev, "plan": card}, default=str))
     except Exception as exc:
         log.warning(f"ticker rules failed (scan continues): {exc}")
         return None

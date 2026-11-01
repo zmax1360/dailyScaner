@@ -180,6 +180,8 @@ def on_scan(chain: pd.DataFrame, *, ticker: str, now: datetime, spot: float | No
 
 def message(ev: dict | None) -> str | None:
     """Telegram HTML for an OPEN/CLOSE event (paper)."""
+    if ev and "plan" in ev and "trade" not in ev:      # the scan's saved block
+        ev = ev.get("event")
     if not ev:
         return None
     t = ev["trade"]

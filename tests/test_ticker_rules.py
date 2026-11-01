@@ -158,3 +158,75 @@ def test_breakout_stop_on_underlying():
          "time_stop": "15:30"}
     ch = recorder.resolve(t, _chain(), 343.9, datetime(2026, 11, 4, 10, 5))
     assert ch["status"] == store.STOP
+
+
+# ------------------------------------------------------------------ plan card
+
+from ticker_rules import plan  # noqa: E402
+
+
+def _chain_iv():
+    c = _chain()
+    c["iv"] = 0.20
+    return c
+
+
+def test_plan_card_with_signal_has_cost_reward_and_odds():
+    store.add_setting("AAPL", "normal", "ema_stack", {"gap": 0.0}, "paper")
+    now = datetime(2026, 11, 4, 11, 31)
+    card = plan.build("AAPL", _ctx(list(np.linspace(350, 345, 60)), now=now), _chain_iv(),
+                      345.2, now)
+    sp = card["spread"]
+    assert card["signal"]["side"] == "PUT" and card["status"] == "paper"
+    assert sp["risk"] == pytest.approx(62.0) and sp["max_gain"] == pytest.approx(188.0)
+    assert sp["break_even"] == pytest.approx(345.0 - 0.62)
+    assert 0 < sp["p_max"] < sp["p_profit"] < 1
+    assert sp["expected_move"] > 0
+    assert "Strategy:" in plan.telegram_lines(card)[0]
+
+
+def test_plan_card_waiting_and_off():
+    store.add_setting("SPY", "normal", "ema_stack", {}, "paper")
+    now = datetime(2026, 11, 4, 10, 0)
+    card = plan.build("SPY", _ctx([100.0] * 60, end="2026-11-04 10:00", now=now), _chain_iv(),
+                      345.2, now)
+    assert card["spread"] is None and "No signal yet" in card["waiting"]
+    store.add_setting("SPY", "normal", "ema_stack", {}, "off")
+    assert "No strategy" in plan.build("SPY", None, _chain_iv(), 345.2, now)["waiting"]
+
+
+def test_prob_beyond_is_symmetric_at_spot():
+    p_up = plan.prob_beyond(100, 100, 0.2, 0.01, True)
+    p_dn = plan.prob_beyond(100, 100, 0.2, 0.01, False)
+    assert p_up + p_dn == pytest.approx(1.0)
+    assert plan.prob_beyond(100, 100, None, 0.01, True) is None
+
+
+def test_recorder_message_accepts_the_saved_block():
+    assert recorder.message({"event": None, "plan": {}}) is None
+
+
+def test_strategy_panel_shows_card_and_saves_choice(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    db = str(tmp_path / "panel.db")
+    monkeypatch.setenv("TR_TEST_DB", db)
+    store.add_setting("AAPL", "normal", "ema_stack", {"gap": 0.0}, "paper", db_path=db)
+    now = datetime(2026, 11, 4, 11, 31)
+    card = plan.build("AAPL", _ctx(list(np.linspace(350, 345, 60)), now=now), _chain_iv(),
+                      345.2, now, db_path=db)
+
+    def app(card=None):
+        import os
+        from ticker_rules import store as s
+        s.DB_PATH = os.environ["TR_TEST_DB"]
+        from ui import strategy_panel
+        strategy_panel.render("AAPL", {"plan": card, "event": None})
+
+    at = AppTest.from_function(app, kwargs={"card": card}).run()
+    assert not at.exception, at.exception
+    assert any("Risk (max loss)" == m.label for m in at.metric)
+    assert any("buy 345P / sell 342.5P" in md.value for md in at.markdown)
+    at.selectbox(key="gp_strategy_AAPL").set_value("fade_midday_stack").run()
+    at.button(key="gp_strategy_save_AAPL").click().run()
+    assert store.current("AAPL", db_path=db)["normal"]["rule"] == "fade_midday_stack"
