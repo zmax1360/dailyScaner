@@ -259,6 +259,73 @@ def latest_scan(ticker: str, *, db_path: str | None = None) -> pd.DataFrame:
             " WHERE ticker=?)", con, params=(ticker.upper(), ticker.upper()))
 
 
+def volume_bursts(ticker: str, *, session_date: str | None = None, top: int = 10,
+                  sort_by: str = "premium", spot: float | None = None,
+                  itm_limit: float | None = 0.05, db_path: str | None = None) -> pd.DataFrame:
+    """The biggest jumps in volume between two recorded scans of one session.
+
+    ``added`` = this scan's cumulative volume minus the same contract's previous scan that
+    day; a contract's first scan of the day counts in full. Two artefacts are dropped:
+
+      * carry-over: a contract whose first scan of the day repeats the previous session's
+        final volume exactly (the feed has not reset yet; seen at the 09:30 scan);
+      * the opening scan: anything recorded before 09:35 (the feed can still show the
+        previous session's volume and pre-open quotes such as 0.05 / 3.30), so the first
+        scan after 09:35 counts the whole morning.
+
+    With ``spot`` and ``itm_limit``, contracts more than ``itm_limit`` in the money are left
+    out: their premium is mostly intrinsic value (stock replacement, not a bet).
+
+    ``premium`` = added x mid x 100 (an estimate: the real fills are not recorded).
+    ``session_date`` None = the latest recorded session.
+    """
+    cols = ["ts_et", "side", "strike", "expiry", "added", "premium", "mid", "bid", "ask",
+            "volume", "open_interest", "vol_oi"]
+    path = db_path or DB_PATH
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=cols)
+    t = ticker.upper()
+    with closing(sqlite3.connect(path, timeout=30)) as con:
+        if session_date is None:
+            row = con.execute("SELECT MAX(session_date) FROM contract_scans WHERE ticker=?",
+                              (t,)).fetchone()
+            session_date = row[0] if row else None
+        if not session_date:
+            return pd.DataFrame(columns=cols)
+        df = pd.read_sql_query(
+            "SELECT ts_et, side, strike, expiry, volume, open_interest, bid, ask"
+            " FROM contract_scans WHERE ticker=? AND session_date=? ORDER BY ts_et",
+            con, params=(t, session_date))
+        prev = pd.read_sql_query(
+            "SELECT c.side, c.strike, c.expiry, c.volume AS prev_close_vol"
+            " FROM contract_scans c JOIN (SELECT side, strike, expiry, MAX(ts_et) AS ts"
+            "   FROM contract_scans WHERE ticker=? AND session_date=(SELECT MAX(session_date)"
+            "   FROM contract_scans WHERE ticker=? AND session_date<?)"
+            "   GROUP BY side, strike, expiry) l"
+            " ON c.side=l.side AND c.strike=l.strike AND c.expiry=l.expiry AND c.ts_et=l.ts"
+            " WHERE c.ticker=?", con, params=(t, t, session_date, t))
+    df = df[df["ts_et"].str[11:16] >= "09:35"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    key = ["side", "strike", "expiry"]
+    df = df.merge(prev, on=key, how="left")
+    g = df.groupby(key, sort=False)
+    df["prev_vol"] = g["volume"].shift(1)
+    first = df["prev_vol"].isna()
+    df["added"] = (df["volume"] - df["prev_vol"]).where(~first, df["volume"])
+    carry = first & df["prev_close_vol"].notna() & (df["volume"] == df["prev_close_vol"])
+    df["mid"] = (df["bid"] + df["ask"]) / 2
+    df = df[~carry & (df["added"] > 0) & df["mid"].notna()].copy()
+    if spot and itm_limit is not None:
+        itm = ((df["side"] == "CALL") & (df["strike"] < spot * (1 - itm_limit))) | \
+              ((df["side"] == "PUT") & (df["strike"] > spot * (1 + itm_limit)))
+        df = df[~itm]
+    df["premium"] = df["added"] * df["mid"] * 100
+    df["vol_oi"] = (df["volume"] / df["open_interest"]).where(df["open_interest"] > 0)
+    order = "premium" if sort_by == "premium" else "added"
+    return df.sort_values(order, ascending=False).head(int(top))[cols].reset_index(drop=True)
+
+
 def explorer_table(latest: pd.DataFrame, daily: pd.DataFrame, *, today) -> pd.DataFrame:
     """Rows for the Volume page: latest scan + OI change vs the previous session + OI streak.
 

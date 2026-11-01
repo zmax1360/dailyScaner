@@ -51,6 +51,8 @@ def render_volume_page(
     )
 
     today = today or datetime.now(tz).date()
+    _render_bursts(ticker, tz=tz, spot=spot)
+    st.divider()
     latest = vh.latest_scan(ticker)
     from ui.components import volume_by_strike
     volume_by_strike.render(latest, spot=spot, today=today)
@@ -130,6 +132,50 @@ def render_volume_page(
         return
     _render_contract(view.iloc[rows[0]], ticker=ticker, tz=tz, spot=spot, scan_ts=scan_ts,
                      greeks_fn=greeks_fn)
+
+
+BIG_PREMIUM = 1_000_000      # $ estimate that earns the alert line
+
+
+def _render_bursts(ticker: str, *, tz, spot: float | None) -> None:
+    """Top N volume jumps of the latest session (``vh.volume_bursts``), with an alert line
+    for jumps of $1M+ estimated premium. Display only: which side traded is unknown."""
+    st.markdown("**Biggest volume jumps — latest session**")
+    c1, c2, c3 = st.columns([1, 2, 2])
+    top = c1.number_input("Top", min_value=3, max_value=50, value=10, step=1, key="burst_top")
+    sort_by = c2.radio("Rank by", ["Premium $", "Contracts"], horizontal=True, key="burst_sort")
+    skip_itm = c3.toggle("Hide deep in-the-money (>5%)", value=True, key="burst_itm",
+                         help="Their premium is mostly intrinsic value: usually stock "
+                              "replacement or hedges, not bets.")
+    b = vh.volume_bursts(ticker, top=int(top), spot=spot, itm_limit=0.05 if skip_itm else None,
+                         sort_by="premium" if sort_by == "Premium $" else "added")
+    if b.empty:
+        st.caption("No volume recorded in the latest session yet.")
+        return
+    big = b[b["premium"] >= BIG_PREMIUM]
+    if not big.empty:
+        lines = [f"{r.side} ${r.strike:g} {r.expiry[5:]} · +{r.added:,.0f} at ~${r.mid:.2f} "
+                 f"(~${r.premium / 1e6:.1f}M) at {_fmt_ts(r.ts_et, tz)[-9:]}"
+                 for r in big.itertuples()]
+        st.warning("🔔 Big blocks today: " + " · ".join(lines))
+    st.dataframe(
+        b, hide_index=True, use_container_width=True,
+        column_config={
+            "ts_et": "Scan", "side": "Side",
+            "strike": st.column_config.NumberColumn("Strike", format="$%.1f"),
+            "expiry": "Expiry",
+            "added": st.column_config.NumberColumn("Added since last scan", format="%d"),
+            "premium": st.column_config.NumberColumn("Premium (est.)", format="$%.0f"),
+            "mid": st.column_config.NumberColumn("Mid", format="$%.2f"),
+            "bid": st.column_config.NumberColumn("Bid", format="$%.2f"),
+            "ask": st.column_config.NumberColumn("Ask", format="$%.2f"),
+            "volume": st.column_config.NumberColumn("Day volume", format="%d"),
+            "open_interest": st.column_config.NumberColumn("OI", format="%d"),
+            "vol_oi": st.column_config.NumberColumn("Vol / OI", format="%.1f"),
+        })
+    st.caption("Volume added between two scans (~15 min apart). Whether it was bought or "
+               "sold is not recorded — next morning's open interest shows if it opened a "
+               "position. The 09:30 carry-over of yesterday's volume is filtered out.")
 
 
 def _render_contract(row: pd.Series, *, ticker, tz, spot, scan_ts, greeks_fn) -> None:
