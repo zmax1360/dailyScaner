@@ -45,6 +45,9 @@ them. Changes since then: `docs/changelog.md`.
    marked only after Telegram accepts; `"opening_range_alert": false` per ticker turns it
    off). The same saved range is the last Game Plan line (`plan_report.opening_range_line`:
    Telegram, the app's Game Plan, the MCP `game_plan`) and feeds the `orb_20` paper rule.
+   The summary also carries the first two candles (`open`: sneaky second candle and the first
+   break of the first candle's high / low); each scan stores the day's newest summary in
+   `data/opening_range_days.json` (`scheduler._log_opening_range`).
 
 ### Where Best Value is scored (open problem, see F-S4-01 in findings)
 

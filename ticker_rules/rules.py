@@ -118,15 +118,20 @@ def orb_in_play(ctx, *, rvol_min=1.5, window="09:35-10:30", **_):
     return None
 
 
-def orb_20(ctx, *, minutes=20, max_age=10, allow_wide=False, **_):
+def orb_20(ctx, *, minutes=20, max_age=10, allow_wide=False, skip_against_sneaky=True, **_):
     """Opening range breakout on the first ``minutes`` (``opening_range``): the first
     5-minute close outside the range, in its direction, only while that break is at most
     ``max_age`` minutes old (a late scan does not chase it) and, unless ``allow_wide``,
-    only when the range is not wide against recent days. Stop at the range's far side."""
+    only when the range is not wide against recent days and, unless
+    ``skip_against_sneaky`` is off, not against the first candle after a sneaky second
+    candle (``opening_range.against_sneaky``). Stop at the range's far side."""
+    from ticker_rules import opening_range
     s = getattr(ctx, "orange", None)
     if not s or s.get("minutes") != minutes or s["status"] not in ("break_up", "break_down"):
         return None
     if s.get("wide") and not allow_wide:
+        return None
+    if skip_against_sneaky and opening_range.against_sneaky(s):
         return None
     h, m = (int(x) for x in s["break_at"].split(":"))
     age = (ctx.now.hour * 60 + ctx.now.minute) - (h * 60 + m)
@@ -158,7 +163,8 @@ RULES: dict[str, dict[str, Any]] = {
                     "defaults": {"rvol_min": 1.5, "window": "09:35-10:30"},
                     "slots": ("in_play",)},
     "orb_20": {"fn": orb_20, "label": "20-min opening range breakout (skip wide opens)",
-               "defaults": {"minutes": 20, "max_age": 10, "allow_wide": False},
+               "defaults": {"minutes": 20, "max_age": 10, "allow_wide": False,
+                            "skip_against_sneaky": True},
                "slots": ("normal", "in_play")},
 }
 

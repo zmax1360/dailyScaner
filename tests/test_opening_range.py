@@ -173,6 +173,7 @@ def test_scheduler_sends_each_event_once(tmp_path, monkeypatch):
     payload = json.loads(json.dumps({"ticker_rules": {"opening_range": s}}))
     sent = []
     monkeypatch.setattr(scheduler, "OPENING_RANGE_STATE", str(tmp_path / "or.json"))
+    monkeypatch.setattr(scheduler, "OPENING_RANGE_LOG", str(tmp_path / "days.json"))
     monkeypatch.setattr(telegram_bot, "_load_latest", lambda t: (payload, None))
     monkeypatch.setattr(scheduler, "load_config", lambda: {})
     monkeypatch.setattr(scheduler, "_send_telegram",
@@ -192,6 +193,7 @@ def test_scheduler_does_not_mark_unsent_alerts(tmp_path, monkeypatch):
     s = orng.summarize(_bars([]), _at("09:50"))
     payload = json.loads(json.dumps({"ticker_rules": {"opening_range": s}}))
     monkeypatch.setattr(scheduler, "OPENING_RANGE_STATE", str(tmp_path / "or.json"))
+    monkeypatch.setattr(scheduler, "OPENING_RANGE_LOG", str(tmp_path / "days.json"))
     monkeypatch.setattr(telegram_bot, "_load_latest", lambda t: (payload, None))
     monkeypatch.setattr(scheduler, "load_config", lambda: {})
     monkeypatch.setattr(scheduler, "_send_telegram", lambda *a, **k: False)
@@ -207,3 +209,99 @@ def test_opening_range_alert_can_be_turned_off():
     assert scheduler.ticker_opening_range_alert({}, "AAPL") is True
     cfg = {"tickers": {"AAPL": {"opening_range_alert": False}}}
     assert scheduler.ticker_opening_range_alert(cfg, "AAPL") is False
+
+
+# ── sneaky second candle ──────────────────────────────────────────────────────────────
+SNEAKY = [(100, 101, 99.8, 100.8),          # first: up, body 0.80
+          (100.8, 100.9, 100.0, 100.3),     # second: red, takes back 62%, low stays >= 99.8
+          (100.3, 100.6, 100.1, 100.5), (100.5, 100.7, 100.2, 100.4)]   # 20 min: 99.8-101.0
+RESUME = [(100.4, 101.3, 100.3, 101.2)]     # 09:50 bar closes above both highs
+REVERSE = [(100.4, 100.5, 99.5, 99.6)]      # 09:50 bar closes below both lows
+
+
+def _sneaky_bars(after):
+    return pd.concat([_history(2.0), _day(TODAY, SNEAKY + after, fill=100.4)])
+
+
+def test_sneaky_second_candle_is_read_and_its_first_break_kept():
+    s = orng.summarize(_sneaky_bars(RESUME), _at("10:00"))
+    op = s["open"]
+    assert op["sneaky"] is True and op["first_dir"] == "up" and op["retrace"] == pytest.approx(0.625, abs=0.01)
+    assert (op["first_high"], op["first_low"]) == (101.0, 99.8)
+    assert op["first_break"] == "resume" and op["first_break_at"] == "09:55"
+    rev = orng.summarize(_sneaky_bars(REVERSE), _at("10:00"))["open"]
+    assert rev["first_break"] == "reverse" and rev["first_break_close"] == 99.6
+
+
+def test_sneaky_is_known_once_the_second_candle_closes():
+    assert orng.summarize(_sneaky_bars([]), _at("09:35"))["open"] is None
+    s = orng.summarize(_sneaky_bars([]), _at("09:40"))
+    assert s["status"] == orng.FORMING and s["open"]["sneaky"] is True
+    assert "Sneaky 2nd candle" in orng.plan_line(s) and "above $101.00" in orng.plan_line(s)
+
+
+@pytest.mark.parametrize("second", [
+    (100.8, 100.9, 100.1, 99.9),     # takes back more than the whole body: a reversal
+    (100.8, 100.9, 99.7, 100.3),     # breaks the first candle's low
+    (100.8, 100.9, 100.6, 100.7),    # takes back only 12%
+    (100.3, 100.9, 100.2, 100.8),    # same colour
+])
+def test_not_sneaky(second):
+    bars = pd.concat([_history(2.0), _day(TODAY, [SNEAKY[0], second] + SNEAKY[2:])])
+    assert orng.summarize(bars, _at("10:00"))["open"]["sneaky"] is False
+
+
+def test_a_tiny_first_candle_is_never_sneaky():
+    bars = pd.concat([_history(2.0), _day(TODAY, [(100, 100.3, 99.9, 100.05),
+                                                  (100.05, 100.1, 99.95, 100.0)] + SNEAKY[2:])])
+    op = orng.summarize(bars, _at("10:00"))["open"]
+    assert op["sneaky"] is False and op["retrace"] is None
+
+
+def test_sneaky_messages_and_the_against_break_warning():
+    s = orng.summarize(_sneaky_bars(REVERSE), _at("10:00"))
+    assert orng.against_sneaky(s) is True
+    assert "Sneaky 2nd candle" in orng.message("AAPL", s, "set")
+    brk = orng.message("AAPL", s, "break")
+    assert "broke DOWN" in brk and "Skip it" in brk and "Plan:" not in brk
+    assert "the other way ❌" in orng.plan_line(s)
+    ok = orng.summarize(_sneaky_bars(RESUME), _at("10:00"))
+    assert orng.against_sneaky(ok) is False
+    assert "Plan: calls" in orng.message("AAPL", ok, "break")
+    assert "the first candle's way ✅" in orng.plan_line(ok)
+
+
+def test_paper_rule_skips_a_break_against_the_sneaky_candle():
+    from ticker_rules import rules
+    rev = orng.summarize(_sneaky_bars(REVERSE), _at("10:00"))
+    assert rules.evaluate("orb_20", None, _Ctx(rev, _at("10:00"))) is None
+    sig = rules.evaluate("orb_20", {"skip_against_sneaky": False}, _Ctx(rev, _at("10:00")))
+    assert sig["side"] == rules.PUT
+    ok = orng.summarize(_sneaky_bars(RESUME), _at("10:00"))
+    assert rules.evaluate("orb_20", None, _Ctx(ok, _at("10:00")))["side"] == rules.CALL
+
+
+def test_day_log_keeps_the_newest_summary_per_day():
+    a = orng.summarize(_sneaky_bars([]), _at("09:50"))
+    b = orng.summarize(_sneaky_bars(RESUME), _at("10:00"))
+    log = orng.log_update({}, "AAPL", a)
+    log = orng.log_update(log, "AAPL", b)
+    assert list(log["AAPL"]) == [TODAY] and log["AAPL"][TODAY]["status"] == orng.BREAK_UP
+    assert orng.log_update(log, "AAPL", None) == log
+    many = {"AAPL": {f"d{i:04d}": {} for i in range(orng.LOG_KEEP_DAYS + 5)}}
+    assert len(orng.log_update(many, "AAPL", b)["AAPL"]) == orng.LOG_KEEP_DAYS
+
+
+def test_scheduler_logs_every_open_even_when_muted(tmp_path, monkeypatch):
+    import scheduler
+    import telegram_bot
+    s = orng.summarize(_sneaky_bars(RESUME), _at("10:00"))
+    payload = json.loads(json.dumps({"ticker_rules": {"opening_range": s}}))
+    monkeypatch.setattr(scheduler, "OPENING_RANGE_STATE", str(tmp_path / "or.json"))
+    monkeypatch.setattr(scheduler, "OPENING_RANGE_LOG", str(tmp_path / "days.json"))
+    monkeypatch.setattr(telegram_bot, "_load_latest", lambda t: (payload, None))
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    scheduler._opening_range_alert("AAPL", {}, send=False)
+    saved = json.loads((tmp_path / "days.json").read_text())
+    assert saved["AAPL"][TODAY]["open"]["sneaky"] is True
+    assert not (tmp_path / "or.json").exists()

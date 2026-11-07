@@ -10,6 +10,13 @@ tested (5/10/15/20 minutes):
   * the 20-minute range had the fewest fake-outs (13% vs 25% for 5 minutes) and the best
     30 minutes after the break (64% up in the break's direction).
 
+Sneaky second candle (same replay): the first 5-minute candle has a real body (at least
+``SNEAKY_MIN_BODY_PCT`` of the open) and the second is the opposite colour, takes back
+40-100% of that body and does not break the first candle's far end. 11 of 60 days. The
+first close beyond the FIRST candle's high/low then went the first candle's way on 4 days
+(3 won over the next 30 minutes, +$0.77/share) and the other way on 6 (2 won, -$0.71).
+So on a sneaky day only a break in the first candle's direction is shown as tradeable.
+
 60 sessions is a small sample, so this is shown and recorded as paper only.
 
 Bars are 5-minute OHLC, regular session, index = bar START in naive ET wall-clock time
@@ -29,10 +36,49 @@ LOOKBACK = 10            # previous sessions the width is compared with
 MIN_HISTORY = 5          # fewer complete past ranges: no width verdict
 WIDE = 1.2               # width / average above this: breakouts tend to fail
 CUTOFF = time(11, 30)    # a first close outside after this is not a breakout
+SNEAKY_MIN_BODY_PCT = 0.15   # first candle body, % of its open (AAPL ~$0.50)
+SNEAKY_RETRACE = (0.40, 1.00)  # share of that body the second candle takes back
 OPEN = time(9, 30)
 
 FORMING, SET, BREAK_UP, BREAK_DOWN, NO_BREAK = (
     "forming", "set", "break_up", "break_down", "no_break")
+
+
+def sneaky_open(todays: pd.DataFrame, *, cutoff: time = CUTOFF) -> dict[str, Any] | None:
+    """The first two 5-minute candles of ``todays`` (complete bars from 09:30): the first
+    candle's direction and extremes, whether the second is a sneaky candle, and (when it
+    is) the first later close beyond the first candle's high / low by ``cutoff``:
+    ``resume`` (the first candle's way) or ``reverse``. None before the second candle closes."""
+    if len(todays) < 2 or todays.index[0].time() != OPEN:
+        return None
+    a, b = todays.iloc[0], todays.iloc[1]
+    o, c = float(a["Open"]), float(a["Close"])
+    body = abs(c - o)
+    d = 1 if c > o else -1 if c < o else 0
+    out = {"first_dir": {1: "up", -1: "down", 0: "flat"}[d],
+           "first_high": round(float(a["High"]), 2), "first_low": round(float(a["Low"]), 2),
+           "sneaky": False, "retrace": None, "first_break": None, "first_break_at": None,
+           "first_break_close": None}
+    if d == 0 or o <= 0 or body / o * 100 < SNEAKY_MIN_BODY_PCT:
+        return out
+    retr = (c - float(b["Close"])) * d / body
+    out["retrace"] = round(retr, 2)
+    opposite = (float(b["Close"]) - float(b["Open"])) * d < 0
+    inside = float(b["Low"]) >= float(a["Low"]) if d > 0 else float(b["High"]) <= float(a["High"])
+    out["sneaky"] = bool(opposite and inside and SNEAKY_RETRACE[0] <= retr <= SNEAKY_RETRACE[1])
+    if not out["sneaky"]:
+        return out
+    hi, lo = float(a["High"]), float(a["Low"])
+    for ts, bar in todays.iloc[2:].iterrows():
+        end = (ts + timedelta(minutes=5)).time()
+        if end > cutoff:
+            break
+        px = float(bar["Close"])
+        if px > hi or px < lo:
+            out["first_break"] = "resume" if (px > hi) == (d > 0) else "reverse"
+            out["first_break_at"], out["first_break_close"] = end.strftime("%H:%M"), round(px, 2)
+            break
+    return out
 
 
 def _clock(minutes_after_open: int) -> time:
@@ -78,6 +124,7 @@ def summarize(five: pd.DataFrame | None, now: datetime, *, minutes: int = MINUTE
     ready = _clock(5 * n)
     base = {"day": today.isoformat(), "minutes": int(minutes),
             "ready_at": ready.strftime("%H:%M"), "cutoff": cutoff.strftime("%H:%M")}
+    base["open"] = sneaky_open(todays, cutoff=cutoff)
     if len(todays) < n:
         part = todays.iloc[:n]
         return {**base, "status": FORMING, "high": float(part["High"].max()),
@@ -116,14 +163,40 @@ def _verdict(s: dict) -> str:
     return f"✅ {s['rel']:.1f}x normal width: breakout allowed"
 
 
+def sneaky_note(s: dict | None) -> str | None:
+    """Plain-text sneaky-candle warning for ``s`` (a summary), or None on a normal open."""
+    op = (s or {}).get("open") or {}
+    if not op.get("sneaky"):
+        return None
+    up = op["first_dir"] == "up"
+    level = op["first_high"] if up else op["first_low"]
+    note = (f"⚠️ Sneaky 2nd candle (took back {op['retrace'] * 100:.0f}% of the first): trade "
+            f"only a 5-min close {'above' if up else 'below'} ${level:.2f} "
+            f"({'calls' if up else 'puts'}); a break the other way failed 4 of 6 times")
+    if op.get("first_break"):
+        way = "the first candle's way ✅" if op["first_break"] == "resume" else "the other way ❌"
+        note += f". First break: {way} at {op['first_break_at']}"
+    return note
+
+
+def against_sneaky(s: dict | None) -> bool:
+    """True when the range broke against the first candle on a sneaky day."""
+    op = (s or {}).get("open") or {}
+    if not op.get("sneaky") or s.get("status") not in (BREAK_UP, BREAK_DOWN):
+        return False
+    return (s["status"] == BREAK_UP) != (op["first_dir"] == "up")
+
+
 def plan_line(s: dict | None) -> str | None:
     """One Game Plan line (HTML, Telegram-safe), or None when there is nothing to show."""
     if not s:
         return None
     m = s.get("minutes", MINUTES)
     if s["status"] == FORMING:
-        return (f"⏱ {m}-min opening range: forming until {s['ready_at']} "
-                f"(so far ${s['high']:.2f} / ${s['low']:.2f})")
+        sn = sneaky_note(s)
+        return html.escape(f"⏱ {m}-min opening range: forming until {s['ready_at']} "
+                           f"(so far ${s['high']:.2f} / ${s['low']:.2f})"
+                           + (f". {sn}" if sn else ""), quote=False)
     head = (f"⏱ {m}-min opening range: high ${s['high']:.2f} · low ${s['low']:.2f} · "
             f"width ${s['width']:.2f}")
     if s["status"] in (BREAK_UP, BREAK_DOWN):
@@ -133,7 +206,9 @@ def plan_line(s: dict | None) -> str | None:
         tail = f"no break by {s['cutoff']}"
     else:
         tail = f"no break yet (watching until {s['cutoff']})"
-    return html.escape(f"{head}. {_verdict(s)}. {tail}", quote=False)
+    sn = sneaky_note(s)
+    return html.escape(f"{head}. {_verdict(s)}. {tail}" + (f". {sn}" if sn else ""),
+                       quote=False)
 
 
 def alert_events(s: dict | None) -> list[str]:
@@ -166,6 +241,23 @@ def mark_sent(state: dict | None, ticker: str, day: str, events: list[str]) -> d
     return out
 
 
+LOG_KEEP_DAYS = 400
+
+
+def log_update(log: dict | None, ticker: str, s: dict | None) -> dict:
+    """``log`` (``{ticker: {day: summary}}``) with today's newest summary for ``ticker``;
+    the last ``LOG_KEEP_DAYS`` days per ticker are kept. The day's final row is the one
+    left after the last scan, so every open (sneaky or not) is on record for later study."""
+    out = {k: dict(v) for k, v in (log or {}).items()}
+    if not s or not s.get("day"):
+        return out
+    days = out.setdefault(ticker, {})
+    days[s["day"]] = s
+    for old in sorted(days)[:-LOG_KEEP_DAYS]:
+        del days[old]
+    return out
+
+
 def message(ticker: str, s: dict, event: str) -> str:
     """Telegram HTML for one event (``set`` or ``break``)."""
     t = html.escape(ticker)
@@ -176,6 +268,9 @@ def message(ticker: str, s: dict, event: str) -> str:
                  html.escape(_verdict(s), quote=False),
                  f"Alert set: a 5-min close above ${s['high']:.2f} or below ${s['low']:.2f} "
                  f"by {s['cutoff']}."]
+        sn = sneaky_note(s)
+        if sn:
+            lines.append(html.escape(sn, quote=False))
     else:
         up = s["status"] == BREAK_UP
         lines = [f"{'🟢' if up else '🔴'} <b>{t}</b> broke {'UP' if up else 'DOWN'} out of "
@@ -183,7 +278,10 @@ def message(ticker: str, s: dict, event: str) -> str:
                  f"5-min close ${s['break_close']:.2f} vs range "
                  f"${s['low']:.2f} – ${s['high']:.2f}",
                  html.escape(_verdict(s), quote=False)]
-        if not s.get("wide"):
+        if against_sneaky(s):
+            lines.append("⚠️ Against the first candle on a sneaky-candle day: in the replay "
+                         "these breaks failed 4 of 6 times. Skip it.")
+        elif not s.get("wide"):
             far = s["low"] if up else s["high"]
             lines.append(f"Plan: {'calls' if up else 'puts'}, stop on a 5-min close back "
                          f"inside, last-resort stop ${far:.2f}; move to break-even fast, "

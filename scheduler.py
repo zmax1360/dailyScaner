@@ -392,6 +392,7 @@ def _setup_alert(ticker: str, env: dict, *, send: bool) -> None:
 
 
 OPENING_RANGE_STATE = os.path.join(BASE_DIR, "data", "opening_range_alerts.json")
+OPENING_RANGE_LOG = os.path.join(BASE_DIR, "data", "opening_range_days.json")
 
 
 def ticker_opening_range_alert(cfg: dict, ticker: str) -> bool:
@@ -403,7 +404,8 @@ def ticker_opening_range_alert(cfg: dict, ticker: str) -> bool:
 def _opening_range_alert(ticker: str, env: dict, *, send: bool) -> None:
     """After a successful scan: the 20-minute opening range once it is set, and its first
     breakout, each sent once a day (``payload["ticker_rules"]["opening_range"]``). An event
-    is marked sent only after Telegram accepts it. Never raises."""
+    is marked sent only after Telegram accepts it. Every scan also records the day's newest
+    summary (``_log_opening_range``), sent or muted. Never raises."""
     try:
         import plan_report
         import safe_io
@@ -413,6 +415,7 @@ def _opening_range_alert(ticker: str, env: dict, *, send: bool) -> None:
         summary = plan_report.saved_opening_range(payload)
         if not summary:
             return
+        _log_opening_range(ticker, summary)
         with safe_io.locked(OPENING_RANGE_STATE):
             try:
                 with open(OPENING_RANGE_STATE) as fh:
@@ -439,6 +442,24 @@ def _opening_range_alert(ticker: str, env: dict, *, send: bool) -> None:
                     state, ticker, summary["day"], done))
     except Exception as exc:
         log.warning(f"[{ticker}] opening range alert error: {exc}")
+
+
+def _log_opening_range(ticker: str, summary: dict) -> None:
+    """Keep the day's newest opening-range summary (incl. the sneaky-candle read) in
+    ``data/opening_range_days.json`` so every open is on record. Never raises."""
+    try:
+        import safe_io
+        from ticker_rules import opening_range
+        with safe_io.locked(OPENING_RANGE_LOG):
+            try:
+                with open(OPENING_RANGE_LOG) as fh:
+                    log_ = json.load(fh)
+            except (OSError, ValueError):
+                log_ = {}
+            safe_io.write_json_atomic(OPENING_RANGE_LOG,
+                                      opening_range.log_update(log_, ticker, summary))
+    except Exception as exc:
+        log.warning(f"[{ticker}] opening range log error: {exc}")
 
 
 def ticker_rules_alert(cfg: dict, ticker: str) -> bool:

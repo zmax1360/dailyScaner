@@ -15,6 +15,14 @@ same commit as the change. Scoring-math changes also go in `CHANGES.md` with the
   new paper rule `orb_20` (Settings → Rules) trades a fresh break, skipping wide opens.
   Basis: a 60-session AAPL replay of 5-minute bars (plain breakout ≈ coin flip; wide opens
   failed in every range length; 20 minutes had the fewest fake-outs). Display and paper only.
+- **Sneaky second candle** (`opening_range.sneaky_open`, same tests). When the first
+  5-minute candle has a real body (>= 0.15% of the open) and the second is the opposite
+  colour, takes back 40-100% of it and stays inside its far end, the Game Plan line and the
+  9:50 alert say to trade only a 5-minute close beyond the first candle's extreme in its own
+  direction; a 20-min break against it gets "skip it" in the breakout alert and is skipped by
+  `orb_20` (`skip_against_sneaky`). Replay: 11 of 60 days; first-candle-way breaks won 3 of 4
+  over 30 min, the other way 2 of 6. Every scan also keeps the day's newest summary in
+  `data/opening_range_days.json` (400 days per ticker) so each open is on record.
 
 ## 2026-10-22
 
