@@ -2,7 +2,8 @@
 
 Context (``market.Context``): ``bars`` 15-minute bars (Close, VWAP; index = bar START,
 naive ET) holding only bars complete at ``now``; ``first5`` the day's first 5-minute bar
-(Open, High, Low, Close) or None; ``rvol`` that bar's volume / its 14-day average.
+(Open, High, Low, Close) or None; ``rvol`` that bar's volume / its 14-day average;
+``orange`` today's opening range (``opening_range.summarize``) or None.
 
 A signal is ``{"side": "CALL"|"PUT", "reason": str, "stop_spot": float|None}``.
 Every rule sees only the newest complete bar inside its window; the recorder asks at each
@@ -117,6 +118,33 @@ def orb_in_play(ctx, *, rvol_min=1.5, window="09:35-10:30", **_):
     return None
 
 
+def orb_20(ctx, *, minutes=20, max_age=10, allow_wide=False, skip_against_sneaky=True, **_):
+    """Opening range breakout on the first ``minutes`` (``opening_range``): the first
+    5-minute close outside the range, in its direction, only while that break is at most
+    ``max_age`` minutes old (a late scan does not chase it) and, unless ``allow_wide``,
+    only when the range is not wide against recent days and, unless
+    ``skip_against_sneaky`` is off, not against the first candle after a sneaky second
+    candle (``opening_range.against_sneaky``). Stop at the range's far side."""
+    from ticker_rules import opening_range
+    s = getattr(ctx, "orange", None)
+    if not s or s.get("minutes") != minutes or s["status"] not in ("break_up", "break_down"):
+        return None
+    if s.get("wide") and not allow_wide:
+        return None
+    if skip_against_sneaky and opening_range.against_sneaky(s):
+        return None
+    h, m = (int(x) for x in s["break_at"].split(":"))
+    age = (ctx.now.hour * 60 + ctx.now.minute) - (h * 60 + m)
+    if age < 0 or age > max_age:
+        return None
+    width = f"{s['rel']:.1f}x normal width" if s.get("rel") is not None else "width n/a"
+    if s["status"] == "break_up":
+        return {"side": CALL, "reason": f"5-min close {s['break_close']:.2f} above the "
+                f"{minutes}-min high {s['high']:.2f} ({width})", "stop_spot": s["low"]}
+    return {"side": PUT, "reason": f"5-min close {s['break_close']:.2f} below the "
+            f"{minutes}-min low {s['low']:.2f} ({width})", "stop_spot": s["high"]}
+
+
 # name -> (function, default params, label, which slot it belongs in)
 RULES: dict[str, dict[str, Any]] = {
     "ema_stack": {"fn": ema_stack, "label": "Follow EMA stack",
@@ -134,6 +162,10 @@ RULES: dict[str, dict[str, Any]] = {
     "orb_in_play": {"fn": orb_in_play, "label": "Opening range breakout (in play)",
                     "defaults": {"rvol_min": 1.5, "window": "09:35-10:30"},
                     "slots": ("in_play",)},
+    "orb_20": {"fn": orb_20, "label": "20-min opening range breakout (skip wide opens)",
+               "defaults": {"minutes": 20, "max_age": 10, "allow_wide": False,
+                            "skip_against_sneaky": True},
+               "slots": ("normal", "in_play")},
 }
 
 

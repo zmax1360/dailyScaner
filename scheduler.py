@@ -391,6 +391,77 @@ def _setup_alert(ticker: str, env: dict, *, send: bool) -> None:
         log.warning(f"[{ticker}] 11:00 setup alert error: {exc}")
 
 
+OPENING_RANGE_STATE = os.path.join(BASE_DIR, "data", "opening_range_alerts.json")
+OPENING_RANGE_LOG = os.path.join(BASE_DIR, "data", "opening_range_days.json")
+
+
+def ticker_opening_range_alert(cfg: dict, ticker: str) -> bool:
+    """20-minute opening range alerts for ``ticker``: on unless ``"opening_range_alert": false``."""
+    own = ((cfg or {}).get("tickers") or {}).get(ticker, {})
+    return own.get("opening_range_alert", True) is not False
+
+
+def _opening_range_alert(ticker: str, env: dict, *, send: bool) -> None:
+    """After a successful scan: the 20-minute opening range once it is set, and its first
+    breakout, each sent once a day (``payload["ticker_rules"]["opening_range"]``). An event
+    is marked sent only after Telegram accepts it. Every scan also records the day's newest
+    summary (``_log_opening_range``), sent or muted. Never raises."""
+    try:
+        import plan_report
+        import safe_io
+        from telegram_bot import _load_latest
+        from ticker_rules import opening_range
+        payload, _ = _load_latest(ticker)
+        summary = plan_report.saved_opening_range(payload)
+        if not summary:
+            return
+        _log_opening_range(ticker, summary)
+        with safe_io.locked(OPENING_RANGE_STATE):
+            try:
+                with open(OPENING_RANGE_STATE) as fh:
+                    state = json.load(fh)
+            except (OSError, ValueError):
+                state = {}
+            due = opening_range.due_events(state, ticker, summary)
+            if not due:
+                return
+            token = ticker_bot_token(env, ticker)
+            chat_id = ticker_chat_id(env, ticker, load_config())
+            if not send or not token or not chat_id:
+                return
+            done = []
+            for ev in due:
+                if _send_telegram(token, chat_id, opening_range.message(ticker, summary, ev),
+                                  ticker=ticker, kind="opening_range"):
+                    done.append(ev)
+                    log.info(f"[{ticker}] opening range alert sent ({ev})")
+                else:
+                    log.warning(f"[{ticker}] opening range alert failed ({ev})")
+            if done:
+                safe_io.write_json_atomic(OPENING_RANGE_STATE, opening_range.mark_sent(
+                    state, ticker, summary["day"], done))
+    except Exception as exc:
+        log.warning(f"[{ticker}] opening range alert error: {exc}")
+
+
+def _log_opening_range(ticker: str, summary: dict) -> None:
+    """Keep the day's newest opening-range summary (incl. the sneaky-candle read) in
+    ``data/opening_range_days.json`` so every open is on record. Never raises."""
+    try:
+        import safe_io
+        from ticker_rules import opening_range
+        with safe_io.locked(OPENING_RANGE_LOG):
+            try:
+                with open(OPENING_RANGE_LOG) as fh:
+                    log_ = json.load(fh)
+            except (OSError, ValueError):
+                log_ = {}
+            safe_io.write_json_atomic(OPENING_RANGE_LOG,
+                                      opening_range.log_update(log_, ticker, summary))
+    except Exception as exc:
+        log.warning(f"[{ticker}] opening range log error: {exc}")
+
+
 def ticker_rules_alert(cfg: dict, ticker: str) -> bool:
     """Paper-rule alert for ``ticker``: on unless ``"rules_alert": false``."""
     own = ((cfg or {}).get("tickers") or {}).get(ticker, {})
@@ -469,6 +540,8 @@ def handle_scan_result(
         _gamma_shift_check(ticker, env, send=notify and ticker_gamma_alert(load_config(), ticker))
         _setup_alert(ticker, env, send=notify and ticker_setup_alert(load_config(), ticker))
         _rules_alert(ticker, env, send=notify and ticker_rules_alert(load_config(), ticker))
+        _opening_range_alert(ticker, env,
+                             send=notify and ticker_opening_range_alert(load_config(), ticker))
         return
 
     if exit_code == 3:

@@ -4,6 +4,26 @@ One line per change that alters what the system does or shows, newest first, in 
 same commit as the change. Scoring-math changes also go in `CHANGES.md` with the new
 `config_hash` (see `AGENTS.md`). Commit ids are from `main`.
 
+## 2026-11-06
+
+- **20-minute opening range** (`ticker_rules/opening_range.py`, `tests/test_opening_range.py`).
+  Each scan saves the day's 09:30–09:50 high/low, its width against the previous 10
+  sessions (over 1.2x = "wide open, skip breakouts") and the first 5-minute close outside it
+  by 11:30 (`payload["ticker_rules"]["opening_range"]`). Shown as the last Game Plan line
+  (Telegram, app, MCP); Telegram alerts once when the range is set and once on the breakout
+  (`scheduler._opening_range_alert`, `"opening_range_alert": false` per ticker to mute);
+  new paper rule `orb_20` (Settings → Rules) trades a fresh break, skipping wide opens.
+  Basis: a 60-session AAPL replay of 5-minute bars (plain breakout ≈ coin flip; wide opens
+  failed in every range length; 20 minutes had the fewest fake-outs). Display and paper only.
+- **Sneaky second candle** (`opening_range.sneaky_open`, same tests). When the first
+  5-minute candle has a real body (>= 0.15% of the open) and the second is the opposite
+  colour, takes back 40-100% of it and stays inside its far end, the Game Plan line and the
+  9:50 alert say to trade only a 5-minute close beyond the first candle's extreme in its own
+  direction; a 20-min break against it gets "skip it" in the breakout alert and is skipped by
+  `orb_20` (`skip_against_sneaky`). Replay: 11 of 60 days; first-candle-way breaks won 3 of 4
+  over 30 min, the other way 2 of 6. Every scan also keeps the day's newest summary in
+  `data/opening_range_days.json` (400 days per ticker) so each open is on record.
+
 ## 2026-10-22
 
 - **Read-only MCP server** (`scanner_mcp.py`, `tests/test_scanner_mcp.py`, optional extra

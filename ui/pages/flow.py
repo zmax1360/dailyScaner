@@ -41,6 +41,7 @@ from ui.market import _rsi_plain
 from ui.market import live_session_snapshot
 from volume_analysis import fetch_intraday_vwap_df
 import game_plan
+import html
 import plan_report
 import bv_saved
 from ui import game_plan_view, shell
@@ -2105,6 +2106,9 @@ def render(cfg: dict, sections: frozenset[str] | None = None):
             strategy_panel.render(ticker, (curr or {}).get("ticker_rules"))
         except Exception as exc:          # the strategy card never breaks the Game Plan
             st.caption(f"Strategy card unavailable: {exc}")
+        orb_line = plan_report.opening_range_line(curr)
+        if orb_line:
+            st.markdown(html.unescape(orb_line).replace("$", "\\$"))
         st.divider()
         saved = plan_report.saved_plan(curr)
         if saved is None:

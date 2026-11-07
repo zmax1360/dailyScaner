@@ -37,6 +37,17 @@ them. Changes since then: `docs/changelog.md`.
    (the scan's saved `payload["gamma"]`, `plan_report.saved_gamma`) with the last ones seen today
    (`gamma_shift.update`, `data/gamma_walls.json`) and sends a short alert when one
    moved to another strike (`"gamma_alert": false` per ticker turns it off).
+5. Then `scheduler._opening_range_alert` reads the day's 20-minute opening range the scan
+   saved (`payload["ticker_rules"]["opening_range"]`, built in `dailyScaner._rules_snapshot`
+   from `ticker_rules.market.build` → `ticker_rules.opening_range.summarize`: 09:30–09:50
+   high/low, width vs the previous 10 sessions, first 5-minute close outside by 11:30) and
+   sends "range set" and "breakout" once a day each (`data/opening_range_alerts.json`,
+   marked only after Telegram accepts; `"opening_range_alert": false` per ticker turns it
+   off). The same saved range is the last Game Plan line (`plan_report.opening_range_line`:
+   Telegram, the app's Game Plan, the MCP `game_plan`) and feeds the `orb_20` paper rule.
+   The summary also carries the first two candles (`open`: sneaky second candle and the first
+   break of the first candle's high / low); each scan stores the day's newest summary in
+   `data/opening_range_days.json` (`scheduler._log_opening_range`).
 
 ### Where Best Value is scored (open problem, see F-S4-01 in findings)
 

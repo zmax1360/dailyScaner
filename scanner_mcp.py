@@ -174,8 +174,11 @@ def game_plan_report(ticker: str, *, now: datetime | None = None,
     return _clean({
         "ticker": t, "available": True, "file": os.path.basename(path),
         "side": plan.side, "side_label": game_plan.SIDE_LABEL.get(plan.side, plan.side),
-        "stale": plan.stale, "text": _text(game_plan.plan_lines(plan)),
+        "stale": plan.stale,
+        "text": _text(game_plan.plan_lines(plan)
+                      + [x for x in [plan_report.opening_range_line(curr)] if x]),
         "plan": game_plan.plan_to_json(plan),
+        "opening_range": plan_report.saved_opening_range(curr),
     })
 
 
