@@ -204,4 +204,25 @@ def report_lines(payload: dict, ticker: str, *, plan: bool = True, gamma: bool =
     saved = saved_plan(payload, now) if plan else None
     plan_out = ((game_plan.plan_lines(saved, compact=compact) if saved else [NO_PLAN_LINE])
                 if plan else [])
+    if plan:
+        orb = opening_range_line(payload)
+        if orb:
+            plan_out.append(orb)
     return plan_out, (gamma_lines(summary) if gamma else [])
+
+
+def saved_opening_range(payload: dict | None) -> dict | None:
+    """The day's opening range the scan saved (``payload["ticker_rules"]["opening_range"]``),
+    or None (older scans, tickers without rules, end-of-day scans)."""
+    tr = (payload or {}).get("ticker_rules")
+    s = tr.get("opening_range") if isinstance(tr, dict) else None
+    return s if isinstance(s, dict) and s.get("status") else None
+
+
+def opening_range_line(payload: dict | None) -> str | None:
+    """The Game Plan's opening-range line (HTML) for a saved scan, or None."""
+    from ticker_rules import opening_range
+    try:
+        return opening_range.plan_line(saved_opening_range(payload))
+    except (KeyError, TypeError, ValueError):
+        return None

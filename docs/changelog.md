@@ -4,6 +4,18 @@ One line per change that alters what the system does or shows, newest first, in 
 same commit as the change. Scoring-math changes also go in `CHANGES.md` with the new
 `config_hash` (see `AGENTS.md`). Commit ids are from `main`.
 
+## 2026-11-06
+
+- **20-minute opening range** (`ticker_rules/opening_range.py`, `tests/test_opening_range.py`).
+  Each scan saves the day's 09:30–09:50 high/low, its width against the previous 10
+  sessions (over 1.2x = "wide open, skip breakouts") and the first 5-minute close outside it
+  by 11:30 (`payload["ticker_rules"]["opening_range"]`). Shown as the last Game Plan line
+  (Telegram, app, MCP); Telegram alerts once when the range is set and once on the breakout
+  (`scheduler._opening_range_alert`, `"opening_range_alert": false` per ticker to mute);
+  new paper rule `orb_20` (Settings → Rules) trades a fresh break, skipping wide opens.
+  Basis: a 60-session AAPL replay of 5-minute bars (plain breakout ≈ coin flip; wide opens
+  failed in every range length; 20 minutes had the fewest fake-outs). Display and paper only.
+
 ## 2026-10-22
 
 - **Read-only MCP server** (`scanner_mcp.py`, `tests/test_scanner_mcp.py`, optional extra

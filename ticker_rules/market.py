@@ -1,5 +1,5 @@
 """market — the context the rules read: 15-minute bars with session VWAP, the day's first
-5-minute bar and its relative volume. Built from the configured market-data source."""
+5-minute bar and its relative volume, and the day's 20-minute opening range. Built from the configured market-data source."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ class Context:
     bars: pd.DataFrame            # 15-min, complete at ``now``, today and earlier
     first5: pd.Series | None      # today's 09:30 5-min bar
     rvol: float | None            # first5 volume / mean of the previous RVOL_DAYS
+    orange: dict | None = None    # today's opening range (opening_range.summarize)
 
 
 def _naive_et(idx) -> pd.DatetimeIndex:
@@ -53,7 +54,9 @@ def build(five: pd.DataFrame, now: datetime) -> Context:
     rvol = None
     if f5 is not None and len(prev) >= 5 and prev.mean() > 0:
         rvol = float(f5["Volume"] / prev.mean())
-    return Context(now=now, bars=b, first5=f5, rvol=rvol)
+    from ticker_rules import opening_range
+    orange = opening_range.summarize(df[["Open", "High", "Low", "Close"]], now_n)
+    return Context(now=now, bars=b, first5=f5, rvol=rvol, orange=orange)
 
 
 def fetch(ticker: str, now: datetime, *, source=None) -> Context:

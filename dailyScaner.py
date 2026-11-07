@@ -1074,7 +1074,8 @@ def _setup_snapshot(payload, calls_all, puts_all, ts):
 
 def _rules_snapshot(payload, calls_all, puts_all, ts):
     """Per-ticker strategy (``ticker_rules``): the Game Plan's strategy card for this scan
-    (``plan``) and today's paper trade entry or exit (``event``). Paper only. Saved as
+    (``plan``), today's paper trade entry or exit (``event``) and the day's 20-minute
+    opening range (``opening_range``, ``ticker_rules.opening_range``). Paper only. Saved as
     ``ticker_rules``; the scheduler sends the event's Telegram line. Never raises."""
     try:
         import volume_history
@@ -1093,7 +1094,9 @@ def _rules_snapshot(payload, calls_all, puts_all, ts):
         ev = recorder.on_scan(chain, ticker=TICKER, now=ts, spot=spot, ctx=ctx) \
             if ctx is not None else None
         card = plan.build(TICKER, ctx, chain, spot, ts)
-        return json.loads(json.dumps({"event": ev, "plan": card}, default=str))
+        orange = getattr(ctx, "orange", None) if ctx is not None else None
+        return json.loads(json.dumps({"event": ev, "plan": card, "opening_range": orange},
+                                     default=str))
     except Exception as exc:
         log.warning(f"ticker rules failed (scan continues): {exc}")
         return None
