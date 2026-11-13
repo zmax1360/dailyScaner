@@ -1102,7 +1102,7 @@ def _rules_snapshot(payload, calls_all, puts_all, ts):
         return None
 
 
-def _record_volume_history(fname_json, calls_all, puts_all, *, source_name, force=False):
+def _record_volume_history(fname_json, calls_all, puts_all, *, source_name, force=False, spot=None):
     """Store every traded contract of this scan. Never raises into the scan."""
     try:
         from zoneinfo import ZoneInfo
@@ -1113,7 +1113,7 @@ def _record_volume_history(fname_json, calls_all, puts_all, *, source_name, forc
             tzinfo=ZoneInfo("America/New_York"))
         n = volume_history.record_scan(
             calls_all, puts_all, ticker=TICKER, scan_id=stem, ts=ts, source=source_name,
-            min_interval_min=volume_history.RECORD_EVERY_MIN, force=force,
+            min_interval_min=volume_history.RECORD_EVERY_MIN, force=force, spot=spot,
         )
         log.info("volume_history: recorded %d contracts for %s%s", n, stem,
                  "" if n else " (skipped: recorded < %d min ago)" % volume_history.RECORD_EVERY_MIN)
@@ -1482,7 +1482,8 @@ def run(source=None):
     )
 
     # Full-chain volume/OI history (fail-soft; display only, never scoring).
-    _record_volume_history(fname_json, calls_all, puts_all, source_name=_curr_source, force=IS_EOD)
+    _record_volume_history(fname_json, calls_all, puts_all, source_name=_curr_source, force=IS_EOD,
+                           spot=spot)
 
     # Attribution: every scored contract + ATM controls (fail-soft), from the
     # same scoring as the archive snapshot.

@@ -212,3 +212,140 @@ def test_volume_bursts_ranks_jumps_and_drops_carryover_and_stale(tmp_path):
     # deep in-the-money 300C (900 x $45) shows only when the filter is off
     assert 300.0 in vh.volume_bursts("AAPL", db_path=db, spot=345.0, itm_limit=None)["strike"].tolist()
     assert vh.volume_bursts("AAPL", db_path=db, sort_by="added", top=1)["strike"].tolist() == [355.0]
+
+
+# ── storage window, latest_chain, session anchor ─────────────────────────────
+
+WIN = {"strike_pct": 2.0, "max_dte": 30, "anchor": "session_open"}
+FAR = _leg([
+    (345.0, 1.0, 50, 10, 0.2, 0.9, 1.1, "2026-12-31", 94),     # inside strikes, too far out
+    (300.0, 45.0, 10, 10, 0.4, 44.0, 46.0, "2026-10-02", 4),   # far below spot
+])
+
+
+def _hist(db):
+    with sqlite3.connect(db) as con:
+        return con.execute("SELECT side, strike, expiry FROM contract_scans ORDER BY side, strike"
+                           ).fetchall()
+
+
+def test_window_keeps_near_strikes_and_short_expiries(tmp_path):
+    db = str(tmp_path / "vh.db")
+    calls = pd.concat([CALLS, FAR], ignore_index=True)
+    n = vh.record_scan(calls, PUTS, ticker="AAPL", scan_id="AAPL_20260928_104500",
+                       ts=_ts("2026-09-28", "10:45"), db_path=db, spot=345.0, window_cfg=WIN)
+    # ±2% of 345 = 338.10 .. 351.90 and ≤ 30 days: 340C and 350C stay; 335P, 300C, Dec 345C go
+    assert n == 2
+    assert _hist(db) == [("CALL", 340.0, "2026-10-02"), ("CALL", 350.0, "2026-10-02")]
+
+
+def test_latest_chain_keeps_the_full_chain(tmp_path):
+    db = str(tmp_path / "vh.db")
+    calls = pd.concat([CALLS, FAR], ignore_index=True)
+    vh.record_scan(calls, PUTS, ticker="AAPL", scan_id="AAPL_20260928_104500",
+                   ts=_ts("2026-09-28", "10:45"), db_path=db, spot=345.0, window_cfg=WIN)
+    latest = vh.latest_scan("AAPL", db_path=db)
+    assert len(latest) == 5                                     # every traded contract
+    assert set(latest["strike"]) == {340.0, 350.0, 345.0, 300.0, 335.0}
+
+
+def test_session_open_anchor_is_kept_all_day(tmp_path):
+    db = str(tmp_path / "vh.db")
+    vh.record_scan(CALLS, PUTS, ticker="AAPL", scan_id="AAPL_20260928_100000",
+                   ts=_ts("2026-09-28", "10:00"), db_path=db, spot=345.0, window_cfg=WIN)
+    # Spot jumps to 360: with the session-open anchor, 340/350 are still recorded.
+    n = vh.record_scan(CALLS, PUTS, ticker="AAPL", scan_id="AAPL_20260928_110000",
+                       ts=_ts("2026-09-28", "11:00"), db_path=db, spot=360.0, window_cfg=WIN)
+    assert n == 2
+    with sqlite3.connect(db) as con:
+        assert con.execute("SELECT spot FROM session_anchor").fetchall() == [(345.0,)]
+
+
+def test_each_scan_anchor_moves_with_price(tmp_path):
+    db = str(tmp_path / "vh.db")
+    win = dict(WIN, anchor="each_scan")
+    n = vh.record_scan(CALLS, PUTS, ticker="AAPL", scan_id="AAPL_20260928_110000",
+                       ts=_ts("2026-09-28", "11:00"), db_path=db, spot=360.0, window_cfg=win)
+    assert n == 0                                               # 340/350 are > 2% from 360
+
+
+def test_skipped_interval_still_refreshes_latest_chain(tmp_path):
+    db = str(tmp_path / "vh.db")
+    kw = dict(ticker="AAPL", db_path=db, min_interval_min=15, spot=345.0, window_cfg=WIN)
+    vh.record_scan(CALLS, PUTS, scan_id="AAPL_20260928_100000", ts=_ts("2026-09-28", "10:00"), **kw)
+    n = vh.record_scan(CALLS, PUTS, scan_id="AAPL_20260928_100500", ts=_ts("2026-09-28", "10:05"), **kw)
+    assert n == 0                                               # history skipped (< 15 min)
+    assert set(vh.latest_scan("AAPL", db_path=db)["scan_id"]) == {"AAPL_20260928_100500"}
+
+
+def test_older_scan_does_not_overwrite_latest_chain(tmp_path):
+    db = str(tmp_path / "vh.db")
+    kw = dict(ticker="AAPL", db_path=db, spot=345.0, window_cfg=WIN)
+    vh.record_scan(CALLS, PUTS, scan_id="AAPL_20260928_110000", ts=_ts("2026-09-28", "11:00"), **kw)
+    vh.record_scan(CALLS, PUTS, scan_id="AAPL_20260928_100000", ts=_ts("2026-09-28", "10:00"), **kw)
+    assert set(vh.latest_scan("AAPL", db_path=db)["scan_id"]) == {"AAPL_20260928_110000"}
+
+
+def test_no_spot_means_no_filtering(tmp_path):
+    db = str(tmp_path / "vh.db")
+    n = vh.record_scan(CALLS, PUTS, ticker="AAPL", scan_id="AAPL_20260928_104500",
+                       ts=_ts("2026-09-28", "10:45"), db_path=db, window_cfg=WIN)
+    assert n == 3
+
+
+def test_config_window_per_ticker_and_default(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "VOLUME_HISTORY", {
+        "anchor": "session_open", "default": {"strike_pct": 10.0, "max_dte": 30},
+        "tickers": {"SPY": {"strike_pct": 5.0, "max_dte": 14}}})
+    assert vh.window("spy") == {"strike_pct": 5.0, "max_dte": 14, "anchor": "session_open"}
+    assert vh.window("IBIT") == {"strike_pct": 10.0, "max_dte": 30, "anchor": "session_open"}
+
+
+def test_parity_spot_estimates_the_stock_price():
+    chain = pd.DataFrame([
+        # spot 101: C − P = S − K for each strike
+        {"side": "CALL", "strike": 100.0, "expiry": "2026-10-02", "bid": 1.9, "ask": 2.1, "last": 2.0},
+        {"side": "PUT", "strike": 100.0, "expiry": "2026-10-02", "bid": 0.9, "ask": 1.1, "last": 1.0},
+        {"side": "CALL", "strike": 101.0, "expiry": "2026-10-02", "bid": 1.4, "ask": 1.6, "last": 1.5},
+        {"side": "PUT", "strike": 101.0, "expiry": "2026-10-02", "bid": 1.4, "ask": 1.6, "last": 1.5},
+        {"side": "CALL", "strike": 102.0, "expiry": "2026-10-02", "bid": 0.9, "ask": 1.1, "last": 1.0},
+        {"side": "PUT", "strike": 102.0, "expiry": "2026-10-02", "bid": 1.9, "ask": 2.1, "last": 2.0},
+    ])
+    assert vh.parity_spot(chain) == pytest.approx(101.0)
+    assert vh.parity_spot(pd.DataFrame()) is None
+
+
+# ── one-time cleanup script ──────────────────────────────────────────────────
+
+def test_cleanup_dry_run_then_apply(tmp_path, monkeypatch):
+    import importlib.util
+    import json as _json
+
+    import config
+    spec = importlib.util.spec_from_file_location(
+        "vh_cleanup", vh.os.path.join(vh._BASE, "scripts", "volume_history_cleanup.py"))
+    cl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cl)
+    monkeypatch.setattr(config, "VOLUME_HISTORY", {
+        "anchor": "session_open", "default": {"strike_pct": 2.0, "max_dte": 30}, "tickers": {}})
+
+    db = str(tmp_path / "vh.db")
+    calls = pd.concat([CALLS, FAR], ignore_index=True)
+    for hm in ("10:00", "11:00"):                              # old-style: no window, no spot
+        vh.record_scan(calls, PUTS, ticker="AAPL", scan_id=f"AAPL_20260928_{hm.replace(':', '')}00",
+                       ts=_ts("2026-09-28", hm), db_path=db, window_cfg={})
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    (arch / "AAPL_20260928_100000.json").write_text(_json.dumps({"spot": 345.0}))
+
+    assert cl.main(["--db", db, "--archive-dir", str(arch)]) == 0          # dry run
+    assert len(_rows(db)) == 10                                            # untouched
+
+    assert cl.main(["--db", db, "--archive-dir", str(arch), "--apply"]) == 0
+    assert len(_hist(db)) == 4                                             # 340C + 350C, 2 scans
+    assert len(vh.latest_scan("AAPL", db_path=db)) == 5                    # full chain kept
+    pruned = tmp_path / "archive" / "volume_history_pruned_AAPL.csv.gz"
+    import gzip
+    with gzip.open(pruned, "rt") as f:
+        assert len(f.read().strip().splitlines()) == 1 + 6                 # header + 3 rows x 2

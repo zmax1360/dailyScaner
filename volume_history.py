@@ -9,7 +9,8 @@ Rules:
   * Recording is fail-soft: ``record_scan`` never raises into the scanner.
   * Display/analysis only. Not a scoring input.
 
-Storage: SQLite at data/volume_history.db (WAL). One row per contract per scan.
+Storage: SQLite at data/volume_history.db (WAL). One row per contract per scan, inside the ticker's
+window (config.VOLUME_HISTORY); the full chain of the newest scan is in ``latest_chain``.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import math
 import os
 import sqlite3
 from contextlib import closing
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Iterable
 
 import pandas as pd
@@ -46,6 +47,30 @@ CREATE TABLE IF NOT EXISTS contract_scans (
 );
 CREATE INDEX IF NOT EXISTS ix_contract ON contract_scans (ticker, side, strike, expiry, ts_et);
 CREATE INDEX IF NOT EXISTS ix_session  ON contract_scans (ticker, session_date);
+
+-- Full traded chain of the newest scan per ticker (unfiltered; read by latest_scan / Gamma).
+CREATE TABLE IF NOT EXISTS latest_chain (
+    ticker        TEXT NOT NULL,
+    scan_id       TEXT NOT NULL,
+    ts_et         TEXT NOT NULL,
+    side          TEXT NOT NULL,
+    strike        REAL NOT NULL,
+    expiry        TEXT NOT NULL,
+    volume        REAL,
+    open_interest REAL,
+    bid REAL, ask REAL, last REAL, iv REAL,
+    source        TEXT,
+    PRIMARY KEY (ticker, side, strike, expiry)
+);
+
+-- Spot the history window is centred on, one per ticker per session.
+CREATE TABLE IF NOT EXISTS session_anchor (
+    ticker        TEXT NOT NULL,
+    session_date  TEXT NOT NULL,
+    spot          REAL NOT NULL,
+    ts_et         TEXT NOT NULL,
+    PRIMARY KEY (ticker, session_date)
+);
 """
 
 # AAPL scans every 3 min; a full snapshot every scan is ~100 MB/day. History charts only
@@ -57,6 +82,69 @@ _COLS = {  # legacy scanner leg column -> table column
     "volume": "volume", "openInterest": "open_interest", "bid": "bid", "ask": "ask",
     "lastPrice": "last", "impliedVolatility": "iv",
 }
+
+
+# ── storage window (config.VOLUME_HISTORY) ───────────────────────────────────
+
+def window(ticker: str) -> dict[str, Any] | None:
+    """``{"strike_pct", "max_dte", "anchor"}`` for ``ticker``, or None (keep everything)."""
+    try:
+        import config
+        cfg = getattr(config, "VOLUME_HISTORY", None)
+    except Exception:
+        cfg = None
+    if not cfg:
+        return None
+    w = dict(cfg.get("default") or {})
+    w.update((cfg.get("tickers") or {}).get(ticker.upper(), {}))
+    if "strike_pct" not in w or "max_dte" not in w:
+        return None
+    w["anchor"] = cfg.get("anchor", "session_open")
+    return w
+
+
+def _dte(expiry: str, session_date: str) -> int | None:
+    try:
+        return (date.fromisoformat(expiry[:10]) - date.fromisoformat(session_date[:10])).days
+    except ValueError:
+        return None
+
+
+def in_window(strike: float, expiry: str, *, anchor: float, session_date: str,
+              strike_pct: float, max_dte: int) -> bool:
+    """True when a contract is inside the history window (pure)."""
+    d = _dte(expiry, session_date)
+    if d is None or d < 0 or d > max_dte:
+        return False
+    return abs(strike / anchor - 1.0) <= strike_pct / 100.0
+
+
+def prune_bounds(anchor: float, strike_pct: float) -> tuple[float, float]:
+    """Inclusive strike bounds kept for ``anchor`` (cleanup SQL uses the same rule)."""
+    return anchor * (1 - strike_pct / 100.0), anchor * (1 + strike_pct / 100.0)
+
+
+def parity_spot(chain: pd.DataFrame) -> float | None:
+    """Estimate spot from one scan's chain by put-call parity on the nearest expiry:
+    at the strike where call and put mids are closest, spot ≈ K + C − P. None if unusable."""
+    if chain is None or chain.empty:
+        return None
+    df = chain.copy()
+    mid = (df["bid"] + df["ask"]) / 2
+    ok = (df["bid"] > 0) & (df["ask"] > 0)
+    df["px"] = mid.where(ok, df["last"])
+    df = df.dropna(subset=["px"])
+    for exp in sorted(df["expiry"].unique()):
+        e = df[df["expiry"] == exp]
+        c = e[e["side"] == "CALL"].set_index("strike")["px"]
+        p = e[e["side"] == "PUT"].set_index("strike")["px"]
+        both = c.index.intersection(p.index)
+        if len(both) < 3:
+            continue
+        diff = (c[both] - p[both])
+        k = diff.abs().idxmin()
+        return float(k + diff[k])
+    return None
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -109,11 +197,17 @@ def record_scan(
     db_path: str | None = None,
     min_interval_min: float | None = None,
     force: bool = False,
+    spot: float | None = None,
+    window_cfg: dict[str, Any] | None = None,
 ) -> int:
-    """Store every traded contract from one scan. Returns rows written; never raises.
+    """Store one scan. Returns history rows written; never raises.
 
-    With ``min_interval_min``, a scan is skipped (returns 0) when the same ticker was
-    recorded less than that many minutes earlier in the same session, unless ``force``.
+    * ``latest_chain`` always gets the full traded chain (if this scan is the newest).
+    * ``contract_scans`` (history) gets only contracts inside the ticker's window
+      (``config.VOLUME_HISTORY``, or ``window_cfg``), centred on the session anchor spot.
+      Without a spot or anchor, nothing is filtered.
+    * With ``min_interval_min``, history is skipped (returns 0) when the same ticker was
+      recorded less than that many minutes earlier in the same session, unless ``force``.
     """
     try:
         if ts.tzinfo is None:
@@ -124,12 +218,47 @@ def record_scan(
         ts_iso = ts.isoformat()
         base = (ticker.upper(), scan_id, ts_iso, ts_iso[:10])
         with closing(_connect(db_path or DB_PATH)) as con, con:
+            newest = con.execute("SELECT MAX(ts_et) FROM latest_chain WHERE ticker=?",
+                                 (base[0],)).fetchone()[0]
+            if not newest or datetime.fromisoformat(newest) <= ts:
+                con.execute("DELETE FROM latest_chain WHERE ticker=?", (base[0],))
+                con.executemany(
+                    "INSERT OR REPLACE INTO latest_chain (ticker, scan_id, ts_et, side, strike,"
+                    " expiry, volume, open_interest, bid, ask, last, iv, source)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [(base[0], scan_id, ts_iso, r["side"], r["strike"], r["expiry"], r["volume"],
+                      r["open_interest"], r["bid"], r["ask"], r["last"], r["iv"], source)
+                     for r in rows],
+                )
             if min_interval_min and not force:
                 last = con.execute(
                     "SELECT MAX(ts_et) FROM contract_scans WHERE ticker=? AND session_date=?",
                     (base[0], base[3])).fetchone()[0]
                 if last and (ts - datetime.fromisoformat(last)).total_seconds() < min_interval_min * 60:
                     return 0
+            win = window_cfg if window_cfg is not None else window(base[0])
+            if win:
+                spot_ok = _num(spot) if spot is not None else None
+                anchor = None
+                if win.get("anchor", "session_open") == "session_open":
+                    if spot_ok and spot_ok > 0:
+                        con.execute("INSERT OR IGNORE INTO session_anchor (ticker, session_date,"
+                                    " spot, ts_et) VALUES (?,?,?,?)",
+                                    (base[0], base[3], spot_ok, ts_iso))
+                    row = con.execute("SELECT spot FROM session_anchor WHERE ticker=? AND"
+                                      " session_date=?", (base[0], base[3])).fetchone()
+                    anchor = row[0] if row else None
+                elif spot_ok and spot_ok > 0:
+                    anchor = spot_ok
+                if anchor:
+                    rows = [r for r in rows if in_window(
+                        r["strike"], r["expiry"], anchor=anchor, session_date=base[3],
+                        strike_pct=win["strike_pct"], max_dte=win["max_dte"])]
+                else:
+                    log.warning("volume_history: no spot/anchor for %s %s; history not filtered",
+                                base[0], base[3])
+            if not rows:
+                return 0
             con.executemany(
                 "INSERT OR IGNORE INTO contract_scans (ticker, scan_id, ts_et, session_date, side,"
                 " strike, expiry, volume, open_interest, bid, ask, last, iv, source)"
@@ -248,11 +377,20 @@ def recording_status(ticker: str, *, db_path: str | None = None) -> dict[str, An
 
 
 def latest_scan(ticker: str, *, db_path: str | None = None) -> pd.DataFrame:
-    """Every contract recorded in the most recent scan."""
+    """Every traded contract of the most recent scan (full chain from ``latest_chain``;
+    falls back to the newest history scan for databases written before it existed)."""
     path = db_path or DB_PATH
     if not os.path.exists(path):
         return pd.DataFrame()
     with closing(sqlite3.connect(path, timeout=30)) as con:
+        has = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='latest_chain'"
+                          ).fetchone()
+        if has:
+            df = pd.read_sql_query(
+                "SELECT side, strike, expiry, volume, open_interest, bid, ask, last, iv, ts_et,"
+                " scan_id FROM latest_chain WHERE ticker=?", con, params=(ticker.upper(),))
+            if not df.empty:
+                return df
         return pd.read_sql_query(
             "SELECT side, strike, expiry, volume, open_interest, bid, ask, last, iv, ts_et, scan_id"
             " FROM contract_scans WHERE ticker=? AND ts_et=(SELECT MAX(ts_et) FROM contract_scans"
