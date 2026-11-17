@@ -7,6 +7,7 @@ import html
 import streamlit as st
 
 import game_plan as gp
+import regime_strategy as rs
 from ui.common import ET
 
 SIDE_STYLE = {gp.CALLS: ("🟢", "rgb(34, 197, 94)"), gp.PUTS: ("🔴", "rgb(239, 68, 68)"),
@@ -111,6 +112,34 @@ def render_trade(trade: gp.TradePlan | None) -> None:
     st.caption(_md(trade.other_side) + " Prices are for the stock, not the option premium.")
 
 
+def render_strategy(pick: dict | None) -> None:
+    """Today's options structure (regime_strategy.choose), as the scan saved it."""
+    if not pick:
+        return
+    st.markdown(f"**Strategy for today** · {pick['label']} "
+                f"<span style='color:#FACC15'>({pick.get('status', rs.STATUS).lower()}: "
+                "not a trade signal yet)</span>", unsafe_allow_html=True)
+    if pick.get("legs"):
+        st.markdown(_md(rs.legs_text(pick)
+                        + (f" · expiry {pick['expiry']}" if pick.get("expiry") else "")))
+    if pick.get("cost_mid") is not None:
+        c = pick["cost_mid"]
+        cols = st.columns(4)
+        cols[0].metric("Credit" if c < 0 else "Debit", f"${abs(c):,.0f}",
+                       help="At mid. Worst case (ask/bid): "
+                            f"${abs(pick['cost_worst']):,.0f}.")
+        cols[1].metric("Max loss", f"${pick['max_loss']:,.0f}")
+        cols[2].metric("Max profit", f"${pick['max_profit']:,.0f}")
+        cols[3].metric("Moved from open", "—" if pick.get("moved") is None
+                       else f"${pick['moved']:+,.2f}")
+        if pick.get("over_budget"):
+            st.warning(f"Max loss is over your ${rs.MAX_RISK:,.0f} limit: skip, or paper only.",
+                       icon="⚠️")
+    elif pick.get("legs"):
+        st.caption("No usable quote for every leg in this scan, so no price.")
+    st.caption(_md(pick["reason"] + " Close before 16:00: these options settle in shares."))
+
+
 def render(plan: gp.Plan) -> None:
     st.subheader(f"{plan.ticker} game plan")
     if plan.stale:
@@ -135,6 +164,7 @@ def render(plan: gp.Plan) -> None:
     for col, cand in zip(cols[2:], plan.candidates):
         col.metric(f"{cand.pool} candidate", gp.candidate_text(cand.pick).split(" · ")[0],
                    help=cand.note)
+    render_strategy(plan.strategy)
     if plan.vwap_note:
         st.warning(_md(plan.vwap_note), icon="⚠️")
     if plan.hold:

@@ -145,7 +145,8 @@ def picks_from_archive(payload: dict) -> pd.DataFrame:
 def plan_from_archive(payload: dict, ticker: str, *, gamma: dict | None = None,
                       now: datetime | None = None,
                       settings: dict[str, float] | None = None,
-                      archive_dir: str | None = None) -> game_plan.Plan:
+                      archive_dir: str | None = None,
+                      quotes: pd.DataFrame | None = None) -> game_plan.Plan:
     """Build the Game Plan for one scan. Only the scan calls this (``build_saved_plan``);
     readers use ``saved_plan``. Everything comes from the scan's own payload: price,
     the saved ranking, gamma (``payload["gamma"]``) and VWAP (``payload["vwap"]``)."""
@@ -168,16 +169,18 @@ def plan_from_archive(payload: dict, ticker: str, *, gamma: dict | None = None,
         emas=((payload.get("timeframes") or {}).get(ema_stack.TIMEFRAME) or {}),
         price_note="Price, VWAP and gamma are the ones recorded by the scan.",
         htf=htf_trend.from_archive(payload),
+        session_open=session.get("open"), quotes=quotes,
     )
 
 
 def build_saved_plan(payload: dict, ticker: str, *, now: datetime,
                      settings: dict[str, float] | None = None,
-                     archive_dir: str | None = None) -> dict | None:
+                     archive_dir: str | None = None,
+                     quotes: pd.DataFrame | None = None) -> dict | None:
     """The Game Plan the scan saves (``payload["game_plan"]``). Called by the scan only,
     after ``payload`` has its timeframes, ranking, gamma and VWAP."""
     plan = plan_from_archive(payload, ticker, gamma=saved_gamma(payload), now=now,
-                             settings=settings, archive_dir=archive_dir)
+                             settings=settings, archive_dir=archive_dir, quotes=quotes)
     return game_plan.plan_to_json(plan)
 
 
