@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 
+import pandas as pd
 import streamlit as st
 
 import game_plan as gp
@@ -137,7 +138,20 @@ def render_strategy(pick: dict | None) -> None:
                        icon="⚠️")
     elif pick.get("legs"):
         st.caption("No usable quote for every leg in this scan, so no price.")
-    st.caption(_md(pick["reason"] + " Close before 16:00: these options settle in shares."))
+    st.caption(_md(pick["reason"] + " Close by 15:45: these options settle in shares."))
+    alts = [a for a in pick.get("alternatives") or [] if a.get("cost_mid") is not None]
+    if alts:
+        st.dataframe(pd.DataFrame([{
+            "Structure": a["label"], "Legs": rs.legs_text(a),
+            "Debit/credit (mid)": a["cost_mid"], "Max loss": a["max_loss"],
+            "Max profit": a["max_profit"],
+            "Sim avg P&L": a.get("sim_avg"), "Sim win": a.get("sim_win"),
+            "Over $" + f"{rs.MAX_RISK:.0f}": "yes" if a.get("over_budget") else "",
+        } for a in alts]), hide_index=True, use_container_width=True)
+        if pick.get("basis"):
+            st.caption(_md(f"Simulated over {pick['basis']}, each past move scaled to "
+                           f"today's implied move ({'$%.2f' % pick['implied_move'] if pick.get('implied_move') else 'n/a'}). "
+                           "Rebuild the history with scripts/build_move_samples.py."))
 
 
 def render(plan: gp.Plan) -> None:

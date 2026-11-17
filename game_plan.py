@@ -626,7 +626,8 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
         htf_note=htf_trend.plan_line(side, htf) if htf is not None else "",
         strategy=regime_strategy.choose(ticker=ticker, regime=regime, trend_side=trend_side,
                                         spot=spot, session_open=session_open, gamma=gamma,
-                                        quotes=quotes),
+                                        quotes=quotes, now=now,
+                                        samples=regime_strategy.load_samples()),
     )
 
 
