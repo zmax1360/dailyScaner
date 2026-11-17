@@ -303,6 +303,10 @@ def choose(*, ticker: str, regime: str, trend_side: str, spot: Any, session_open
         if samples is not None and not zs:
             return _no(f"Not enough history to simulate ({basis}). Candidates are listed, "
                        "none is picked.", alternatives=alts, basis=basis, **extra)
+        if samples is not None:
+            return _no("No usable quote for every leg (or no implied move) in this scan, "
+                       "so nothing could be priced or simulated.", alternatives=alts,
+                       basis=basis, **extra)
         reason = "Not simulated (no quotes or history): first candidate for this regime."
     regime_txt = {POSITIVE: "Positive gamma: dealers dampen moves.",
                   NEGATIVE: "Negative gamma: moves tend to extend."}[regime]

@@ -117,3 +117,8 @@ def test_load_samples_reads_the_file(tmp_path):
     f.write_text(json.dumps({"samples": QUIET}))
     assert len(rs.load_samples(str(f))) == len(QUIET)
     assert rs.load_samples(str(tmp_path / "missing.json")) == []
+
+
+def test_no_quotes_with_history_is_no_trade():
+    p = pick(quotes=None)
+    assert p["code"] == rs.NO_TRADE and "No usable quote" in p["reason"]
