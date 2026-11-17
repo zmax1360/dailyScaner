@@ -96,4 +96,11 @@ if [ "$DOW" -le 5 ]; then          # weekday — expect activity
     [ "${MARKED:-0}" -eq 0 ] && log "ALERT: no t1h marks — is mark_runner alive?"
 fi
 
+# ── 5. 0DTE move history for the Game Plan strategy (regime_strategy) ─────────
+if "$PY" "$REPO/scripts/build_move_samples.py" --root "$REPO" >> "$LOG" 2>&1; then
+    log "move samples rebuilt"
+else
+    log "WARN: move samples rebuild failed (the Game Plan keeps the previous file)"
+fi
+
 log "── nightly done ──"

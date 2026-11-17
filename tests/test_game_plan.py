@@ -468,7 +468,9 @@ def test_view_has_no_trade_plan_on_a_stand_aside_day():
 # ── Telegram lines ──────────────────────────────────────────────────────────
 
 def test_plan_lines_for_telegram():
-    lines = gp.plan_lines(_plan())
+    import regime_strategy
+    plan = _plan()
+    lines = gp.plan_lines(plan)
     assert lines[:5] == [
         "🎯 <b>GAME PLAN · AAPL</b>",
         "Side: <b>Calls only</b>",
@@ -483,8 +485,11 @@ def test_plan_lines_for_telegram():
         "$342.75 Expected range high (30%)",
         "Reward to risk from here: <b>0.8</b> (needs 1.5)",
     ]
-    assert lines[9].startswith("Levels: Expected range high $342.75 &gt; Call resistance $335")
-    assert all(line.startswith("• ") for line in lines[10:]) and len(lines) > 10
+    strat = regime_strategy.lines(plan.strategy)           # today's structure, after the trade
+    assert strat and lines[9:9 + len(strat)] == strat
+    n = 9 + len(strat)
+    assert lines[n].startswith("Levels: Expected range high $342.75 &gt; Call resistance $335")
+    assert all(line.startswith("• ") for line in lines[n + 1:]) and len(lines) > n + 1
     stale = gp.plan_lines(_plan(trend=_trend(333.44, 333.01, 332.62, stale=True)))
     assert stale[1] == "Side: <b>Calls only</b> (scan is stale)"
     assert gp.plan_lines(_plan(trend=MIXED))[3:5] == ["1DTE+: None", "0DTE: None"]

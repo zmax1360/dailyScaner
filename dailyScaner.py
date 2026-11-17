@@ -1003,7 +1003,7 @@ def save_archive(spot, tf_data, calls_all, puts_all, or_data=None, direction=Non
 
     # Built last: the plan reads the timeframes, ranking, gamma and VWAP above.
     payload["vwap"] = _vwap_snapshot()
-    payload["game_plan"] = _plan_snapshot(payload, ts_aware)
+    payload["game_plan"] = _plan_snapshot(payload, ts_aware, calls_all, puts_all)
     if not is_eod:
         payload["setup_1100"] = _setup_snapshot(payload, calls_all, puts_all, ts_aware)
         payload["ticker_rules"] = _rules_snapshot(payload, calls_all, puts_all, ts_aware)
@@ -1046,12 +1046,19 @@ def _vwap_snapshot():
         return None
 
 
-def _plan_snapshot(payload, ts):
+def _plan_snapshot(payload, ts, calls_all=None, puts_all=None):
     """The Game Plan built once from this scan (``plan_report.build_saved_plan``) and
-    saved as ``game_plan``; Telegram and the app show it as saved. Never raises."""
+    saved as ``game_plan``; Telegram and the app show it as saved. The scan's own chain
+    prices the strategy legs. Never raises."""
     try:
         import plan_report
-        return plan_report.build_saved_plan(payload, TICKER, now=ts)
+        quotes = None
+        try:
+            import volume_history
+            quotes = volume_history.chain_frame(calls_all, puts_all)
+        except Exception as exc:
+            log.warning(f"strategy quotes unavailable (plan continues): {exc}")
+        return plan_report.build_saved_plan(payload, TICKER, now=ts, quotes=quotes)
     except Exception as exc:
         log.warning(f"Game Plan snapshot failed (scan continues): {exc}")
         return None

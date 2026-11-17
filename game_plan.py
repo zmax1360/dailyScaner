@@ -38,6 +38,7 @@ import pandas as pd
 
 import ema_stack
 import htf_trend
+import regime_strategy
 from scoring_pool import POOL_0DTE, POOL_1DTE
 from time_stop import TIME_STOP_CAP, window_minutes_for_dte
 
@@ -139,6 +140,7 @@ class Plan:
     hold_note: str = ""
     vwap_note: str = ""                  # a doubt about the VWAP number itself, if any
     htf_note: str = ""                   # the 1-hour and 4-hour trend, for context only
+    strategy: dict | None = None         # regime_strategy.choose: today's options structure
 
     def candidate_for(self, pool: str) -> Candidate | None:
         return next((c for c in self.candidates if c.pool == pool), None)
@@ -579,7 +581,8 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
                price_note: str = "", emas: dict | None = None,
                flow: dict | None = None, now: datetime | None = None,
                vwap_warning: str | None = None,
-               htf: dict[str, str] | None = None) -> Plan:
+               htf: dict[str, str] | None = None, session_open: Any = None,
+               quotes: pd.DataFrame | None = None) -> Plan:
     trend_side, side_reason = side_from_trend(trend)
     side, hold, hold_note = resolve_side(trend_side, flow, now)
     if not hold:
@@ -621,6 +624,10 @@ def build_plan(*, ticker: str, spot: Any, trend: dict | None, gamma: dict | None
         flow_note=(flow or {}).get("note") or "", hold=hold, hold_note=hold_note,
         vwap_note=str(vwap_warning or ""),
         htf_note=htf_trend.plan_line(side, htf) if htf is not None else "",
+        strategy=regime_strategy.choose(ticker=ticker, regime=regime, trend_side=trend_side,
+                                        spot=spot, session_open=session_open, gamma=gamma,
+                                        quotes=quotes, now=now,
+                                        samples=regime_strategy.load_samples()),
     )
 
 
@@ -651,11 +658,12 @@ def plan_lines(plan: Plan, compact: bool = False) -> list[str]:
     if plan.vwap_note:
         lines.append(f"⚠️ {plan.vwap_note}")
     if plan.hold:
-        return lines + [f"⛔ {plan.hold_note}"]
+        return lines + regime_strategy.lines(plan.strategy) + [f"⛔ {plan.hold_note}"]
     lines += [f"{c.pool}: {candidate_text(c.pick)}" for c in plan.candidates]
     if plan.htf_note:
         lines.append(plan.htf_note)
     lines += trade_lines(plan.trade)
+    lines += regime_strategy.lines(plan.strategy)
     if compact:
         return lines
     ladder = [f"{lv.name} {_usd(lv.price)}" for lv in plan.levels]
