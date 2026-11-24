@@ -69,3 +69,10 @@ def latest_usable_spot(ticker: str = "AAPL", *, limit: int = 50) -> tuple[float 
         if spot is not None:
             return spot, os.path.basename(path)
     return None, None
+
+
+def gamma_spot(ticker: str, raw) -> tuple[float | None, str | None]:
+    """Spot for the Gamma page: the latest scan's own spot when usable (spot_from None),
+    else the newest archive that saved a real price (spot, that archive's file name)."""
+    spot = usable_spot(raw)
+    return (spot, None) if spot is not None else latest_usable_spot(ticker)

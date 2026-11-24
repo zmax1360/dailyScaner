@@ -15,7 +15,7 @@ _YF_ALLOWED = frozenset({
 })
 
 _SKIP_DIRS = frozenset({
-    ".git", ".venv", "venv", "__pycache__", "backups", "archive",
+    ".git", ".wt", ".venv", "venv", "__pycache__", "backups", "archive",
     "archive_weekly", "data", "files", "node_modules",
 })
 
