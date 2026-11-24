@@ -57,3 +57,4 @@ data/volume_history.db*
 data/
 .worktrees/
 /_to_delete/
+research/

@@ -76,3 +76,20 @@ SCORING: dict[str, float | int | str] = {
     # health_check: fail if MAX(marked_t1h_at) older than this during RTH
     "mark_t1h_health_max_age_min": 90,
 }
+
+
+# Full-chain history recorder: storage window. Display/history only: not part of SCORING, not hashed.
+# Every scan keeps the FULL traded chain in `latest_chain` (Gamma page, positioning).
+# The per-scan history in `contract_scans` keeps only strikes within ±strike_pct % of the
+# session's anchor spot and expiries at most max_dte days out. Unlisted tickers use "default".
+VOLUME_HISTORY: dict = {
+    # "session_open": anchor = first spot recorded that session (a strike's history has no gaps)
+    # "each_scan":    anchor = this scan's spot (window moves with price)
+    "anchor": "session_open",
+    "default": {"strike_pct": 10.0, "max_dte": 30},
+    "tickers": {
+        "AAPL": {"strike_pct": 15.0, "max_dte": 45},
+        "TSLA": {"strike_pct": 15.0, "max_dte": 30},
+        "SPY": {"strike_pct": 5.0, "max_dte": 14},
+    },
+}
